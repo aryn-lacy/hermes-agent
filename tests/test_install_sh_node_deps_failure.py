@@ -13,6 +13,7 @@ INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 
 
 def _write_executable(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     path.chmod(0o755)
 
@@ -61,13 +62,14 @@ exit 0
     # the pre-flight check passes, and a uv whose `run` reports success —
     # this test is about npm lifecycle failures, not about downloading tools.
     # install_uv keeps an existing managed uv only when it answers --version
-    # with the pinned version, so the stub reads the pin from the table.
+    # with the pinned version, so the stub reads the pin from the table and
+    # sits at the install-scoped runtime location install_uv resolves.
     (install_dir / "installation").mkdir(parents=True, exist_ok=True)
     pinned_uv = json.loads(
         (REPO_ROOT / "installation" / "runtime-pins.json").read_text(encoding="utf-8")
     )["tools"]["uv"]["version"]
     _write_executable(
-        managed_bin / "uv",
+        install_dir / ".hermes-runtime" / "uv" / "uv",
         f"""#!/bin/sh
 if [ "${{1:-}}" = "--version" ]; then
     echo 'uv {pinned_uv}'

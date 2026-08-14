@@ -1,8 +1,8 @@
 """Provision managed runtime tools into <install>/.hermes-runtime/.
 
 THE one dep engine: `hermes update` (post-update MACHINE_STEPS), the
-installers (`--install-phase`, after venv + uv sync), and the desktop
-payload staging all run this same code.
+installers (`python -m installation.provisioner`, after the pinned-uv
+bootstrap), and the desktop payload staging all run this same code.
 
 Per tool: read the EXACT pin for this target (url + sha256) → download →
 verify the digest BEFORE extracting → stage into the tool's directory →

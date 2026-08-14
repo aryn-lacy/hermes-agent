@@ -17,7 +17,6 @@ The scopes must match the record that gates them in ``boot_bootstrap``
 """
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 import sys
@@ -196,7 +195,8 @@ def step_cua_driver_refresh() -> dict:
 def step_provision_runtimes() -> dict:
     """Provision managed runtime tools (node, npm, uv, git, gh, ripgrep) into
     the install-scoped runtime dir from runtime-pins.json. THE dep engine
-    for updates AND fresh installs (--install-phase); see
+    for updates AND fresh installs (the installers run
+    ``python -m installation.provisioner`` directly); see
     installation/provisioner.py."""
     from installation.provisioner import step_provision_runtimes as _run
 
@@ -257,30 +257,12 @@ def main(argv: list | None = None) -> int:
     parser = argparse.ArgumentParser(prog="hermes_cli.post_update")
     parser.add_argument("--scope", choices=("home", "machine", "all"), default="all")
     parser.add_argument("--update-phase", action="store_true")
-    parser.add_argument(
-        "--install-phase",
-        action="store_true",
-        help="fresh-install dep provisioning: run ONLY the runtime "
-        "provisioner, streaming installer stage-JSON lines. The installers "
-        "call this after venv + uv sync — same engine as updates.",
-    )
     parser.add_argument("--gateway-mode", action="store_true")
     parser.add_argument("--assume-yes", action="store_true")
     parser.add_argument("--pre-update-snapshot-id", default=None)
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-    if args.install_phase:
-        from installation.provisioner import provision_runtimes
-
-        results = provision_runtimes(
-            emit=lambda event: print(json.dumps(event), flush=True)
-        )
-        failed = [r for r in results if not r.ok]
-        for r in results:
-            logger.info("  runtime %s: %s%s", r.tool, r.action, f" {r.version}" if r.version else "")
-        return 1 if failed else 0
 
     if args.update_phase:
         # This process was just born, so update_cmd and everything it

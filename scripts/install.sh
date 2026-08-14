@@ -587,12 +587,18 @@ install_uv() {
         return 0
     fi
 
-    # Hermes owns its own uv at $HERMES_HOME/bin/uv.  Always install there —
-    # no PATH probing, no conda guards, no multi-location resolution chains.
+    # Hermes owns its own uv at $INSTALL_DIR/.hermes-runtime/uv/uv — the
+    # SAME install-scoped location managed_uv.managed_uv_path() resolves,
+    # so the binary this installer stages is the one every later
+    # `hermes update` / ensure_uv() finds. No PATH probing, no conda
+    # guards, no second copy in $HERMES_HOME/bin.
     # The binary is the EXACT artifact pinned in installation/runtime-pins.json
     # (URL + sha256 via the generated fragment above): the same authority the
     # provisioner uses for every other managed tool. No astral-latest.
-    local _managed_uv="$HERMES_HOME/bin/uv"
+    # Runs AFTER clone_repo: the install dir must exist to hold it.
+    require_install_dir
+    local _uv_dir="$INSTALL_DIR/.hermes-runtime/uv"
+    local _managed_uv="$_uv_dir/uv"
 
     if [ -x "$_managed_uv" ]; then
         UV_VERSION=$($_managed_uv --version 2>/dev/null)
@@ -618,8 +624,8 @@ install_uv() {
     fi
     uv_bootstrap_pin "$_target"
 
-    log_info "Installing pinned uv $UV_PIN_VERSION into $HERMES_HOME/bin ..."
-    mkdir -p "$HERMES_HOME/bin"
+    log_info "Installing pinned uv $UV_PIN_VERSION into $_uv_dir ..."
+    mkdir -p "$_uv_dir"
 
     local _uv_tmp
     _uv_tmp="$(mktemp -d 2>/dev/null || echo "/tmp/hermes-uv-bootstrap.$$")"
@@ -648,7 +654,7 @@ install_uv() {
     fi
 
     # The tarball nests everything under one versioned dir (uv-<triple>/).
-    # Move uv AND uvx — browser tooling resolves uvx from the same bin dir.
+    # Move uv AND uvx — browser tooling resolves uvx from the same dir.
     if ! tar -xzf "$_uv_tmp/uv.tar.gz" -C "$_uv_tmp"; then
         log_error "Failed to extract uv archive"
         rm -rf "$_uv_tmp"
@@ -663,8 +669,8 @@ install_uv() {
     fi
     mv "$_unpacked" "$_managed_uv"
     if [ -f "$(dirname "$_unpacked")/uvx" ]; then
-        mv "$(dirname "$_unpacked")/uvx" "$HERMES_HOME/bin/uvx"
-        chmod +x "$HERMES_HOME/bin/uvx"
+        mv "$(dirname "$_unpacked")/uvx" "$_uv_dir/uvx"
+        chmod +x "$_uv_dir/uvx"
     fi
     chmod +x "$_managed_uv"
     rm -rf "$_uv_tmp"
@@ -2669,6 +2675,11 @@ ensure_browser() {
 
 ensure_mode() {
     detect_os
+    # --ensure runs against an EXISTING install (dep_ensure.py spawns this
+    # script from inside the checkout), and the pinned uv now lives in the
+    # install-scoped runtime dir — resolve the layout so install_uv and the
+    # provisioner know where that is.
+    resolve_install_layout
 
     IFS=',' read -ra DEPS <<< "$ENSURE_DEPS"
     for dep in "${DEPS[@]}"; do
@@ -3123,8 +3134,9 @@ run_stage_body() {
             print_banner
             detect_os
             resolve_install_layout
-            install_uv
-            check_python
+            # uv + python move to the venv stage: the pinned uv lands in
+            # the install-scoped runtime dir, which exists only after the
+            # repository stage clones the checkout.
             check_git
             check_network_prerequisites
             install_system_packages
@@ -3259,13 +3271,16 @@ main() {
 
     detect_os
     resolve_install_layout
-    install_uv
-    check_python
     check_git
     check_network_prerequisites
     install_system_packages
 
     clone_repo
+    # AFTER the clone: the pinned uv lives in the install-scoped runtime
+    # dir ($INSTALL_DIR/.hermes-runtime/uv/), which exists once the
+    # checkout does. git is the only true pre-clone prerequisite.
+    install_uv
+    check_python
     # Before the venv: the provisioner is stdlib-only and runs under
     # `uv run --no-project`, and the tools it installs (node, npm, git) are
     # what the steps below build with.

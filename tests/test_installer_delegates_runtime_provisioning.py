@@ -4,9 +4,9 @@ Historically ``install.sh`` downloaded Node itself into ``$HERMES_HOME/node``
 and had to redirect the bundled npm's global prefix onto PATH, and
 ``scripts/lib/node-bootstrap.sh`` carried a second copy of the same download
 for self-heal. Both are gone (hermes-home lifetime split, phase 3.8): the
-installer bootstraps only what Python needs, then hands off to
-``hermes_cli.post_update --install-phase``, which installs every pinned tool
-into the install-scoped runtime dir.
+installer bootstraps only the pinned uv, then hands off to
+``python -m installation.provisioner`` — the same engine ``hermes update``
+runs — which installs every pinned tool into the install-scoped runtime dir.
 
 These are structural assertions about install.sh — the shell cannot be
 imported, and a full install is not a unit test.
@@ -17,6 +17,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
+INSTALL_PS1 = REPO_ROOT / "scripts" / "install.ps1"
+POST_UPDATE = REPO_ROOT / "hermes_cli" / "post_update.py"
 
 
 def test_installer_hands_dep_provisioning_to_the_shared_engine() -> None:
@@ -24,7 +26,15 @@ def test_installer_hands_dep_provisioning_to_the_shared_engine() -> None:
 
     assert "provision_managed_runtimes()" in text
     # The handoff is the whole point: one engine for install AND update.
-    assert "hermes_cli.post_update --install-phase" in text
+    assert "-m installation.provisioner" in text
+
+
+def test_install_phase_indirection_is_gone() -> None:
+    """--install-phase was a one-consumer indirection over the provisioner's
+    own main(); the installers call the module directly now."""
+    assert "--install-phase" not in INSTALL_SH.read_text()
+    assert "--install-phase" not in INSTALL_PS1.read_text()
+    assert "--install-phase" not in POST_UPDATE.read_text()
 
 
 def test_installer_no_longer_downloads_node_itself() -> None:

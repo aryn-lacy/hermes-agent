@@ -719,12 +719,17 @@ $script:UvPinFiles = @{
 # --- END GENERATED: uv bootstrap pins ---
 
 function Install-Uv {
-    # Hermes owns its own uv at $HermesHome\bin\uv.exe.  Always install there --
-    # no PATH probing, no conda guards, no multi-location resolution chains.
+    # Hermes owns its own uv at $InstallDir\.hermes-runtime\uv\uv.exe -- the
+    # SAME install-scoped location managed_uv.managed_uv_path() resolves, so
+    # the binary this installer stages is the one every later `hermes update`
+    # / ensure_uv() finds. No PATH probing, no conda guards, no second copy
+    # in $HermesHome\bin.
     # The binary is the EXACT artifact pinned in installation/runtime-pins.json
     # (URL + sha256 via the generated fragment above): the same authority the
     # provisioner uses for every other managed tool. No astral-latest.
-    $managedUv = Join-Path $HermesHome "bin\uv.exe"
+    # Runs AFTER Stage-Repository: the install dir must exist to hold it.
+    $uvDir = Join-Path $InstallDir ".hermes-runtime\uv"
+    $managedUv = Join-Path $uvDir "uv.exe"
 
     if (Test-Path $managedUv) {
         $version = & $managedUv --version
@@ -746,9 +751,8 @@ function Install-Uv {
         return $false
     }
 
-    Write-Info "Installing pinned uv $($script:UvPinVersion) into $HermesHome\bin ..."
-    $binDir = Join-Path $HermesHome "bin"
-    New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+    Write-Info "Installing pinned uv $($script:UvPinVersion) into $uvDir ..."
+    New-Item -ItemType Directory -Path $uvDir -Force | Out-Null
 
     $tmpDir = Join-Path ([IO.Path]::GetTempPath()) "hermes-uv-bootstrap-$PID"
     $zipPath = Join-Path $tmpDir "uv.zip"
@@ -780,7 +784,7 @@ function Install-Uv {
         $uvxExe = Get-ChildItem -Path $extractDir -Filter "uvx.exe" -Recurse |
             Select-Object -First 1
         if ($uvxExe) {
-            Move-Item -Path $uvxExe.FullName -Destination (Join-Path $binDir "uvx.exe") -Force
+            Move-Item -Path $uvxExe.FullName -Destination (Join-Path $uvDir "uvx.exe") -Force
         }
 
         $version = & $managedUv --version
@@ -983,8 +987,9 @@ function Resolve-UvCmd {
         # Stale; fall through to re-discover.
     }
 
-    # Check the managed location first -- this is where Install-Uv puts it.
-    $managedUv = Join-Path $HermesHome "bin\uv.exe"
+    # Check the managed location first -- this is where Install-Uv puts it
+    # (the install-scoped runtime dir; requires $InstallDir to be resolved).
+    $managedUv = Join-Path $InstallDir ".hermes-runtime\uv\uv.exe"
     if (Test-Path $managedUv) {
         $script:UvCmd = $managedUv
         return
@@ -4051,12 +4056,16 @@ function Write-Completion {
 # stages; ``NeedsUserInput`` tells UIs "this stage prompts -- either skip it
 # or arrange to provide answers another way."
 $InstallStages = @(
-    @{ Name = "uv";               Title = "Installing uv package manager";        Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Uv" }
-    @{ Name = "python";           Title = "Verifying Python $PythonVersion";      Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Python" }
     @{ Name = "git";              Title = "Installing Git";                       Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Git" }
     @{ Name = "node";             Title = "Detecting Node.js";                    Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Node" }
     @{ Name = "system-packages";  Title = "Installing ffmpeg";                    Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-SystemPackages" }
     @{ Name = "repository";       Title = "Cloning Hermes repository";            Category = "install";      NeedsUserInput = $false; Worker = "Stage-Repository" }
+    # uv + python run AFTER the clone: the pinned uv lands in the
+    # install-scoped runtime dir ($InstallDir\.hermes-runtime\uv), which
+    # exists only once the checkout does. Stage NAMES keep their protocol
+    # identity; only their position moved.
+    @{ Name = "uv";               Title = "Installing uv package manager";        Category = "install";      NeedsUserInput = $false; Worker = "Stage-Uv" }
+    @{ Name = "python";           Title = "Verifying Python $PythonVersion";      Category = "install";      NeedsUserInput = $false; Worker = "Stage-Python" }
     @{ Name = "venv";             Title = "Creating Python virtual environment";  Category = "install";      NeedsUserInput = $false; Worker = "Stage-Venv" }
     @{ Name = "dependencies";     Title = "Installing Python dependencies";       Category = "install";      NeedsUserInput = $false; Worker = "Stage-Dependencies" }
     @{ Name = "node-deps";        Title = "Installing Node.js dependencies";      Category = "install";      NeedsUserInput = $false; Worker = "Stage-NodeDeps" }

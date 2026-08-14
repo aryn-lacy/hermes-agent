@@ -192,8 +192,8 @@ def default_downgrade_notice() -> Optional[str]:
 
 
 def _managed_bin_dir() -> Optional[str]:
-    """Hermes' own bin dir ($HERMES_HOME/bin) — where install.sh puts uv/uvx
-    and where install_cli() links the browser-use binary."""
+    """Hermes' own bin dir ($HERMES_HOME/bin) — where install_cli() links
+    the browser-use binary (UV_TOOL_BIN_DIR)."""
     try:
         from hermes_constants import get_hermes_home
 
@@ -203,13 +203,26 @@ def _managed_bin_dir() -> Optional[str]:
         return None
 
 
+def _managed_uv_dir() -> Optional[str]:
+    """The install-scoped runtime dir holding the pinned uv + uvx
+    (managed_uv.managed_uv_path()'s parent — where the installers stage them)."""
+    try:
+        from hermes_cli.managed_uv import managed_uv_path
+
+        return str(managed_uv_path().parent)
+    except Exception as e:  # pragma: no cover — defensive
+        logger.debug("Could not resolve managed uv dir: %s", e)
+        return None
+
+
 def _find_cli() -> Optional[List[str]]:
     """Locate the browser-use CLI, or None when it can't be run.
 
     Prefers an installed browser-use binary (PATH, then Hermes' managed
     $HERMES_HOME/bin); falls back to running it through uvx (PATH, then
-    managed). The managed probes matter because Hermes bootstraps its own
-    uv into $HERMES_HOME/bin, which is not on the user's PATH.
+    the install-scoped runtime dir). The managed probes matter because
+    Hermes stages its own uv/uvx into the runtime dir, which is not on
+    the user's PATH.
     """
     bin_dir = _managed_bin_dir()
     for probe_path in (None, bin_dir):
@@ -217,7 +230,8 @@ def _find_cli() -> Optional[List[str]]:
             direct = shutil.which("browser-use", path=probe_path)
             if direct:
                 return [direct]
-    for probe_path in (None, bin_dir):
+    uv_dir = _managed_uv_dir()
+    for probe_path in (None, uv_dir, bin_dir):
         if probe_path is None or probe_path:
             uvx = shutil.which("uvx", path=probe_path)
             if uvx:
