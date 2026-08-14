@@ -178,10 +178,17 @@ def _node_symlink_candidate_dirs() -> "list[Path]":
 
 
 def remove_node_symlinks(hermes_home: Path) -> list:
-    """Remove the node/npm/npx symlinks the installer placed on PATH.
+    """Remove node/npm/npx symlinks a PRE-SPLIT installer placed on PATH.
 
-    The POSIX installer (``scripts/install.sh`` / ``scripts/lib/node-bootstrap.sh``)
-    symlinks node/npm/npx into the same directory as the ``hermes`` command:
+    Current installs create no such links: managed Node is install-scoped
+    and private (hermes-home lifetime split), precisely because a shared
+    ``~/.local/bin/node`` is what two installs fight over. This cleanup
+    stays for installs made before that change — an uninstall that leaves
+    dangling links behind is worse than a few lines of dead-on-new-installs
+    code.
+
+    Older POSIX installers symlinked node/npm/npx into the same directory
+    as the ``hermes`` command:
 
     - ``/usr/local/bin/`` on root FHS installs (Linux, uid 0)
     - ``$PREFIX/bin/`` on Termux
@@ -456,6 +463,42 @@ def remove_portable_tooling_windows(hermes_home: Path) -> list[Path]:
                 removed.append(target)
             except Exception as e:
                 log_warn(f"Could not remove {target}: {e}")
+    return removed
+
+
+def remove_legacy_runtime_trees(hermes_home: Path) -> list[Path]:
+    """Delete managed-runtime trees a PRE-SPLIT install left in HERMES_HOME.
+
+    Runtime artifacts are install-scoped now, so the current locations go
+    away with ``rmtree(project_root)``. But a checkout OUTSIDE the home
+    (the common case: ``~/src/hermes-agent``) used to put its node/uv
+    under ``$HERMES_HOME`` — that tree survives removing the checkout and
+    survives "keep my data" uninstalls, because it is not data.
+
+    Only the exact managed layout is removed: ``node/`` (a tree the
+    installer owned wholesale) and ``bin/uv`` (the single binary, NOT the
+    whole ``bin/`` dir — a user's own scripts can live there). Profile
+    state is never touched.
+    """
+    removed: list[Path] = []
+
+    node_tree = hermes_home / "node"
+    if node_tree.is_dir():
+        try:
+            shutil.rmtree(node_tree, ignore_errors=False)
+            removed.append(node_tree)
+        except Exception as e:
+            log_warn(f"Could not remove {node_tree}: {e}")
+
+    for uv_name in ("uv", "uv.exe"):
+        uv_binary = hermes_home / "bin" / uv_name
+        if uv_binary.is_file():
+            try:
+                uv_binary.unlink()
+                removed.append(uv_binary)
+            except Exception as e:
+                log_warn(f"Could not remove {uv_binary}: {e}")
+
     return removed
 
 
@@ -978,7 +1021,22 @@ def _perform_uninstall(
         log_warn(f"Could not fully remove {project_root}: {e}")
         log_info("You may need to manually remove it")
 
-    # 4b. Remove Windows-only installer artifacts that are NOT user data:
+    # 4b. Remove managed-runtime trees a PRE-SPLIT install left in
+    #     HERMES_HOME. Current installs keep these inside the checkout, so
+    #     step 4 already removed them — but a checkout outside the home
+    #     (~/src/hermes-agent) used to leave its node/uv behind, surviving
+    #     both the checkout removal and a "keep my data" uninstall. They
+    #     are install tooling, not data, so removing them is correct in
+    #     either mode.
+    log_info("Removing managed runtime trees...")
+    removed_runtimes = remove_legacy_runtime_trees(hermes_home)
+    if removed_runtimes:
+        for path in removed_runtimes:
+            log_success(f"Removed {path}")
+    else:
+        log_info("No legacy runtime trees to remove")
+
+    # 4c. Remove Windows-only installer artifacts that are NOT user data:
     #     PortableGit, bundled Node, gateway-service dir.  Installer put them
     #     under HERMES_HOME but they're install tooling, not config — safe to
     #     remove even in "keep data" mode.  If we're doing a full uninstall

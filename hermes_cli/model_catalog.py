@@ -113,9 +113,14 @@ def _load_catalog_config() -> dict[str, Any]:
 
 
 def _cache_path() -> Path:
-    """Return the disk cache path. Import lazily so tests can monkeypatch home."""
-    from hermes_constants import get_hermes_home
-    return get_hermes_home() / "cache" / "model_catalog.json"
+    """Return the disk cache path.
+
+    Install-scoped: the file's schema is owned by the code that wrote it,
+    so two installs at different versions must not share it (the cost of
+    NOT sharing is one refetch). Imported lazily so tests can monkeypatch.
+    """
+    from hermes_cli.runtime_env import runtime_cache_dir
+    return runtime_cache_dir() / "model_catalog.json"
 
 
 # ---------------------------------------------------------------------------

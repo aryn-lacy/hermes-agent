@@ -580,7 +580,7 @@ function resolveHermesHome() {
 
 const HERMES_HOME = resolveHermesHome()
 
-// Managed runtime tools (node, npm, uv, git, gh, ripgrep) live in the INSTALL's
+// Managed runtime tools (node, uv, git, gh, ripgrep) live in the INSTALL's
 // runtime dir, not in HERMES_HOME — profile state and install artifacts have
 // different lifetimes, and two installs sharing a home must not share
 // binaries. The registry's facts file says which tools exist and where;
@@ -4251,6 +4251,7 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
     args: ['-m', 'hermes_cli.main', ...backendArgs],
     env: buildDesktopBackendEnv({
       hermesHome: HERMES_HOME,
+      runtimeDir: ACTIVE_RUNTIME_DIR,
       pythonPathEntries: [root, ...getVenvSitePackagesEntries(venvRoot)],
       venvRoot
     }),
@@ -4276,6 +4277,7 @@ function createActiveBackend(backendArgs) {
     args: ['-m', 'hermes_cli.main', ...backendArgs],
     env: buildDesktopBackendEnv({
       hermesHome: HERMES_HOME,
+      runtimeDir: ACTIVE_RUNTIME_DIR,
       pythonPathEntries: [ACTIVE_HERMES_ROOT, ...getVenvSitePackagesEntries(VENV_ROOT)],
       venvRoot: VENV_ROOT
     }),
@@ -4316,14 +4318,22 @@ function createEmbeddedBackend(backendArgs) {
 
   const repoRoot = path.join(payload.dir, 'repo')
 
+  // Writable state for a sealed bundle lives in the Electron userData dir,
+  // which is per-install by construction. These used to sit in HERMES_HOME:
+  // lazy-installed wheels are ABI-coupled to the PAYLOAD's CPython, so two
+  // installs sharing a home shared an overlay built for a different
+  // interpreter — a live collision, not a theoretical one.
+  const desktopStateDir = app.getPath('userData')
+
   const env = {
     ...buildDesktopBackendEnv({
       hermesHome: HERMES_HOME,
+      runtimeDir: payload.dir,
       pythonPathEntries: [],
       venvRoot: null
     }),
-    PYTHONPYCACHEPREFIX: path.join(HERMES_HOME, 'pycache'),
-    HERMES_LAZY_INSTALL_TARGET: path.join(HERMES_HOME, 'lazy-packages')
+    PYTHONPYCACHEPREFIX: path.join(desktopStateDir, 'pycache'),
+    HERMES_LAZY_INSTALL_TARGET: path.join(desktopStateDir, 'lazy-packages')
   }
 
   // The .pth glue owns import resolution; an inherited PYTHONPATH from the
@@ -4332,21 +4342,11 @@ function createEmbeddedBackend(backendArgs) {
     delete env.PYTHONPATH
   }
 
-  // The payload's own node, uv, and git lead PATH so the backend's
-  // subprocesses (TUI builds never happen, but browser tools, git
-  // operations, and lazy installs do) find the bundled runtimes before
-  // any system ones.
-  const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') || 'PATH'
-
-  env[pathKey] = [
-    path.join(payload.dir, 'node', 'bin'),
-    path.join(payload.dir, 'node'),
-    path.join(payload.dir, 'uv'),
-    path.join(payload.dir, 'git', 'cmd'),
-    path.join(payload.dir, 'git', 'bin'),
-    path.join(payload.dir, 'git', 'usr', 'bin'),
-    env[pathKey]
-  ].filter(Boolean).join(path.delimiter)
+  // The payload's own tools lead PATH so the backend's subprocesses
+  // (browser tools, git operations, lazy installs) find the bundled
+  // runtimes before any system ones. buildDesktopBackendEnv already did
+  // this from the payload's runtimes.json — the payload IS a runtime dir.
+  // No hand-rolled directory list here: one assembler, one order.
 
   return {
     kind: 'python',

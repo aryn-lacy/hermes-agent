@@ -115,6 +115,9 @@ USER_OWNED_EXCLUDE: frozenset = frozenset({
     "backups", "cache",
     # Infrastructure
     "hermes-agent", ".worktrees", "profiles", "bin", "node_modules",
+    # Managed runtimes: install-scoped, never profile data (hermes-home
+    # lifetime split). "node" is the pre-split location.
+    ".hermes-runtime", "node",
     # User customization namespace
     "local",
 })

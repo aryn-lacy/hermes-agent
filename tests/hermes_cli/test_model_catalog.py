@@ -13,11 +13,17 @@ import pytest
 
 @pytest.fixture
 def isolated_home(tmp_path, monkeypatch):
-    """Isolate HERMES_HOME + reset any module-level catalog cache per test."""
+    """Isolate HERMES_HOME + the install root, and reset module state.
+
+    The catalog cache is install-scoped now (hermes-home lifetime split),
+    so isolating HERMES_HOME alone would let tests write into the real
+    checkout's runtime dir.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_INSTALL_ROOT", str(tmp_path / "install"))
 
     # Force a fresh catalog module state for each test.
     import importlib
@@ -226,8 +232,8 @@ class TestDefaultModelFromCache:
 
     def test_reads_label_from_disk_cache(self, isolated_home):
         from hermes_cli import model_catalog
-        cache = isolated_home / "cache"
-        cache.mkdir()
+        cache = model_catalog._cache_path().parent
+        cache.mkdir(parents=True, exist_ok=True)
         (cache / "model_catalog.json").write_text(
             json.dumps(self._manifest_with_default())
         )
@@ -244,8 +250,8 @@ class TestDefaultModelFromCache:
 
     def test_no_label_returns_none(self, isolated_home):
         from hermes_cli import model_catalog
-        cache = isolated_home / "cache"
-        cache.mkdir()
+        cache = model_catalog._cache_path().parent
+        cache.mkdir(parents=True, exist_ok=True)
         (cache / "model_catalog.json").write_text(json.dumps(_valid_manifest()))
         with patch.object(model_catalog, "_fetch_manifest") as fetch:
             assert model_catalog.get_default_model_from_cache("openrouter") is None

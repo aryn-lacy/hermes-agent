@@ -350,7 +350,22 @@ _IGNORED_MANAGED_VALUES = frozenset({"brew", "homebrew"})
 
 
 def get_managed_system() -> Optional[str]:
-    """Return the package manager owning this install, if any."""
+    """Return the package manager owning this install, if any.
+
+    Two signals, in order:
+
+    1. ``HERMES_MANAGED`` — set by the systemd service unit.
+    2. The install stamp's ``distribution`` field, which the nix package
+       already writes (``nix/hermes-agent.nix``). The stamp travels WITH
+       the code it describes, so it cannot disagree with the tree the way
+       a marker file in a shared HERMES_HOME could.
+
+    The historical ``$HERMES_HOME/.managed`` marker is deliberately no
+    longer read (hermes-home lifetime split, phase 3.9): it lived in
+    profile state while describing an INSTALL, so two installs sharing a
+    home saw each other's stewardship. Existing marker files are left on
+    disk — deleting them is pointless churn — they are simply inert.
+    """
     raw = os.getenv("HERMES_MANAGED", "").strip()
     if raw:
         normalized = raw.lower()
@@ -360,10 +375,36 @@ def get_managed_system() -> Optional[str]:
             return "NixOS"
         return _MANAGED_SYSTEM_NAMES.get(normalized, raw)
 
-    managed_marker = get_hermes_home() / ".managed"
-    if managed_marker.exists():
-        return "NixOS"
+    distribution = _stamped_distribution()
+    if distribution:
+        normalized = distribution.lower()
+        if normalized in _IGNORED_MANAGED_VALUES:
+            return None
+        return _MANAGED_SYSTEM_NAMES.get(normalized, distribution)
     return None
+
+
+def _stamped_distribution() -> Optional[str]:
+    """The install stamp's steward, or None.
+
+    Only package-manager stewards count as "managed" here: a desktop-app
+    or docker stamp describes how the tree was delivered, not a system
+    package manager that owns config writes.
+    """
+    try:
+        from hermes_cli.version_info import _resolve_stamp_file
+
+        stamp_file = _resolve_stamp_file()
+        if stamp_file is None:
+            return None
+        stamp = json.loads(stamp_file.read_text(encoding="utf-8"))
+        distribution = stamp.get("distribution")
+    except Exception:
+        return None
+    if not isinstance(distribution, str):
+        return None
+    distribution = distribution.strip()
+    return distribution if distribution.lower() in _MANAGED_SYSTEM_NAMES else None
 
 
 def is_managed() -> bool:

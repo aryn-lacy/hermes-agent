@@ -473,25 +473,6 @@ get_command_link_display_dir() {
     fi
 }
 
-# Point a Hermes-managed Node's `npm install -g` at a directory that is on
-# PATH. npm's default global prefix for a bundled Node is the Node dir itself,
-# so global package binaries land in $HERMES_HOME/node/bin — which is NOT on
-# PATH (only the command link dir is) and is wiped on every Node upgrade.
-# Redirecting the prefix to the link dir's parent makes global bins resolve to
-# the command link dir (node/npm/npx live there too, already on PATH) and
-# survive upgrades. Scoped to the managed Node via its prefix-local global
-# npmrc, so the user's other Node installs and their ~/.npmrc are untouched.
-# Hermes's own global installs pass an explicit --prefix and are unaffected.
-# Idempotent and a no-op when there is no Hermes-managed npm, so calling it on
-# every install run repairs pre-existing installs, not just fresh ones.
-configure_managed_node_npm_prefix() {
-    [ -x "$HERMES_HOME/node/bin/npm" ] || return 0
-    local link_dir
-    link_dir="$(get_command_link_dir)"
-    mkdir -p "$HERMES_HOME/node/etc"
-    printf 'prefix=%s\n' "$(dirname "$link_dir")" > "$HERMES_HOME/node/etc/npmrc"
-}
-
 get_hermes_command_path() {
     local link_dir
     link_dir="$(get_command_link_dir)"
@@ -824,129 +805,41 @@ npm_supports_npmrc() {
 }
 
 check_node() {
+    # Node is a MANAGED RUNTIME now: the installer no longer downloads it.
+    # provision_managed_runtimes() (run after the venv exists) installs the
+    # pinned version from runtime-pins.json via the same provisioner that
+    # `hermes update` uses. This function only reports what is already on
+    # the machine so later stages can decide whether to use a system Node.
     log_info "Checking Node.js (for browser tools)..."
 
-    # Repair pre-existing Hermes-managed installs where `npm install -g` lands
-    # off PATH. No-op when there's no managed Node, so this is safe to run on
-    # every install — including re-runs that skip the Node (re)install below.
-    configure_managed_node_npm_prefix
-
-    # The system toolchain is only usable when BOTH halves work: a Node new
-    # enough for the desktop build AND an npm that can read our .npmrc. A
-    # bad-band npm (see npm_supports_npmrc) fails `npm ci` outright, and the
-    # managed Node we install instead bundles one that works.
-    #
-    # npm must actually be reachable, not just node: a stray `node` symlink
-    # without a sibling npm (leftover from a node version manager) makes
-    # `command -v node` succeed while every later `npm install` silently
-    # fails and the desktop build dies with an opaque "Node.js / npm
-    # unavailable" (#77003). Node only counts as found when npm resolves on
-    # the same PATH.
-    if command -v node &> /dev/null && command -v npm &> /dev/null \
-        && node_satisfies_build "$(node --version)"; then
-        if npm_supports_npmrc "$(npm --version 2>/dev/null)"; then
+    if command -v node &> /dev/null && node_satisfies_build "$(node --version)"; then
+        if ! command -v npm &> /dev/null || npm_supports_npmrc "$(npm --version 2>/dev/null)"; then
             log_success "Node.js $(node --version) found"
             HAS_NODE=true
             return 0
         fi
+        # A bad-band npm (see npm_supports_npmrc) fails `npm ci` outright;
+        # the managed Node the provisioner installs bundles one that works.
         log_warn "npm $(npm --version) cannot honor this repo's .npmrc (npm 11.10-11.16 ignore"
-        log_warn "min-release-age-exclude) — installing Hermes-managed Node $NODE_VERSION instead..."
-        install_node
-        return
-    fi
-
-    # Prefer a Hermes-managed Node from a previous run over a too-old system one.
-    if [ -x "$HERMES_HOME/node/bin/node" ] && [ -x "$HERMES_HOME/node/bin/npm" ] \
-        && node_satisfies_build "$("$HERMES_HOME/node/bin/node" --version)"; then
-        export PATH="$HERMES_HOME/node/bin:$PATH"
-        log_success "Node.js $("$HERMES_HOME/node/bin/node" --version) found (Hermes-managed)"
-        HAS_NODE=true
-        return 0
-    fi
-
-    if command -v node &> /dev/null && ! command -v npm &> /dev/null; then
-        log_warn "node found but npm is not on PATH (stray node symlink?) — installing Hermes-managed Node $NODE_VERSION LTS..."
-    elif command -v node &> /dev/null; then
-        log_warn "Node.js $(node --version) is too old (Hermes requires Node >=26) — installing Hermes-managed Node $NODE_VERSION..."
-    elif [ "$DISTRO" = "termux" ]; then
-        log_info "Node.js not found — installing Node.js via pkg..."
-    else
-        log_info "Node.js not found — installing Node.js $NODE_VERSION LTS..."
-    fi
-    install_node
-}
-
-install_node() {
-    if [ "$DISTRO" = "termux" ]; then
-        log_info "Installing Node.js via pkg..."
-        if pkg install -y nodejs >/dev/null; then
-            local installed_ver
-            installed_ver=$(node --version 2>/dev/null)
-            log_success "Node.js $installed_ver installed via pkg"
-            HAS_NODE=true
-        else
-            log_warn "Failed to install Node.js via pkg"
-            HAS_NODE=false
-        fi
-        return 0
-    fi
-
-    local arch=$(uname -m)
-    local node_arch
-    case "$arch" in
-        x86_64)        node_arch="x64"    ;;
-        aarch64|arm64) node_arch="arm64"  ;;
-        armv7l)        node_arch="armv7l" ;;
-        *)
-            log_warn "Unsupported architecture ($arch) for Node.js auto-install"
-            log_info "Install manually: https://nodejs.org/en/download/"
-            HAS_NODE=false
-            return 0
-            ;;
-    esac
-
-    local node_os
-    case "$OS" in
-        linux) node_os="linux"  ;;
-        macos) node_os="darwin" ;;
-        *)
-            log_warn "Unsupported OS for Node.js auto-install"
-            HAS_NODE=false
-            return 0
-            ;;
-    esac
-
-    # Resolve the latest v${NODE_VERSION}.x.x tarball name from the index page
-    local index_url="https://nodejs.org/dist/latest-v${NODE_VERSION}.x/"
-    local tarball_name
-    tarball_name=$(curl -fsSL "$index_url" \
-        | grep -oE "node-v${NODE_VERSION}\.[0-9]+\.[0-9]+-${node_os}-${node_arch}\.tar\.xz" \
-        | head -1)
-
-    # Fallback to .tar.gz if .tar.xz not available
-    if [ -z "$tarball_name" ]; then
-        tarball_name=$(curl -fsSL "$index_url" \
-            | grep -oE "node-v${NODE_VERSION}\.[0-9]+\.[0-9]+-${node_os}-${node_arch}\.tar\.gz" \
-            | head -1)
-    fi
-
-    if [ -z "$tarball_name" ]; then
-        log_warn "Could not find Node.js $NODE_VERSION binary for $node_os-$node_arch"
-        log_info "Install manually: https://nodejs.org/en/download/"
+        log_warn "min-release-age-exclude) — Hermes will provision its own Node."
         HAS_NODE=false
         return 0
     fi
 
-    local download_url="${index_url}${tarball_name}"
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
+    if command -v node &> /dev/null; then
+        log_warn "Node.js $(node --version) is too old — Hermes will provision its own Node."
+    else
+        log_info "Node.js not found — Hermes will provision its own Node."
+    fi
+    HAS_NODE=false
+}
 
 provision_managed_runtimes() {
     # THE dep engine, shared with `hermes update`: one implementation of
     # "download the pinned tools", in Python, reading runtime-pins.json.
     # The installer's job ends at "python can run"; everything below that
     # line (node, git, gh, ripgrep) belongs to the provisioner.
-    log_info "Provisioning managed runtimes (node, npm, git, gh, ripgrep)..."
+    log_info "Provisioning managed runtimes (node, git, gh, ripgrep)..."
 
     local py="$INSTALL_DIR/venv/bin/python"
     if [ ! -x "$py" ]; then
@@ -954,46 +847,22 @@ provision_managed_runtimes() {
         return 0
     fi
 
-    log_info "Extracting to ~/.hermes/node/..."
-    if [[ "$tarball_name" == *.tar.xz ]]; then
-        tar xf "$tmp_dir/$tarball_name" -C "$tmp_dir"
+    # Not fatal: a failed tool download leaves the system copy in play and
+    # the next `hermes update` retries. The provisioner reports per tool.
+    if (cd "$INSTALL_DIR" && "$py" -m hermes_cli.post_update --install-phase); then
+        log_success "Managed runtimes provisioned"
     else
-        tar xzf "$tmp_dir/$tarball_name" -C "$tmp_dir"
+        log_warn "Some managed runtimes could not be provisioned (see above)"
+        log_info "They will be retried on the next 'hermes update'."
     fi
 
-    local extracted_dir
-    extracted_dir=$(ls -d "$tmp_dir"/node-v* 2>/dev/null | head -1)
-
-    if [ ! -d "$extracted_dir" ]; then
-        log_warn "Extraction failed"
-        rm -rf "$tmp_dir"
-        HAS_NODE=false
-        return 0
+    # Re-check Node so later stages (browser deps, desktop build) see the
+    # freshly provisioned tree.
+    local managed_node="$INSTALL_DIR/.hermes-runtime/node/bin/node"
+    if [ -x "$managed_node" ]; then
+        export PATH="$INSTALL_DIR/.hermes-runtime/node/bin:$PATH"
+        HAS_NODE=true
     fi
-
-    # Place into ~/.hermes/node/ and symlink binaries into the same bin dir
-    # the hermes command uses (get_command_link_dir): /usr/local/bin for root
-    # FHS installs, $PREFIX/bin on Termux, ~/.local/bin otherwise.
-    rm -rf "$HERMES_HOME/node"
-    mkdir -p "$HERMES_HOME"
-    mv "$extracted_dir" "$HERMES_HOME/node"
-    rm -rf "$tmp_dir"
-
-    local node_link_dir
-    node_link_dir="$(get_command_link_dir)"
-    mkdir -p "$node_link_dir"
-    ln -sf "$HERMES_HOME/node/bin/node" "$node_link_dir/node"
-    ln -sf "$HERMES_HOME/node/bin/npm"  "$node_link_dir/npm"
-    ln -sf "$HERMES_HOME/node/bin/npx"  "$node_link_dir/npx"
-
-    configure_managed_node_npm_prefix
-
-    export PATH="$HERMES_HOME/node/bin:$PATH"
-
-    local installed_ver
-    installed_ver=$("$HERMES_HOME/node/bin/node" --version 2>/dev/null)
-    log_success "Node.js $installed_ver installed to ~/.hermes/node/"
-    HAS_NODE=true
 }
 
 check_network_prerequisites() {
@@ -1054,18 +923,9 @@ check_network_prerequisites() {
 
 install_system_packages() {
     # Detect what's missing
-    HAS_RIPGREP=false
     HAS_FFMPEG=false
-    local need_ripgrep=false
     local need_ffmpeg=false
 
-    log_info "Checking ripgrep (fast file search)..."
-    if command -v rg &> /dev/null; then
-        log_success "$(rg --version | head -1) found"
-        HAS_RIPGREP=true
-    else
-        need_ripgrep=true
-    fi
 
     log_info "Checking ffmpeg (TTS voice messages)..."
     if command -v ffmpeg &> /dev/null; then
@@ -1080,16 +940,12 @@ install_system_packages() {
     # even when ripgrep/ffmpeg are already present.
     if [ "$DISTRO" = "termux" ]; then
         local termux_pkgs=(clang rust make pkg-config libffi openssl ca-certificates curl)
-        if [ "$need_ripgrep" = true ]; then
-            termux_pkgs+=("ripgrep")
-        fi
         if [ "$need_ffmpeg" = true ]; then
             termux_pkgs+=("ffmpeg")
         fi
 
         log_info "Installing Termux packages: ${termux_pkgs[*]}"
         if pkg install -y "${termux_pkgs[@]}" >/dev/null; then
-            [ "$need_ripgrep" = true ] && HAS_RIPGREP=true && log_success "ripgrep installed"
             [ "$need_ffmpeg" = true ]  && HAS_FFMPEG=true  && log_success "ffmpeg installed"
             log_success "Termux build dependencies installed"
             return 0
@@ -1101,17 +957,13 @@ install_system_packages() {
     fi
 
     # Nothing to install — done
-    if [ "$need_ripgrep" = false ] && [ "$need_ffmpeg" = false ]; then
+    if [ "$need_ffmpeg" = false ]; then
         return 0
     fi
 
     # Build a human-readable description + package list
     local desc_parts=()
     local pkgs=()
-    if [ "$need_ripgrep" = true ]; then
-        desc_parts+=("ripgrep for faster file search")
-        pkgs+=("ripgrep")
-    fi
     if [ "$need_ffmpeg" = true ]; then
         desc_parts+=("ffmpeg for TTS voice messages")
         pkgs+=("ffmpeg")
@@ -1124,7 +976,6 @@ install_system_packages() {
         if command -v brew &> /dev/null; then
             log_info "Installing ${pkgs[*]} via Homebrew..."
             if brew install "${pkgs[@]}"; then
-                [ "$need_ripgrep" = true ] && HAS_RIPGREP=true && log_success "ripgrep installed"
                 [ "$need_ffmpeg" = true ]  && HAS_FFMPEG=true  && log_success "ffmpeg installed"
                 return 0
             fi
@@ -1154,7 +1005,6 @@ install_system_packages() {
         if [ "$(id -u)" -eq 0 ]; then
             log_info "Installing ${pkgs[*]}..."
             if $install_cmd; then
-                [ "$need_ripgrep" = true ] && HAS_RIPGREP=true && log_success "ripgrep installed"
                 [ "$need_ffmpeg" = true ]  && HAS_FFMPEG=true  && log_success "ffmpeg installed"
                 return 0
             fi
@@ -1162,7 +1012,6 @@ install_system_packages() {
         elif command -v sudo &> /dev/null && sudo -n true 2>/dev/null; then
             log_info "Installing ${pkgs[*]}..."
             if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a $install_cmd; then
-                [ "$need_ripgrep" = true ] && HAS_RIPGREP=true && log_success "ripgrep installed"
                 [ "$need_ffmpeg" = true ]  && HAS_FFMPEG=true  && log_success "ffmpeg installed"
                 return 0
             fi
@@ -1174,7 +1023,6 @@ install_system_packages() {
                 log_info "Hermes Agent itself does not require or retain root access."
                 if prompt_yes_no "Install ${description}? (requires sudo)" "no"; then
                     if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a $install_cmd; then
-                        [ "$need_ripgrep" = true ] && HAS_RIPGREP=true && log_success "ripgrep installed"
                         [ "$need_ffmpeg" = true ]  && HAS_FFMPEG=true  && log_success "ffmpeg installed"
                         return 0
                     fi
@@ -1190,7 +1038,6 @@ install_system_packages() {
                 log_info "Hermes Agent itself does not require or retain root access."
                 if prompt_yes_no "Install ${description}?" "yes"; then
                     if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a $install_cmd < /dev/tty; then
-                        [ "$need_ripgrep" = true ] && HAS_RIPGREP=true && log_success "ripgrep installed"
                         [ "$need_ffmpeg" = true ]  && HAS_FFMPEG=true  && log_success "ffmpeg installed"
                         return 0
                     fi
@@ -1202,22 +1049,7 @@ install_system_packages() {
         fi
     fi
 
-    # ── Fallback for ripgrep: cargo ──
-    if [ "$need_ripgrep" = true ] && [ "$HAS_RIPGREP" = false ]; then
-        if command -v cargo &> /dev/null; then
-            log_info "Trying cargo install ripgrep (no sudo needed)..."
-            if cargo install ripgrep; then
-                log_success "ripgrep installed via cargo"
-                HAS_RIPGREP=true
-            fi
-        fi
-    fi
-
     # ── Show manual instructions for anything still missing ──
-    if [ "$HAS_RIPGREP" = false ] && [ "$need_ripgrep" = true ]; then
-        log_warn "ripgrep not installed (file search will use grep fallback)"
-        show_manual_install_hint "ripgrep"
-    fi
     if [ "$HAS_FFMPEG" = false ] && [ "$need_ffmpeg" = true ]; then
         log_warn "ffmpeg not installed (TTS voice messages will be limited)"
         show_manual_install_hint "ffmpeg"
@@ -2753,18 +2585,6 @@ print_success() {
         echo -e "${NC}"
     fi
 
-    # Show ripgrep note if not installed
-    if [ "$HAS_RIPGREP" = false ]; then
-        echo -e "${YELLOW}"
-        echo "Note: ripgrep (rg) was not found. File search will use"
-        echo "grep as a fallback. For faster search in large codebases,"
-        if [ "$DISTRO" = "termux" ]; then
-            echo "install ripgrep: pkg install ripgrep"
-        else
-            echo "install ripgrep: sudo apt install ripgrep (or brew install ripgrep)"
-        fi
-        echo -e "${NC}"
-    fi
 }
 
 ensure_browser() {
@@ -2829,24 +2649,30 @@ ensure_mode() {
         case "$dep" in
             node)
                 check_node
+                if [ "$HAS_NODE" != true ]; then
+                    provision_managed_runtimes
+                fi
                 ;;
             browser)
                 check_node
+                if [ "$HAS_NODE" != true ]; then
+                    provision_managed_runtimes
+                fi
                 if [ "$HAS_NODE" = true ]; then
                     ensure_browser
                 fi
                 ;;
             ripgrep)
+                # A managed runtime now: the provisioner installs the pinned
+                # ripgrep into the install root rather than asking a system
+                # package manager for whatever version it has.
                 if ! command -v rg &>/dev/null; then
-                    HAS_RIPGREP=false
-                    HAS_FFMPEG=true
-                    install_system_packages
+                    provision_managed_runtimes
                 fi
                 ;;
             ffmpeg)
                 if ! command -v ffmpeg &>/dev/null; then
                     HAS_FFMPEG=false
-                    HAS_RIPGREP=true
                     install_system_packages
                 fi
                 ;;
@@ -3052,12 +2878,16 @@ install_desktop() {
     # (--include-desktop / 'desktop' stage), so a missing toolchain is a hard
     # failure, not a silent skip — a silent skip yields a "complete" install
     # with no app and a confusing "couldn't find a built desktop" at launch.
-    # Always re-resolve Node here. Stages run in separate processes, so we can't
-    # trust an earlier check; more importantly check_node now enforces the build
-    # floor (Node >=26) and prepends the Hermes-managed Node to PATH, so
-    # the build never runs on a too-old system Node — the cause of the opaque
-    # "Build desktop app … exit code 1" failure (Vite crashes on old Node).
+    # Always re-resolve Node here. Stages run in separate processes, so we
+    # can't trust an earlier check, and the build must never run on a
+    # too-old system Node — the cause of the opaque "Build desktop app …
+    # exit code 1" failure (Vite crashes on old Node). check_node reports
+    # what's on the machine; provision_managed_runtimes guarantees a
+    # pinned one and puts it on PATH (no-op when already satisfied).
     check_node
+    if [ "$HAS_NODE" != true ]; then
+        provision_managed_runtimes
+    fi
     if ! command -v npm >/dev/null 2>&1; then
         log_error "Cannot build desktop app: Node.js / npm unavailable"
         log_info "Install Node.js and retry: cd $desktop_dir && npm run pack"
@@ -3316,11 +3146,12 @@ run_stage_body() {
             detect_os
             resolve_install_layout
             require_install_dir
+            # Stage NAME is protocol (the GUI driver renders it); its body is
+            # now the shared provisioner. Managed runtimes first, then the
+            # npm-installed browser tooling that needs a working node.
             check_node
-            install_node_deps || return
-            install_uv
-            install_browser_use_cli
-            install_computer_use_driver
+            provision_managed_runtimes
+            install_node_deps
             ;;
         path)
             detect_os
@@ -3350,11 +3181,13 @@ run_stage_body() {
             detect_os
             resolve_install_layout
             require_install_dir
-            # Each stage runs in its own process, so the Hermes-managed Node
-            # provisioned during prerequisites/node-deps (at $HERMES_HOME/node/bin)
-            # isn't on PATH here. check_node re-adds it (or installs if missing)
-            # so install_desktop can find npm instead of silently skipping.
+            # Each stage runs in its own process, so the managed Node
+            # provisioned during node-deps (in the install root's
+            # .hermes-runtime) isn't on PATH here. Re-provisioning is a
+            # cheap no-op when the pin is already satisfied, and it puts
+            # the tree back on PATH so install_desktop finds npm.
             check_node
+            provision_managed_runtimes
             install_desktop_voice_deps
             install_desktop
             ;;

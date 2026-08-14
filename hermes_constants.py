@@ -429,21 +429,19 @@ def _node_target_major() -> int:
     if override:
         return int(override)
     try:
-        from hermes_cli.runtime_registry import load_pins
+        from hermes_cli.runtime_registry import load_pins, parse_spec
 
         # Pins ship WITH the code, so they are read relative to this module
         # — not from get_install_root(), which callers can point elsewhere
         # (desktop resourcesPath, tests) and which would then silently lose
         # the pin file and fall back.
         pins = load_pins(Path(__file__).resolve().parent)
-        # Pins are exact ("26.7.0"), so the major is just the first field.
-        return int(pins["node"]["version"].split(".")[0])
+        return parse_spec(pins["node"]["version"]).floor[0]
     except Exception:
         return 22
 
 
 _managed_node_heal_attempted = False
-_NODE_BOOTSTRAP_SCRIPT = Path(__file__).resolve().parent / "scripts" / "lib" / "node-bootstrap.sh"
 
 
 def node_tool_runnable(path: str | None) -> bool:
@@ -573,7 +571,7 @@ def _managed_node_tree_outdated(home: Path | None = None) -> bool:
     An outdated managed Node (e.g. a 22 tree from an older install) heals the
     same way a broken one does: :func:`find_hermes_node_executable` triggers
     the once-per-process heal, which redownloads
-    ``latest-v<target major>.x`` — so existing users are upgraded
+    the pinned Node major — so existing users are upgraded
     on next launch, not just on the next installer re-run. Mirrors
     ``_nb_managed_node_outdated`` in ``scripts/lib/node-bootstrap.sh``.
     """
@@ -605,7 +603,7 @@ def _managed_node_tree_outdated(home: Path | None = None) -> bool:
 def find_hermes_node_executable(command: str) -> str | None:
     """Return a Hermes-managed Node/npm executable path, healing broken trees.
 
-    Outdated trees (node major below the pinned target) heal the
+    Outdated trees (node major below the pinned major) heal the
     same way broken ones do — the once-per-process heal redownloads the target
     major, upgrading existing users on next launch rather than next reinstall.
     When the heal fails (offline, download error), an outdated-but-runnable

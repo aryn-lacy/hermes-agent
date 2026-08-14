@@ -246,11 +246,14 @@ def _discover_homebrew_node_dirs() -> tuple[str, ...]:
 
 def _browser_candidate_path_dirs() -> list[str]:
     """Return ordered browser CLI PATH candidates shared by discovery and execution."""
-    hermes_home = get_hermes_home()
-    hermes_node_bin = str(hermes_home / "node" / "bin")
-    hermes_node_root = str(hermes_home / "node")
-    hermes_nm_bin = str(hermes_home / "node_modules" / ".bin")
-    return [hermes_node_bin, hermes_node_root, hermes_nm_bin, *list(_discover_homebrew_node_dirs()), *_SANE_PATH_DIRS]
+    from hermes_constants import iter_hermes_node_dirs
+
+    # Managed Node lives in the install-scoped runtime dir, not the profile
+    # home; one resolver owns that location, so this list follows it rather
+    # than restating a path shape that moved.
+    hermes_node_dirs = [str(d) for d in iter_hermes_node_dirs()]
+    hermes_nm_bin = str(get_hermes_home() / "node_modules" / ".bin")
+    return [*hermes_node_dirs, hermes_nm_bin, *list(_discover_homebrew_node_dirs()), *_SANE_PATH_DIRS]
 
 
 def _merge_browser_path(existing_path: str = "") -> str:
@@ -2497,9 +2500,13 @@ def _find_agent_browser(*, validate: bool = True) -> str:
             candidates = [
                 shutil.which("agent-browser"),
                 shutil.which("agent-browser", path=extended_path) if extended_path else None,
-                shutil.which("agent-browser", path=str(get_hermes_home() / "node_modules" / ".bin")),
-                shutil.which("agent-browser", path=str(get_hermes_home() / "node" / "bin")),
-                shutil.which("agent-browser", path=str(get_hermes_home() / "node")),
+                # Same candidate list the extended PATH is built from, so a
+                # post-install recheck cannot look in fewer places than the
+                # first pass did.
+                *(
+                    shutil.which("agent-browser", path=directory)
+                    for directory in _browser_candidate_path_dirs()
+                ),
             ]
             for recheck in candidates:
                 if recheck and agent_browser_runnable(recheck):

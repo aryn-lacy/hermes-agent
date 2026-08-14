@@ -215,7 +215,7 @@ def _check_managed_runtimes() -> None:
     are still reported from PATH so a system copy is visible.
     """
     try:
-        from hermes_cli.runtime_registry import load_facts, load_pins
+        from hermes_cli.runtime_registry import load_facts, load_pins, satisfies
         from hermes_constants import get_runtime_dir
 
         runtime_dir = get_runtime_dir()
@@ -243,12 +243,10 @@ def _check_managed_runtimes() -> None:
                 "(runtime dir was modified; 'hermes update' reinstalls it)",
             )
             continue
-        # Pins are exact, so this is equality: anything else means the
-        # pin moved and this install has not caught up yet.
-        if fact.version != pin["version"]:
+        if not satisfies(fact.version, pin["version"]):
             check_warn(
-                f"{tool} {fact.version} does not match the pin {pin['version']}",
-                "(reprovisioned on the next 'hermes update')",
+                f"{tool} {fact.version} is below the pin {pin['version']}",
+                "(upgraded on the next 'hermes update')",
             )
             continue
         check_ok(f"{tool} {fact.version}", "(managed)")
@@ -2048,13 +2046,11 @@ def run_doctor(args):
     else:
         check_warn("git not found", "(optional)")
     
-    # ripgrep (optional, for faster file search)
-    if _safe_which("rg"):
-        check_ok("ripgrep (rg)", "(faster file search)")
-    else:
-        check_warn("ripgrep (rg) not found", "(file search uses grep fallback)")
-        check_info(f"Install for faster search: {_system_package_install_cmd('ripgrep')}")
-    
+    # Managed runtimes: what the registry says this install provisioned.
+    # A tool that is missing here is not a "go install it yourself"
+    # problem — the provisioner owns it and retries on the next update.
+    _check_managed_runtimes()
+
     # Docker (optional)
     terminal_env = os.getenv("TERMINAL_ENV", "local")
     try:

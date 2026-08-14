@@ -2,7 +2,8 @@
 
 Hermes owns its own uv binary at ``<install>/.hermes-runtime/uv/uv`` (or
 ``uv.exe`` on Windows) — install-scoped, never shared between two installs.
-Legacy ``$HERMES_HOME/bin/uv`` binaries are salvaged on first touch.
+An older install's ``$HERMES_HOME/bin/uv`` is ignored, never adopted: it
+is unverified bytes, and the pinned artifact is one download away.
 Every code path that needs uv resolves it from that single location.
 If the binary is missing, ``ensure_uv()`` bootstraps it via the official
 standalone installer with ``UV_UNMANAGED_INSTALL`` / ``UV_INSTALL_DIR`` pointed
@@ -59,10 +60,10 @@ def managed_uv_path() -> Path:
     ``<install>/.hermes-runtime/uv/uv`` (``uv.exe`` on Windows) — the
     install-scoped runtime dir (hermes-home lifetime split, phase 2.5).
     Previously ``$HERMES_HOME/bin/uv``, which two installs sharing one
-    home would fight over; ``_ensure_uv_path`` salvages a healthy legacy
-    binary from there on first touch. The directory may not exist yet —
-    callers should use ``ensure_uv()`` to bootstrap it.
-"""
+    home would fight over. A binary left in that old location is ignored
+    rather than adopted — it is unverified. The directory may not exist
+    yet; callers should use ``ensure_uv()`` to bootstrap it.
+    """
     from hermes_constants import get_runtime_dir
 
     name = "uv.exe" if platform.system() == "Windows" else "uv"
@@ -228,19 +229,6 @@ def _ensure_uv_path(
 
     target = managed_uv_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-
-    # Salvage a healthy pre-split binary ($HERMES_HOME/bin/uv) before
-    # downloading: mv beats redownload, and the legacy location is dead
-    # to every reader from this release on (phase 2.5).
-    legacy = get_hermes_home() / "bin" / target.name
-    if legacy.is_file() and os.access(legacy, os.X_OK):
-        try:
-            shutil.move(str(legacy), target)
-        except OSError as exc:
-            logger.debug("legacy uv salvage failed, downloading instead: %s", exc)
-    if resolve_uv():
-        _record_uv_fact(target)
-        return str(target)
 
     # No salvage: a uv left in the pre-split location by an older install
     # is bytes nobody verified against the pin table, and adopting it

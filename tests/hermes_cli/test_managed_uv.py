@@ -278,7 +278,9 @@ class TestUpdateManagedUv:
         _make_executable(uv)
         # Fresh stamp under the isolated HERMES_HOME.
         import hermes_constants
-        stamp = hermes_constants.get_hermes_home() / "cache" / ".uv_self_update_stamp"
+        from hermes_cli import managed_uv
+
+        stamp = managed_uv._uv_self_update_stamp_path()
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.touch()
 
@@ -304,7 +306,9 @@ class TestUpdateManagedUv:
         uv = tmp_path / ".hermes-runtime" / "uv" / "uv"
         _make_executable(uv)
         import hermes_constants
-        stamp = hermes_constants.get_hermes_home() / "cache" / ".uv_self_update_stamp"
+        from hermes_cli import managed_uv
+
+        stamp = managed_uv._uv_self_update_stamp_path()
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.touch()
         old = _time.time() - UV_SELF_UPDATE_INTERVAL_SECONDS - 60

@@ -897,9 +897,13 @@ _nous_recommended_cache: dict[str, tuple[dict[str, Any], float]] = {}
 
 
 def _nous_recommended_disk_path() -> "Path":
-    """Disk path for the persisted recommended-models cache."""
-    from hermes_constants import get_hermes_home
-    return get_hermes_home() / "cache" / "nous_recommended_cache.json"
+    """Disk path for the persisted recommended-models cache.
+
+    Install-scoped (hermes-home lifetime split): regenerable, and its
+    shape belongs to the code that wrote it.
+    """
+    from hermes_cli.runtime_env import runtime_cache_dir
+    return runtime_cache_dir() / "nous_recommended_cache.json"
 
 
 def _read_nous_recommended_disk(base: str) -> dict[str, Any] | None:
