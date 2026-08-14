@@ -1111,7 +1111,7 @@ def _update_via_zip(args):
 
     from hermes_cli.managed_uv import ensure_uv, update_managed_uv
 
-    # Keep managed uv current — runs `uv self update` if we already have one.
+    # Keep managed uv on the pin table — re-provisions if the pin moved.
     update_managed_uv()
 
     uv_bin = ensure_uv()
@@ -4872,7 +4872,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print("→ Updating Python dependencies...")
         from hermes_cli.managed_uv import ensure_uv, update_managed_uv
 
-        # Keep managed uv current — runs `uv self update` if we already have one.
+        # Keep managed uv on the pin table — re-provisions if the pin moved.
         update_managed_uv()
 
         uv_bin = ensure_uv()

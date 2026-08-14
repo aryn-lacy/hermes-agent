@@ -5,10 +5,10 @@ Hermes owns its own uv binary at ``<install>/.hermes-runtime/uv/uv`` (or
 An older install's ``$HERMES_HOME/bin/uv`` is ignored, never adopted: it
 is unverified bytes, and the pinned artifact is one download away.
 Every code path that needs uv resolves it from that single location.
-If the binary is missing, ``ensure_uv()`` bootstraps it via the official
-standalone installer with ``UV_UNMANAGED_INSTALL`` / ``UV_INSTALL_DIR`` pointed
-at ``$HERMES_HOME/bin`` so the installer writes directly there — no PATH
-probing, no conda guards, no multi-location resolution chains.
+If the binary is missing, ``ensure_uv()`` bootstraps it through the runtime
+provisioner: the EXACT artifact pinned in ``installation/runtime-pins.json``,
+digest-verified before extraction — the same authority as every other
+managed tool. There is no self-update channel; a pin bump is the update.
 
 The Python backing the install is different: it is shared by every Hermes
 profile because the checkout's ``venv`` is shared.  Runtime repair therefore
@@ -31,7 +31,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -304,103 +303,40 @@ def ensure_uv(
     return _UvResult(result)
 
 
-def _uv_self_update_stamp_path() -> Path:
-    """Freshness stamp for ``uv self update``.
-
-    Install-scoped: it describes THIS install's managed uv binary, so two
-    installs sharing a home must not share it (one's update would silence
-    the other's for a week). Lives in the runtime dir's cache beside the
-    binary it is about (hermes-home lifetime split, phase 5.13).
-    """
-    from installation.env import runtime_cache_dir
-
-    return runtime_cache_dir() / ".uv_self_update_stamp"
-
-
-def _uv_self_update_is_fresh(now: float | None = None) -> bool:
-    """Return True when ``uv self update`` ran recently enough to skip.
-
-    uv releases roughly weekly while many users run ``hermes update`` daily;
-    re-running a blocking network self-update on every invocation is waste
-    and, offline, an unbounded hang risk. A stamp file under HERMES_HOME
-    caches the last successful self-update time.
-    """
-    try:
-        from hermes_constants import get_hermes_home
-
-        stamp = _uv_self_update_stamp_path()
-        age = (now if now is not None else time.time()) - stamp.stat().st_mtime
-        return 0 <= age < UV_SELF_UPDATE_INTERVAL_SECONDS
-    except Exception:
-        return False
-
-
-def _touch_uv_self_update_stamp() -> None:
-    try:
-        from hermes_constants import get_hermes_home
-
-        stamp = _uv_self_update_stamp_path()
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.touch()
-    except OSError:
-        pass
-
-
-# uv ships releases ~weekly; refresh the managed binary at most this often.
-UV_SELF_UPDATE_INTERVAL_SECONDS = 7 * 24 * 3600
-# `uv self update` is a network call; unbounded it can hang forever on a
-# blackholed connection (no default timeout in uv's downloader path).
-UV_SELF_UPDATE_TIMEOUT_SECONDS = 60
-
-
 def update_managed_uv(
     *,
     repair_observer: Callable[[RuntimeRepairResult], None] | None = None,
     force: bool = False,
 ) -> Optional[str]:
-    """Run ``uv self update`` on the managed uv binary.
+    """Converge the managed uv binary on the pin table.
 
-    Call this during ``hermes update`` so the managed copy stays current.
+    Call this during ``hermes update`` so the managed copy tracks the pin:
+    ``git pull`` may have bumped ``installation/runtime-pins.json``, and the
+    provisioner replaces the staged binary when its recorded version no
+    longer matches. There is no ``uv self update`` network channel anymore
+    — a pinned binary has no "latest"; the pin table is the update.
+
     Returns the managed path when uv is available and ``None`` otherwise.
-    A self-update failure is non-fatal because the old version still works.
+    A provisioning failure is non-fatal because the old version still works.
     ``repair_observer``, when provided, receives the runtime repair result.
-
-    The network self-update is skipped when it succeeded within the last
-    ``UV_SELF_UPDATE_INTERVAL_SECONDS`` (7 days) unless ``force=True``; the
-    vulnerable-runtime repair probe below ALWAYS runs — CVE-driven runtime
-    repair must never be gated behind the freshness stamp.
+    ``force`` is accepted for compatibility with older callers; convergence
+    on an exact pin is idempotent, so it has nothing left to force.
     """
     existing = resolve_uv()
     if not existing:
         # Not installed yet — ensure_uv() will handle that elsewhere.
         return None
 
-    if force or not _uv_self_update_is_fresh():
-        try:
-            result = subprocess.run(
-                [existing, "self", "update"],
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                check=False,
-                timeout=UV_SELF_UPDATE_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
-            logger.debug("uv self update timed out after %ss", UV_SELF_UPDATE_TIMEOUT_SECONDS)
-            result = None
-        if result is not None and result.returncode == 0:
-            _touch_uv_self_update_stamp()
-            version = subprocess.run(
-                [existing, "--version"],
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                check=False,
-            ).stdout.strip()
-            print(f"  ✓ Managed uv updated ({version})")
-        elif result is not None:
-            # Non-fatal — old uv still works fine.
-            logger.debug(
-                "uv self update failed (rc=%d): %s", result.returncode, result.stderr
-            )
+    before = _uv_version_string(existing)
+    try:
+        _install_uv(managed_uv_path())
+    except Exception as exc:
+        # Non-fatal — the staged uv still works fine.
+        logger.debug("pinned uv convergence failed: %s", exc)
+    else:
+        after = _uv_version_string(existing)
+        if after and after != before:
+            print(f"  ✓ Managed uv updated ({after})")
 
     # Keep this hook inside the long-standing API. During an update, main.py is
     # already imported from the old checkout, then ``git pull`` replaces this
@@ -1019,21 +955,23 @@ def _uv_version_string(uv_bin: str) -> str:
 
 
 def _refresh_managed_uv_catalog(uv_bin: str) -> bool:
-    """Re-bootstrap the managed uv binary to refresh its Python catalog.
+    """Re-provision the managed uv binary to refresh its Python catalog.
 
-    The managed uv is installed with ``UV_UNMANAGED_INSTALL``, which disables
-    ``uv self update`` by design — so its embedded python-build-standalone
-    download catalog stays frozen at bootstrap age.  python-build-standalone
-    re-releases existing CPython patch versions with newer SQLite (e.g. the
-    3.11.15 build was re-cut with SQLite 3.53.x), so a stale catalog can make
-    every provisioning attempt resolve to a vulnerable build even though a
-    fixed build of the SAME patch version exists (issue #72093).  The
-    patch-retry loop cannot recover from that: the fixed build carries no
-    newer version number to retry with.
+    uv's embedded python-build-standalone download catalog is frozen at the
+    version of uv itself.  python-build-standalone re-releases existing
+    CPython patch versions with newer SQLite (e.g. the 3.11.15 build was
+    re-cut with SQLite 3.53.x), so a stale catalog can make every
+    provisioning attempt resolve to a vulnerable build even though a fixed
+    build of the SAME patch version exists (issue #72093).  The patch-retry
+    loop cannot recover from that: the fixed build carries no newer version
+    number to retry with.
 
-    Re-running the official installer is the only supported refresh path for
-    unmanaged installs.  Only the Hermes-managed binary is ever refreshed;
-    a caller-supplied foreign uv path is left alone.
+    uv is pinned in ``installation/runtime-pins.json``, so this re-runs the
+    provisioner: when ``git pull`` moved the pin, the staged binary is
+    replaced and its catalog moves with it.  When the pin has not moved, the
+    binary (and catalog) cannot change — the fix for a stale catalog is a
+    pin bump.  Only the Hermes-managed binary is ever refreshed; a
+    caller-supplied foreign uv path is left alone.
 
     Returns ``True`` when the binary's version actually changed — i.e. a
     provisioning retry can now see a different catalog.  ``False`` means a
@@ -1284,61 +1222,24 @@ def repair_vulnerable_runtime(
 
 
 def _install_uv(target: Path) -> None:
-    """Bootstrap uv into *target* using the official standalone installer.
+    """Provision the pinned uv into the runtime dir via the provisioner.
 
-    Uses ``UV_UNMANAGED_INSTALL`` (POSIX) or ``UV_INSTALL_DIR`` (Windows)
-    so the astral installer writes the binary directly into
-    ``$HERMES_HOME/bin/`` instead of ``~/.local/bin/``.
+    The provisioner downloads the EXACT artifact pinned in
+    ``installation/runtime-pins.json`` for this host, verifies its sha256
+    BEFORE extracting, stages it at ``<runtime dir>/uv/``, and records the
+    fact only after the staged binary answers a version probe. *target* is
+    accepted for signature compatibility with the historical astral-based
+    installer; the provisioner always stages at the pin table's canonical
+    location, which ``managed_uv_path()`` mirrors.
+
+    Raises ``RuntimeError`` when provisioning fails, matching the old
+    contract (callers catch and report).
     """
-    system = platform.system()
-    env = {
-        **os.environ,
-        # Tell the astral installer to drop the binary in our dir, not
-        # ~/.local/bin.  UV_UNMANAGED_INSTALL is the POSIX env var; Windows
-        # uses UV_INSTALL_DIR.
-        "UV_UNMANAGED_INSTALL": str(target.parent),
-        "UV_INSTALL_DIR": str(target.parent),
-    }
+    from installation.provisioner import provision_tool
 
-    if system == "Windows":
-        _install_uv_windows(env)
-    else:
-        _install_uv_posix(env)
-
-
-def _install_uv_posix(env: dict[str, str]) -> None:
-    """Download + sh the POSIX installer (two-stage to avoid curl|sh pitfalls)."""
-    with tempfile.NamedTemporaryFile(suffix=".sh", delete=False) as f:
-        installer_path = f.name
-
-    try:
-        subprocess.run(
-            ["curl", "-LsSf", "https://astral.sh/uv/install.sh", "-o", installer_path],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["sh", installer_path],
-            env=env,
-            check=True,
-            capture_output=True,
-        )
-    finally:
-        try:
-            os.unlink(installer_path)
-        except OSError:
-            pass
-
-
-def _install_uv_windows(env: dict[str, str]) -> None:
-    """Invoke the PowerShell installer."""
-    cmd = "irm https://astral.sh/uv/install.ps1 | iex"
-    subprocess.run(
-        ["powershell", "-ExecutionPolicy", "Bypass", "-c", cmd],
-        env=env,
-        check=True,
-        capture_output=True,
-    )
+    result = provision_tool("uv")
+    if not result.ok:
+        raise RuntimeError(f"pinned uv provisioning failed: {result.detail}")
 
 
 def rebuild_venv(uv_bin: str, venv_dir: Path, python_version: str = "3.11") -> bool:

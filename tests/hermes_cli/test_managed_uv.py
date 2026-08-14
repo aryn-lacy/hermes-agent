@@ -268,24 +268,17 @@ class TestEnsureUvWindowsSafe:
 class TestUpdateManagedUv:
 
 
-
-    def test_fresh_stamp_skips_network_self_update_but_not_repair(self, tmp_path, monkeypatch):
-        """A recent success stamp must skip `uv self update` entirely while the
-        vulnerable-runtime repair probe still runs (CVE repair is never gated)."""
+    def test_converges_on_pin_and_always_repairs(self, tmp_path):
+        """update_managed_uv re-provisions from the pin table and ALWAYS runs
+        the vulnerable-runtime repair probe (CVE repair is never gated)."""
         from hermes_cli.managed_uv import RuntimeRepairResult, update_managed_uv
 
         uv = tmp_path / ".hermes-runtime" / "uv" / "uv"
         _make_executable(uv)
-        # Fresh stamp under the isolated HERMES_HOME.
-        import hermes_constants
-        from hermes_cli import managed_uv
-
-        stamp = managed_uv._uv_self_update_stamp_path()
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.touch()
 
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
-             patch("hermes_cli.managed_uv.subprocess.run") as mock_run, \
+             patch("hermes_cli.managed_uv._install_uv") as mock_install, \
+             patch("hermes_cli.managed_uv._uv_version_string", return_value="uv 0.12.3"), \
              patch(
                  "hermes_cli.managed_uv.repair_vulnerable_runtime",
                  return_value=RuntimeRepairResult("skipped"),
@@ -293,35 +286,29 @@ class TestUpdateManagedUv:
             result = update_managed_uv()
 
         assert result == str(uv)
-        assert mock_run.call_count == 0, "fresh stamp must skip the network self-update"
+        mock_install.assert_called_once()
         mock_repair.assert_called_once_with(str(uv))
 
 
-    def test_stale_stamp_runs_self_update_and_refreshes_stamp(self, tmp_path):
-        import os as _os
-        import time as _time
-
-        from hermes_cli.managed_uv import UV_SELF_UPDATE_INTERVAL_SECONDS, update_managed_uv
+    def test_provisioning_failure_is_nonfatal(self, tmp_path):
+        """A failed convergence keeps the existing binary in play — the old
+        version still works, and the repair probe still runs."""
+        from hermes_cli.managed_uv import RuntimeRepairResult, update_managed_uv
 
         uv = tmp_path / ".hermes-runtime" / "uv" / "uv"
         _make_executable(uv)
-        import hermes_constants
-        from hermes_cli import managed_uv
-
-        stamp = managed_uv._uv_self_update_stamp_path()
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.touch()
-        old = _time.time() - UV_SELF_UPDATE_INTERVAL_SECONDS - 60
-        _os.utime(stamp, (old, old))
 
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
-             patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")), \
-             patch("hermes_cli.managed_uv.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.2.0")
-            update_managed_uv()
+             patch("hermes_cli.managed_uv._install_uv", side_effect=RuntimeError("network down")), \
+             patch("hermes_cli.managed_uv._uv_version_string", return_value="uv 0.12.3"), \
+             patch(
+                 "hermes_cli.managed_uv.repair_vulnerable_runtime",
+                 return_value=RuntimeRepairResult("not-applicable"),
+             ) as mock_repair:
+            result = update_managed_uv()
 
-        assert mock_run.call_args_list[0][0][0] == [str(uv), "self", "update"]
-        assert stamp.stat().st_mtime > old + 30, "successful self-update must refresh the stamp"
+        assert result == str(uv)
+        mock_repair.assert_called_once_with(str(uv))
 
 
 
@@ -618,14 +605,24 @@ class TestRuntimeCutover:
 # ---------------------------------------------------------------------------
 
 class TestInstallUvInternals:
-    def test_posix_sets_uv_unmanaged_install(self, tmp_path):
+    def test_delegates_to_the_pinned_provisioner(self, tmp_path):
+        """_install_uv is a thin veneer over provision_tool("uv") — the pin
+        table is the only uv acquisition authority."""
+        from hermes_cli.managed_uv import _install_uv
+
         target = tmp_path / ".hermes-runtime" / "uv" / "uv"
-        with patch("hermes_cli.managed_uv._install_uv_posix") as mock_posix:
-            from hermes_cli.managed_uv import _install_uv
+        ok = SimpleNamespace(ok=True, detail="")
+        with patch("installation.provisioner.provision_tool", return_value=ok) as mock_provision:
             _install_uv(target)
-            mock_posix.assert_called_once()
-            call_env = mock_posix.call_args[0][0]
-            assert call_env["UV_UNMANAGED_INSTALL"] == str(target.parent)
+        mock_provision.assert_called_once_with("uv")
+
+    def test_provisioner_failure_raises(self, tmp_path):
+        from hermes_cli.managed_uv import _install_uv
+
+        failed = SimpleNamespace(ok=False, detail="digest mismatch")
+        with patch("installation.provisioner.provision_tool", return_value=failed):
+            with pytest.raises(RuntimeError, match="digest mismatch"):
+                _install_uv(tmp_path / "uv")
 
 
 class TestRuntimeRequestMinorLine:
@@ -881,11 +878,11 @@ class TestListAvailablePatches:
 # ---------------------------------------------------------------------------
 
 class TestRefreshManagedUvCatalog:
-    """The managed uv is UV_UNMANAGED_INSTALL'd, so `uv self update` is
-    disabled and its python-build-standalone catalog freezes at bootstrap
-    age. python-build-standalone re-releases the same patch versions with
-    fixed SQLite, so a stale catalog makes provisioning fail forever with
-    no newer patch number to retry (issue #72093)."""
+    """uv's python-build-standalone catalog is frozen at the pinned uv's
+    version. python-build-standalone re-releases the same patch versions
+    with fixed SQLite, so a stale catalog makes provisioning fail forever
+    with no newer patch number to retry (issue #72093). The refresh
+    re-runs the provisioner so a pin bump carries a new catalog in."""
 
 
     def test_version_change_reports_true(self, tmp_path):
