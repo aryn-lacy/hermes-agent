@@ -178,6 +178,12 @@ def main() -> int:
         "scripts/install.ps1": _splice(
             REPO_ROOT / "scripts" / "install.ps1", _ps1_fragment(uv, git), args.check
         ),
+        # The dev-checkout wrapper stages the same pinned uv, so it holds
+        # the same fragment. (Its git needs are covered by "you cloned
+        # this repo, so you have git".)
+        "setup-hermes.sh": _splice(
+            REPO_ROOT / "setup-hermes.sh", _sh_fragment(uv, git), args.check
+        ),
     }
     stale = [name for name, fresh in results.items() if not fresh]
     if args.check and stale:
