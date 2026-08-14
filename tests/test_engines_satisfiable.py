@@ -41,6 +41,12 @@ def _root_manifest() -> dict:
     return json.loads((REPO_ROOT / "package.json").read_text())
 
 
+def _pins() -> dict:
+    """The pin table the installers, Nix, Docker and the desktop all provision from."""
+    path = REPO_ROOT / "installation" / "runtime-pins.json"
+    return json.loads(path.read_text())["tools"]
+
+
 def _parse_major_minor_patch(version: str) -> tuple[int, int, int]:
     parts = version.split("-", 1)[0].split(".")
     nums = [int(p) for p in parts[:3]]
@@ -148,6 +154,51 @@ class TestEnginesAreSatisfiable:
             "22.12 — stricter than Vite requires. A desktop floor above the "
             "build toolchain's own floor replaces working user toolchains for "
             "nothing."
+        )
+
+
+class TestThePinnedToolchainSatisfiesEngines:
+    """The toolchain we actually install must clear the floor we declare.
+
+    Every install provisions node and npm from ``runtime-pins.json`` — the
+    installers treat a failed provision as a failed install, and Nix, Docker
+    and the desktop bundle build the runtime dir into the artifact. So the
+    pinned versions are not one candidate among several; they are the
+    toolchain every ``npm ci`` runs with.
+
+    ``TestEnginesAreSatisfiable`` above checks the floor against the npm
+    versions that ship bundled with a stock Node. That was the right question
+    when users arrived with their own toolchain. It cannot answer this one:
+    the pinned npm is deliberately NEWER than anything a Node release bundles,
+    so it is absent from that table by construction.
+
+    Relationships, not literals: a pin bump keeps these green, a pin that
+    breaks installs turns them red.
+    """
+
+    def test_the_pinned_node_satisfies_engines_node(self):
+        node_range = _root_manifest()["engines"]["node"]
+        pinned = _pins()["node"]["version"]
+        assert _satisfies_range(pinned, node_range), (
+            f"runtime-pins.json pins Node {pinned}, which does not satisfy "
+            f"engines.node {node_range!r}. engine-strict=true makes that a "
+            "hard failure on the first npm ci of every fresh install."
+        )
+
+    def test_the_pinned_npm_satisfies_engines_npm(self):
+        """Covers the exclude band too — it is part of the range.
+
+        engines.npm carries an excluded band (npm 11.10-11.16 ignore
+        min-release-age-exclude in .npmrc). Evaluating the whole range rather
+        than just its floor means a pin landing inside that band fails here
+        instead of on a user's machine.
+        """
+        npm_range = _root_manifest()["engines"]["npm"]
+        pinned = _pins()["npm"]["version"]
+        assert _satisfies_range(pinned, npm_range), (
+            f"runtime-pins.json pins npm {pinned}, which does not satisfy "
+            f"engines.npm {npm_range!r}. Every npm ci in the checkout would "
+            "abort with EBADENGINE."
         )
 
 
