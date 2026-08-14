@@ -410,7 +410,7 @@ export interface DesktopVersionInfo {
    * Where an external build's backend came from. Mirrors the resolution
    * ladder in `resolveHermesBackend()`; the tree-classification values
    * (`git` / `source` / sealed stewards) are the Python install methods from
-   * `hermes_cli.runtime_tree.install_method()` — the desktop does not
+   * `installation.tree.install_method()` — the desktop does not
    * re-derive them. Each variant carries the location it resolved from,
    * when there is one.
    */
@@ -423,7 +423,7 @@ export interface DesktopVersionInfo {
  * `source` is populated for external builds only after the backend has been
  * spawned — before the first launch it is absent.
  *
- * `type` follows `install_method()` in `hermes_cli/runtime_tree.py`: `git`
+ * `type` follows `install_method()` in `installation/tree.py`: `git`
  * (a checkout at a managed install root — `$HERMES_HOME/hermes-agent`),
  * `source` (a git checkout anywhere else), or a sealed-tree steward
  * (`docker` / `nix` / `desktop-app`). The Electron-only rungs — an explicit

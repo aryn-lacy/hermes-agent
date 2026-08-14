@@ -1159,7 +1159,7 @@ def _managed_runtime_path_entries() -> list[str]:
     managed tree can appear mid-process (a heal, a first browser install).
     """
     try:
-        from hermes_cli.runtime_env import managed_path_dirs
+        from installation.env import managed_path_dirs
 
         return [str(d) for d in managed_path_dirs()]
     except Exception:
@@ -1187,7 +1187,7 @@ def _apply_managed_runtime_tool_env(env: dict) -> None:
     mid-process, and a broken runtime dir must not break the terminal.
     """
     try:
-        from hermes_cli.runtime_env import managed_tool_env
+        from installation.env import managed_tool_env
 
         for key, value in managed_tool_env().items():
             env.setdefault(key, value)

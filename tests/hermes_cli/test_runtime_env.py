@@ -1,9 +1,9 @@
-"""Tests for hermes_cli.runtime_env — the single PATH/env assembler."""
+"""Tests for installation.env — the single PATH/env assembler."""
 
 import os
 
-from hermes_cli import runtime_env as re_mod
-from hermes_cli import runtime_registry as rr
+from installation import env as re_mod
+from installation import registry as rr
 
 
 def _provision(tmp_path, name, rel_bin, version="1.0.0", path_dirs=None,

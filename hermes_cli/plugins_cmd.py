@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
-from hermes_cli.runtime_env import (
+from installation.env import (
     is_macos_xcode_shim as _is_macos_xcode_shim,
     managed_tool_binary,
 )

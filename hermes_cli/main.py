@@ -1825,13 +1825,13 @@ def _ensure_tui_node() -> None:
         return
 
     try:
-        from hermes_cli.runtime_provisioner import provision_tool
+        from installation.provisioner import provision_tool
 
         provision_tool("node")
     except Exception:  # noqa: BLE001 — no Node is a degrade, not a crash
         return
 
-    from hermes_cli.runtime_env import managed_path_dirs
+    from installation.env import managed_path_dirs
 
     parts = os.environ.get("PATH", "").split(os.pathsep)
     for extra in managed_path_dirs():

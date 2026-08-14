@@ -4334,7 +4334,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # refuse when nobody can answer. --yes skips the question. The guard
     # is a courtesy: an unclassifiable PROJECT_ROOT skips it and keeps the
     # historical behavior.
-    from hermes_cli.runtime_tree import is_managed_install_root
+    from installation.tree import is_managed_install_root
 
     try:
         project_root = Path(_m().PROJECT_ROOT)

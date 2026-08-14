@@ -2,7 +2,7 @@
   "$id": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/runtime-pins.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Hermes Tool Provisioning Manifest",
-  "description": "Exact, verifiable pins for every tool Hermes manages per-install. One source of truth read by hermes_cli/runtime_provisioner.py and desktop payload staging. Every tool pins an exact version plus, per target, an exact download URL and its sha256.",
+  "description": "Exact, verifiable pins for every tool Hermes manages per-install. One source of truth read by installation/provisioner.py and desktop payload staging. Every tool pins an exact version plus, per target, an exact download URL and its sha256.",
   "type": "object",
   "required": ["schemaVersion", "tools"],
   "additionalProperties": false,

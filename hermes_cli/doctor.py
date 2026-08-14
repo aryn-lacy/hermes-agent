@@ -221,8 +221,8 @@ def _check_managed_runtimes() -> None:
     its steward can fix it.
     """
     try:
-        from hermes_cli.runtime_registry import load_facts, load_pins, satisfies
-        from hermes_cli.runtime_tree import Sealed, runtime_tree
+        from installation.registry import load_facts, load_pins, satisfies
+        from installation.tree import Sealed, runtime_tree
         from hermes_constants import get_install_root, get_runtime_dir
 
         runtime_dir = get_runtime_dir()
@@ -715,7 +715,7 @@ def check_legacy_desktop_checkout() -> None:
     clean tree); a false "pristine" is not (the suggestion could cost
     local work). Doctor never deletes anything itself.
     """
-    from hermes_cli.runtime_tree import Sealed, runtime_tree
+    from installation.tree import Sealed, runtime_tree
 
     try:
         from hermes_cli.main import PROJECT_ROOT

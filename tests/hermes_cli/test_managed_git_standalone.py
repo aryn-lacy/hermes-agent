@@ -20,9 +20,9 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import runtime_env
-from hermes_cli import runtime_provisioner as rp
-from hermes_cli.runtime_registry import load_facts, load_pins, save_facts, RuntimeFact
+from installation import env as runtime_env
+from installation import provisioner as rp
+from installation.registry import load_facts, load_pins, save_facts, RuntimeFact
 
 pytestmark = pytest.mark.skipif(
     os.name == "nt",

@@ -902,7 +902,7 @@ def _nous_recommended_disk_path() -> "Path":
     Install-scoped (hermes-home lifetime split): regenerable, and its
     shape belongs to the code that wrote it.
     """
-    from hermes_cli.runtime_env import runtime_cache_dir
+    from installation.env import runtime_cache_dir
     return runtime_cache_dir() / "nous_recommended_cache.json"
 
 

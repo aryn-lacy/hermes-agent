@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import runtime_env
-from hermes_cli import runtime_provisioner as rp
+from installation import env as runtime_env
+from installation import provisioner as rp
 from hermes_cli._subprocess_compat import noninteractive_git_env
 
 pytestmark = pytest.mark.skipif(

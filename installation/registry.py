@@ -43,17 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-# hermes_constants is imported lazily, inside the two functions that need it.
-# The pin/fact tables are the bottom of the runtime layer — the provisioner
-# imports THIS module before a venv exists — and hermes_constants imports
-# back into here for the pinned Node major. A module-level import either way
-# makes that a real cycle instead of a deferred one.
-
-
-def _default_runtime_dir() -> Path:
-    from hermes_constants import get_runtime_dir
-
-    return get_runtime_dir()
+from installation.paths import get_runtime_dir
 
 PINS_FILENAME = "runtime-pins.json"
 FACTS_FILENAME = "runtimes.json"
@@ -130,25 +120,22 @@ class PinnedFile:
 def pins_path(install_root: Path | None = None) -> Path:
     """Path to the pin table.
 
-    Pins ship WITH the code, so the default is this package's parent (the
-    repo root for a checkout, the payload's repo/ dir for the desktop
-    bundle) rather than ``get_install_root()`` — the install root is where
-    tools get INSTALLED, and callers may point it elsewhere.
+    Pins ship WITH the code, so the default is this package's own
+    directory: the table is package data, versioned and reviewed with the
+    module that reads it, rather than a repo-root file this module has to
+    reach up for. ``get_install_root()`` is deliberately not consulted —
+    that is where tools get INSTALLED, and callers may point it elsewhere.
 
-    ``HERMES_RUNTIME_PINS`` overrides that for packaged installs whose
-    Python lives in a sealed venv with no repo root above it. It is the
-    same bare-data-dir case as ``HERMES_OPTIONAL_SKILLS`` and
-    ``HERMES_BUILD_INFO``: the table is not a Python package, so the
-    packager ships it into its own store path and points at it. The
-    explicit *install_root* argument still wins, because a caller naming
-    a root means that root.
+    ``HERMES_RUNTIME_PINS`` overrides that for packagers who ship the
+    table into its own store path. The explicit *install_root* argument
+    still wins, because a caller naming a root means that root.
     """
     if install_root is not None:
         return install_root / PINS_FILENAME
     override = os.getenv("HERMES_RUNTIME_PINS", "").strip()
     if override:
         return Path(override)
-    return Path(__file__).resolve().parent.parent / PINS_FILENAME
+    return Path(__file__).resolve().parent / PINS_FILENAME
 
 
 # Loopback http is allowed so tests can serve real archives from a local
@@ -355,7 +342,7 @@ class RuntimeFact:
 
 
 def facts_path(runtime_dir: Path | None = None) -> Path:
-    base = runtime_dir if runtime_dir is not None else _default_runtime_dir()
+    base = runtime_dir if runtime_dir is not None else get_runtime_dir()
     return base / FACTS_FILENAME
 
 
@@ -381,7 +368,7 @@ def load_facts(runtime_dir: Path | None = None) -> dict[str, RuntimeFact]:
 def load_path_order(runtime_dir: Path | None = None) -> list[str]:
     """The PATH assembly order the provisioner derived from the pins.
 
-    Written into the facts so both readers (hermes_cli/runtime_env.py and
+    Written into the facts so both readers (installation/env.py and
     apps/desktop/electron/backend-env.ts) consume the SAME data rather
     than each restating a literal list that has to be kept in sync by
     hand. Empty when nothing is provisioned yet.
@@ -457,7 +444,7 @@ def tool_path(name: str, runtime_dir: Path | None = None) -> Optional[Path]:
     """Absolute path to a managed tool's binary, or None when not
     provisioned (or recorded but vanished — treat as unprovisioned; the
     provisioner heals on next update)."""
-    base = runtime_dir if runtime_dir is not None else _default_runtime_dir()
+    base = runtime_dir if runtime_dir is not None else get_runtime_dir()
     fact = load_facts(base).get(name)
     if fact is None:
         return None

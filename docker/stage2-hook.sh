@@ -397,7 +397,7 @@ as_hermes mkdir -p \
 
 # --- Legacy home-scoped stamp cleanup ---
 # Install provenance is code-scoped now (/opt/hermes/install-stamp.json;
-# see hermes_cli/runtime_tree.py) and nothing reads $HERMES_HOME/.install_method
+# see installation/tree.py) and nothing reads $HERMES_HOME/.install_method
 # anymore. Older images DID stamp 'docker' into $HERMES_HOME on every boot —
 # and $HERMES_HOME is a shared data volume, commonly bind-mounted from the
 # host (~/.hermes:/opt/data) and sometimes shared with a host-side

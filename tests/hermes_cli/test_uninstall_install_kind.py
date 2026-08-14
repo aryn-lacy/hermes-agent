@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 import hermes_cli.uninstall as un
-from hermes_cli.runtime_tree import (
+from installation.tree import (
     STEWARD_DESKTOP,
     STEWARD_DOCKER,
     STEWARD_NIX,
@@ -64,7 +64,7 @@ def _fake_project_root(monkeypatch, tmp_path: Path, *, git: bool, distribution: 
     if git:
         (root / ".git").mkdir()
     if distribution is not None:
-        # The code-scoped stamp (see hermes_cli.runtime_tree.BUILD_INFO_NAME).
+        # The code-scoped stamp (see installation.tree.BUILD_INFO_NAME).
         (root / "install-stamp.json").write_text(json.dumps({"distribution": distribution}))
     monkeypatch.setattr(un, "get_project_root", lambda: root)
     return root
@@ -186,7 +186,7 @@ def test_run_data_uninstall_works_on_sealed_trees(monkeypatch, tmp_path):
 
 def test_gui_summary_reports_steward_and_gate(monkeypatch, tmp_path):
     import hermes_cli.gui_uninstall as gu
-    from hermes_cli import runtime_tree as rt
+    from installation import tree as rt
 
     home = tmp_path / ".hermes"
     home.mkdir()

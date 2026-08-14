@@ -1,4 +1,4 @@
-"""Tests for hermes_cli.runtime_registry — exact pins, targets, facts.
+"""Tests for installation.registry — exact pins, targets, facts.
 
 Pure logic: no network, no real install. The pin table is EXACT by
 design (no ranges, no "resolve latest"), so these assert the shape of
@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from hermes_cli import runtime_registry as rr
+from installation import registry as rr
 
 
 def _pins(tools, schema=rr.PINS_SCHEMA_VERSION):

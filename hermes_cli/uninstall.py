@@ -40,7 +40,7 @@ def code_removal_refusal() -> "str | None":
     trees; the text always points at ``hermes uninstall --data`` for the
     user-data cleanup that IS allowed everywhere.
     """
-    from hermes_cli.runtime_tree import GitCheckout, runtime_tree, steward_uninstall_message
+    from installation.tree import GitCheckout, runtime_tree, steward_uninstall_message
 
     tree = runtime_tree(get_project_root())
     if isinstance(tree, GitCheckout):
@@ -1128,7 +1128,7 @@ def main(argv=None) -> int:
     code-removing modes hard-fail there with the steward's instructions.
 
     This module imports only stdlib + ``hermes_constants`` + ``hermes_cli.colors``
-    (and lazily ``hermes_cli.gui_uninstall`` / ``hermes_cli.runtime_tree``), so
+    (and lazily ``hermes_cli.gui_uninstall`` / ``installation.tree``), so
     it runs fine under a bare system Python with no site-packages from the venv.
     """
     import argparse

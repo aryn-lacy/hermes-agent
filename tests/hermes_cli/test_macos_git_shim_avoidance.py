@@ -14,8 +14,8 @@ resolver's data rather than by pretending to be another OS.
 
 import pytest
 
-from hermes_cli import runtime_env
-from hermes_cli.runtime_registry import RuntimeFact, save_facts
+from installation import env as runtime_env
+from installation.registry import RuntimeFact, save_facts
 
 
 class TestManagedToolBinary:

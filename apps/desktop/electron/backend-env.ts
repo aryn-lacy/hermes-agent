@@ -177,7 +177,7 @@ function readRuntimeFactsFile(
  * Managed runtime bin dirs, in assembly order.
  *
  * The registry's facts file decides WHICH tools exist, WHERE, and in WHAT
- * ORDER — this is a reader of the same data hermes_cli/runtime_env.py
+ * ORDER — this is a reader of the same data installation/env.py
  * serves to the Python side, not a second copy of the layout rules. That
  * mattered twice: an earlier version hard-coded `$HERMES_HOME/node{,/bin}`
  * and had to be kept in sync with `iter_hermes_node_dirs()` by comment,

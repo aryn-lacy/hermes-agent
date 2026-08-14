@@ -1,6 +1,6 @@
 """The runtimes.json contract holds across Python and TypeScript.
 
-Two languages read the same facts file: hermes_cli/runtime_env.py builds
+Two languages read the same facts file: installation/env.py builds
 the PATH for Python-spawned subprocesses, apps/desktop/electron/backend-env.ts
 does it for the Electron backend. AGENTS.md's rule for cross-language
 manifest writers applies — write it with one, read it with the other.
@@ -17,8 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import runtime_env
-from hermes_cli import runtime_registry as rr
+from installation import env as runtime_env
+from installation import registry as rr
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_ENV_TS = REPO_ROOT / "apps" / "desktop" / "electron" / "backend-env.ts"

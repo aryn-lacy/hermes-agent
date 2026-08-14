@@ -20,8 +20,8 @@ import sys
 from pathlib import Path
 from typing import Mapping, Optional
 
-from hermes_constants import get_runtime_dir
-from hermes_cli.runtime_registry import RuntimeFact, load_facts, load_path_order
+from installation.paths import get_runtime_dir
+from installation.registry import RuntimeFact, load_facts, load_path_order
 
 __all__ = [
     "managed_path_dirs",

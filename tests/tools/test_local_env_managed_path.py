@@ -18,7 +18,7 @@ class TestManagedRuntimePathEntries:
         directories — one resolver owns the policy."""
         node_bin = tmp_path / "node" / "bin"
         node_bin.mkdir(parents=True)
-        import hermes_cli.runtime_env as runtime_env
+        import installation.env as runtime_env
 
         monkeypatch.setattr(runtime_env, "managed_path_dirs", lambda *a, **k: [node_bin])
         assert local._managed_runtime_path_entries() == [str(node_bin)]
@@ -26,7 +26,7 @@ class TestManagedRuntimePathEntries:
     def test_registry_failure_degrades_to_empty(self, monkeypatch):
         """A broken/absent registry must not break the terminal tool — no
         managed dirs simply means system tools."""
-        import hermes_cli.runtime_env as runtime_env
+        import installation.env as runtime_env
 
         def _boom(*a, **k):
             raise RuntimeError("registry unavailable")

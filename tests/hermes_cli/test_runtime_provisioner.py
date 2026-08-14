@@ -1,4 +1,4 @@
-"""Tests for hermes_cli.runtime_provisioner.
+"""Tests for installation.provisioner.
 
 The decision core runs against a LOCAL http server serving real archives,
 so download → verify → extract → run → record is exercised end to end
@@ -19,8 +19,8 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import runtime_provisioner as rp
-from hermes_cli import runtime_registry as rr
+from installation import provisioner as rp
+from installation import registry as rr
 from hermes_constants import get_runtime_dir
 
 

@@ -249,7 +249,7 @@ def gui_install_summary(hermes_home: "Path | None" = None) -> dict:
     packaged = [p for p in packaged_gui_app_paths() if p.exists()]
     userdata = desktop_userdata_dir()
 
-    from hermes_cli.runtime_tree import GitCheckout, runtime_tree
+    from installation.tree import GitCheckout, runtime_tree
 
     code_root = Path(__file__).parent.parent.resolve()
     tree = runtime_tree(code_root)

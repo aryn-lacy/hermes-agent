@@ -1,9 +1,9 @@
-"""Tests for hermes_cli/runtime_tree.py — tree classification and channel."""
+"""Tests for installation/tree.py — tree classification and channel."""
 
 import json
 from pathlib import Path
 
-from hermes_cli.runtime_tree import (
+from installation.tree import (
     CHANNEL_MAIN,
     CHANNEL_STABLE,
     STEWARD_UPDATE_MESSAGES,

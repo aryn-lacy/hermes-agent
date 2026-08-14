@@ -218,73 +218,17 @@ def get_default_hermes_root() -> Path:
 # ``<install root>/.hermes-runtime/``. Two installs sharing one home must
 # never share these (different node versions, venv ABIs, update stamps).
 
-RUNTIME_DIR_NAME = ".hermes-runtime"
-
-_INSTALL_ROOT_OVERRIDE: ContextVar[str | object] = ContextVar(
-    "_INSTALL_ROOT_OVERRIDE", default=_UNSET
+# Install paths live in `installation.paths` — the bottom of that layer,
+# where the pin/fact tables and the provisioner can reach them without
+# importing back up into this module. Re-exported here because ~40 callers
+# already ask hermes_constants for them.
+from installation.paths import (  # noqa: E402
+    RUNTIME_DIR_NAME,
+    get_install_root,
+    get_runtime_dir,
+    reset_install_root_override,
+    set_install_root_override,
 )
-
-
-def set_install_root_override(path: str | Path | None) -> Token:
-    """Override the install root for this context (desktop resourcesPath,
-    tests). Pass ``None`` to explicitly restore the default derivation."""
-    value: str | object = _UNSET if path is None else str(path)
-    return _INSTALL_ROOT_OVERRIDE.set(value)
-
-
-def reset_install_root_override(token: Token) -> None:
-    _INSTALL_ROOT_OVERRIDE.reset(token)
-
-
-def get_install_root() -> Path:
-    """Return the root directory of THIS install of Hermes.
-
-    Resolution order:
-      1. ``HERMES_INSTALL_ROOT`` env var — set by the desktop app
-         (resources payload) and by tests. An env var rather than only a
-         ContextVar because child processes (post-update phase, tool
-         subprocesses) must inherit it across the process boundary.
-      2. Context override (``set_install_root_override``) — in-process
-         callers that cannot mutate the environment.
-      3. The directory containing this module — for a source checkout
-         this IS the repo root (``hermes_constants.py`` sits at top
-         level; same derivation ``managed_uv.py`` uses for
-         ``_PROJECT_ROOT``).
-
-    pip/wheel layouts are unsupported by design (setup.py blocks wheel
-    builds outside Nix), so rung 3 is always a real, writable checkout —
-    or the caller set rung 1/2.
-    """
-    env_root = os.environ.get("HERMES_INSTALL_ROOT", "")
-    if env_root:
-        return Path(env_root)
-    override = _INSTALL_ROOT_OVERRIDE.get()
-    if override is not _UNSET:
-        return Path(str(override))
-    return Path(__file__).resolve().parent
-
-
-def get_runtime_dir(install_root: Path | None = None) -> Path:
-    """Return the install-scoped runtime directory ``<root>/.hermes-runtime``.
-
-    Holds managed binaries (node, npm, uv, git, gh, ripgrep), install-keyed
-    caches, and the ``runtimes.json`` facts manifest. Callers must treat
-    the location as opaque and go through the runtime registry for tool
-    lookup — no path literals.
-
-    ``HERMES_RUNTIME_DIR`` overrides it for packagers that BUILD the
-    runtime dir instead of provisioning it: the Nix package assembles one
-    from the pin table at build time and points here, because its install
-    root is an immutable store path that no provisioner can write to. An
-    explicit *install_root* still wins — a caller naming a root means
-    that root.
-    """
-    if install_root is None:
-        override = os.environ.get("HERMES_RUNTIME_DIR", "").strip()
-        if override:
-            return Path(override)
-    root = install_root if install_root is not None else get_install_root()
-    return root / RUNTIME_DIR_NAME
 
 
 def get_optional_skills_dir(default: Path | None = None) -> Path:
@@ -431,13 +375,13 @@ def _node_target_major() -> int:
     written to prevent came back.
     """
     try:
-        from hermes_cli.runtime_registry import load_pins
+        from installation.registry import load_pins
 
-        # Pins ship WITH the code, so they are read relative to this module
-        # — not from get_install_root(), which callers can point elsewhere
-        # (desktop resourcesPath, tests) and which would then silently lose
-        # the pin file and fall back.
-        pins = load_pins(Path(__file__).resolve().parent)
+        # No install_root: the registry defaults to its own package dir,
+        # where the pin table now lives. Passing a root here is what would
+        # lose the file — a caller can point the install root anywhere
+        # (desktop resourcesPath, tests) and the pins do not move with it.
+        pins = load_pins()
         return int(str(pins["node"]["version"]).lstrip("v").split(".")[0])
     except Exception:
         return 22
@@ -512,7 +456,7 @@ def _provision_managed_node() -> bool:
     platform, so installer and self-heal cannot drift apart.
     """
     try:
-        from hermes_cli.runtime_provisioner import provision_tool
+        from installation.provisioner import provision_tool
 
         return provision_tool("node").ok
     except Exception:  # noqa: BLE001 — a failed heal degrades to system Node

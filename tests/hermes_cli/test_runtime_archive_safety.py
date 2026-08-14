@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import runtime_provisioner as rp
+from installation import provisioner as rp
 
 
 def _tar(path: Path, members: dict[str, bytes]) -> Path:

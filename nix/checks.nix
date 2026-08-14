@@ -47,7 +47,7 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
         # code, so a drift would fail `hermes doctor` on a nix install.
         runtime-pins-are-the-source =
           let
-            pins = (builtins.fromJSON (builtins.readFile ../runtime-pins.json)).tools;
+            pins = (builtins.fromJSON (builtins.readFile ../installation/runtime-pins.json)).tools;
             runtimeDir = pkgs.callPackage ./runtime-pins.nix { };
             mismatched = lib.filterAttrs (
               name: entry: runtimeDir.${name}.pinnedVersion != entry.version
@@ -66,14 +66,14 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           );
 
         # The nix-built runtime dir satisfies the Python readers with no
-        # nix-specific code: `hermes_cli.runtime_env` assembles PATH from
+        # nix-specific code: `installation.env` assembles PATH from
         # its facts, every pinned tool runs (patchelf'd), and each reports
         # the version the table pinned. That is the whole contract — if
         # this passes, a nix install needs no special handling anywhere.
         runtime-dir-serves-python =
           let
             runtimeDir = pkgs.callPackage ./runtime-pins.nix { };
-            pins = (builtins.fromJSON (builtins.readFile ../runtime-pins.json)).tools;
+            pins = (builtins.fromJSON (builtins.readFile ../installation/runtime-pins.json)).tools;
             # "How do I ask your version" is genuinely per-tool; the TOOLS
             # come from the table, so a new pin surfaces here as a missing
             # probe rather than going silently unchecked.
@@ -110,7 +110,7 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
               # above site-packages, so the pin table is pointed at by
               # HERMES_RUNTIME_PINS — the same bare-data-dir treatment as
               # HERMES_OPTIONAL_SKILLS and HERMES_BUILD_INFO.
-              export HERMES_RUNTIME_PINS=${../runtime-pins.json}
+              export HERMES_RUNTIME_PINS=${../installation/runtime-pins.json}
               export HERMES_RUNTIME_DIR=${runtimeDir}
 
               # PATH comes from the facts file, via the same assembler
@@ -122,7 +122,7 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
               eval "$(${hermesVenv}/bin/python3 - <<'PY'
               import os
               from pathlib import Path
-              from hermes_cli.runtime_env import with_managed_runtimes
+              from installation.env import with_managed_runtimes
 
               env = with_managed_runtimes(
                   {"PATH": os.environ["PATH"]}, runtime_dir=Path("${runtimeDir}")
@@ -149,7 +149,7 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
               ${hermesVenv}/bin/python3 - <<'PY'
               import json, tempfile
               from pathlib import Path
-              from hermes_cli.runtime_provisioner import require_current_runtimes, stale_tools
+              from installation.provisioner import require_current_runtimes, stale_tools
 
               runtime_dir = Path("${runtimeDir}")
               drift = stale_tools(runtime_dir=runtime_dir)

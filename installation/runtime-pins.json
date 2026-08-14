@@ -1,6 +1,6 @@
 {
   "$schema": "./runtime-pins.schema.json",
-  "$comment": "ONE source of truth, read by the Python provisioner (hermes_cli/runtime_provisioner.py) and by the desktop payload staging, which shells out to it. Every entry pins an EXACT version plus, per target, the exact download URL and its sha256. No ranges, no 'resolve latest and hope': a build is reproducible, needs no GitHub API (unauthenticated callers get 60 requests/hour), and a tool cannot silently change under users. Bump deliberately: change the version, refresh every url+sha256 for that tool, verify, commit. Tool ORDER is derived from this file too — see 'extends'.",
+  "$comment": "ONE source of truth, read by the Python provisioner (installation/provisioner.py) and by the desktop payload staging, which shells out to it. Every entry pins an EXACT version plus, per target, the exact download URL and its sha256. No ranges, no 'resolve latest and hope': a build is reproducible, needs no GitHub API (unauthenticated callers get 60 requests/hour), and a tool cannot silently change under users. Bump deliberately: change the version, refresh every url+sha256 for that tool, verify, commit. Tool ORDER is derived from this file too — see 'extends'.",
   "schemaVersion": 2,
   "tools": {
     "node": {

@@ -246,7 +246,7 @@ _LOCAL_PROBE_DISK_TTL_SECONDS = 300.0
 def _local_probe_disk_cache_path() -> Path:
     # Install-scoped: regenerable probe results whose shape this install's
     # code owns (hermes-home lifetime split).
-    from hermes_cli.runtime_env import runtime_cache_dir
+    from installation.env import runtime_cache_dir
     return runtime_cache_dir() / "local_endpoint_probes.json"
 
 
@@ -300,7 +300,7 @@ def _get_model_metadata_cache_path() -> Path:
     Install-scoped (hermes-home lifetime split): regenerable, and its
     shape belongs to the code that wrote it.
     """
-    from hermes_cli.runtime_env import runtime_cache_dir
+    from installation.env import runtime_cache_dir
     return runtime_cache_dir() / "openrouter_model_metadata.json"
 
 

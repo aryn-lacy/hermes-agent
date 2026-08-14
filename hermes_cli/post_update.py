@@ -197,8 +197,8 @@ def step_provision_runtimes() -> dict:
     """Provision managed runtime tools (node, npm, uv, git, gh, ripgrep) into
     the install-scoped runtime dir from runtime-pins.json. THE dep engine
     for updates AND fresh installs (--install-phase); see
-    hermes_cli/runtime_provisioner.py."""
-    from hermes_cli.runtime_provisioner import step_provision_runtimes as _run
+    installation/provisioner.py."""
+    from installation.provisioner import step_provision_runtimes as _run
 
     return _run()
 
@@ -272,7 +272,7 @@ def main(argv: list | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     if args.install_phase:
-        from hermes_cli.runtime_provisioner import provision_runtimes
+        from installation.provisioner import provision_runtimes
 
         results = provision_runtimes(
             emit=lambda event: print(json.dumps(event), flush=True)

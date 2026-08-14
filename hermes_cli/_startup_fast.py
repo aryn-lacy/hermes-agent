@@ -166,7 +166,7 @@ def read_install_method() -> str | None:
     """Derive the install method with stdlib-only probes.
 
     Mirrors ``config.detect_install_method`` (which delegates to
-    ``runtime_tree.install_method``) cheaply: the code-scoped
+    ``installation.tree.install_method``) cheaply: the code-scoped
     ``install-stamp.json`` names the steward of a sealed tree; a ``.git``
     tree is ``git`` at the managed install roots and ``source`` elsewhere.
     On the fast path home ambiguity is already excluded:

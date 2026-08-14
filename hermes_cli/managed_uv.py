@@ -86,7 +86,7 @@ def _record_uv_fact(binary: Path) -> None:
     facts file improves doctor/uninstall fidelity but a recording failure
     must never break a working uv."""
     try:
-        from hermes_cli.runtime_registry import record_fact
+        from installation.registry import record_fact
 
         version_out = subprocess.run(
             [str(binary), "--version"],
@@ -312,7 +312,7 @@ def _uv_self_update_stamp_path() -> Path:
     the other's for a week). Lives in the runtime dir's cache beside the
     binary it is about (hermes-home lifetime split, phase 5.13).
     """
-    from hermes_cli.runtime_env import runtime_cache_dir
+    from installation.env import runtime_cache_dir
 
     return runtime_cache_dir() / ".uv_self_update_stamp"
 

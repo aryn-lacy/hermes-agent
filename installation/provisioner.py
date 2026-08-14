@@ -41,9 +41,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from hermes_constants import get_install_root, get_runtime_dir
-from hermes_cli.runtime_tree import Sealed, runtime_tree
-from hermes_cli.runtime_registry import (
+from installation.paths import get_install_root, get_runtime_dir
+from installation.tree import Sealed, runtime_tree
+from installation.registry import (
     PinnedFile,
     RuntimeFact,
     current_target,
@@ -209,7 +209,7 @@ def _probe_env(entry: dict, rt: Path) -> Optional[dict[str, str]]:
     """
     if not entry.get("extends"):
         return None
-    from hermes_cli.runtime_env import with_managed_runtimes
+    from installation.env import with_managed_runtimes
 
     return with_managed_runtimes(runtime_dir=rt)
 
@@ -613,14 +613,14 @@ def step_provision_runtimes() -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``python -m hermes_cli.runtime_provisioner`` — provision into a dir.
+    """``python -m installation.provisioner`` — provision into a dir.
 
     The desktop payload staging shells out to this rather than carrying a
     second implementation of download-and-verify in JavaScript.
     """
     import argparse
 
-    parser = argparse.ArgumentParser(prog="python -m hermes_cli.runtime_provisioner")
+    parser = argparse.ArgumentParser(prog="python -m installation.provisioner")
     parser.add_argument(
         "--runtime-dir",
         type=Path,

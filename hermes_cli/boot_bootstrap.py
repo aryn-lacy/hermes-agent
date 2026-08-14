@@ -112,7 +112,7 @@ def read_git_head(root: Path) -> str | None:
 def current_install_identity(project_root: Path) -> str | None:
     """What code this install is: stamp commit for sealed trees, git HEAD
     for checkouts, None for broken trees (never bootstrap, never write)."""
-    from hermes_cli.runtime_tree import read_build_info
+    from installation.tree import read_build_info
 
     root = Path(project_root)
     if (root / ".git").exists():

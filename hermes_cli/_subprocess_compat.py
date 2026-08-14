@@ -390,7 +390,7 @@ def noninteractive_git_env(
     # in the registry. Fail-open — a broken/absent runtime dir must not
     # take down git invocations that were working with a system git.
     try:
-        from hermes_cli.runtime_env import managed_tool_env
+        from installation.env import managed_tool_env
 
         for key, value in managed_tool_env().items():
             env.setdefault(key, value)

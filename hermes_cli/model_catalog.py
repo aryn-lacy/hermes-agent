@@ -119,7 +119,7 @@ def _cache_path() -> Path:
     so two installs at different versions must not share it (the cost of
     NOT sharing is one refetch). Imported lazily so tests can monkeypatch.
     """
-    from hermes_cli.runtime_env import runtime_cache_dir
+    from installation.env import runtime_cache_dir
     return runtime_cache_dir() / "model_catalog.json"
 
 

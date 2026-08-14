@@ -441,7 +441,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     """Detect how Hermes was installed.
 
     Everything derives from the tree the running code sits in — see
-    ``hermes_cli.runtime_tree.install_method`` for the ladder:
+    ``installation.tree.install_method`` for the ladder:
 
     * ``docker`` / ``nix`` / ``desktop-app`` — sealed tree; the build stamp
       (``install-stamp.json``) names the steward in ``distribution``.
@@ -462,7 +462,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
     stamp lives in the immutable code tree (and git trees carry ``.git``),
     so co-located installs cannot clobber each other. See issue #34397.
     """
-    from hermes_cli.runtime_tree import install_method
+    from installation.tree import install_method
 
     return install_method(_install_method_project_root(project_root))
 

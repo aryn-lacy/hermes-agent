@@ -770,8 +770,10 @@ class TestNodeTargetMajorFollowsThePins:
         import json
         from pathlib import Path
 
+        import installation
+
         pins = json.loads(
-            (Path(hermes_constants.__file__).resolve().parent / "runtime-pins.json")
+            (Path(installation.__file__).resolve().parent / "runtime-pins.json")
             .read_text(encoding="utf-8")
         )
         return int(str(pins["tools"]["node"]["version"]).lstrip("v").split(".")[0])

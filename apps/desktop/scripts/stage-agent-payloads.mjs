@@ -276,7 +276,7 @@ function loadPins() {
  * provisioner a source install and `hermes update` use. Everything about
  * a tool — its exact version, its per-target download URL and sha256, how
  * its archive unpacks — lives in runtime-pins.json and
- * hermes_cli/runtime_provisioner.py. A second implementation here would
+ * installation/provisioner.py. A second implementation here would
  * be a second thing to keep correct, and the digest verification is not
  * something to reimplement twice.
  *
@@ -294,7 +294,7 @@ function stageManagedRuntimes(target, outDir, pythonExe) {
 
   run(pythonExe, [
     "-m",
-    "hermes_cli.runtime_provisioner",
+    "installation.provisioner",
     "--runtime-dir",
     outDir,
     "--target",
@@ -812,7 +812,7 @@ function stageNode(target, outDir) {
 
 /**
  * The runtime-registry facts for a staged payload. Same schema
- * hermes_cli/runtime_registry.py writes for a source install, so the
+ * installation/registry.py writes for a source install, so the
  * desktop's backend-env reads BOTH artifact kinds through one code path
  * (paths are relative to the payload dir, keeping it relocatable).
  *

@@ -13,6 +13,12 @@
       packages = builtins.attrValues self'.packages;
       hermesNpmLib = self'.packages.default.passthru.hermesNpmLib;
 
+      # The managed runtime tools, from runtime-pins.json — the same
+      # table a source install, `hermes update` and the nix package all
+      # use. A developer's node/npm/git/gh/ripgrep are therefore the
+      # versions users get, not whatever nixpkgs carries this week.
+      runtimeDir = pkgs.callPackage ../nix/runtime-pins.nix { };
+
       # Collect all packageJsonPath values from npm workspace packages.
       npmPackageJsonPaths = builtins.filter (p: p != null) (
         map (p: p.passthru.packageJsonPath or null) packages
@@ -27,9 +33,9 @@
               mkdir -p $out/bin
               install -Dm755 ${../hermes} $out/bin/hermes
             '')
-            uv
             # hermes egress setup (iron-proxy) shells out to openssl for CA
             # generation; tests/test_iron_proxy_cli.py exercises that wizard.
+            # Not a managed tool, so the pin table does not supply it.
             openssl
             # Validate GitHub Actions workflows before pushing CI changes.
             actionlint
@@ -56,6 +62,34 @@
           ${self'.packages.default.passthru.devShellHook}
           ${self'.packages.desktop.passthru.devShellHook}
           ${hermesNpmLib.mkNpmDevShellHook npmPackageJsonPaths}
+
+          # Point the devshell's Hermes at the SAME runtime dir the nix
+          # package ships, so `hermes doctor` here reports what a nix
+          # install reports. Without this it resolves the runtime dir
+          # relative to the checkout and finds nothing provisioned —
+          # true, but not the thing a developer is testing.
+          export HERMES_RUNTIME_DIR="${runtimeDir}"
+
+          # The pinned tools go on PATH FIRST, in the dirs the bundle's
+          # own assembler recorded (runtime_env.managed_path_dirs), with
+          # the matching tool env from managed_tool_env. A developer gets
+          # the node/npm/uv/git/gh/ripgrep the pin table names — the same
+          # ones users get — rather than whatever nixpkgs carries.
+          #
+          # Both files are read here rather than rebuilt in Nix: the
+          # layouts are per-tool (uv and ripgrep keep their binary at the
+          # tree root, the rest use bin/) and the git contract is
+          # dugite's, and all of that already lives in the Python
+          # assembler. Recomputing either in `mkShell` would also mean
+          # import-from-derivation at eval time.
+          #
+          # PATH and the tool env must travel TOGETHER: a relocated
+          # dugite-native git resolves its helpers against a build-time
+          # prefix, so git on PATH without GIT_EXEC_PATH dies on
+          # "'remote-http' is not a git command". Anything that scrubs
+          # the environment has to keep both (see scripts/run_tests.sh).
+          export PATH="$(tr '\n' ':' < "${runtimeDir}/path-dirs")$PATH"
+          . "${runtimeDir}/tool-env"
 
           # Force Node to use Nix's playwright-test binary instead of node_modules/.bin
           export PATH="${pkgs.playwright-test}/bin:$PATH"

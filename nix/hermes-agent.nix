@@ -221,7 +221,7 @@ stdenv.mkDerivation (finalAttrs: {
     # treatment as the skills/locales above: symlink it in, point the
     # wrapper at it, and the Python readers consume it unchanged.
     ln -s ${runtimeDir} $out/share/hermes-agent/runtime
-    ln -s ${../runtime-pins.json} $out/share/hermes-agent/runtime-pins.json
+    ln -s ${../installation/runtime-pins.json} $out/share/hermes-agent/runtime-pins.json
 
     # The pinned tools' PATH dirs and tool env, as the bundle's own
     # assembler recorded them. Read here rather than in Nix so evaluation

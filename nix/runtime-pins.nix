@@ -14,11 +14,11 @@
 #     derivation takes node's, so Nix orders the builds and neither this
 #     file nor a reader restates "npm needs node";
 #   * `bundle` symlinks those derivations into the directory layout
-#     `hermes_cli/runtime_registry.py` describes, and writes `runtimes.json`
+#     `installation/registry.py` describes, and writes `runtimes.json`
 #     with the registry's own code.
 #
 # Nothing here wraps a program or exports an environment variable. The
-# bundle is a runtime dir, and `hermes_cli/runtime_env.py` already knows
+# bundle is a runtime dir, and `installation/env.py` already knows
 # how to turn one of those into PATH, GIT_EXEC_PATH, npm_config_cache and
 # the rest — on every install kind. A Nix-specific version of any of that
 # would be a second implementation of tested behaviour.
@@ -36,8 +36,7 @@
   zlib,
 }:
 let
-  repoRoot = ../.;
-  pins = (builtins.fromJSON (builtins.readFile ../runtime-pins.json)).tools;
+  pins = (builtins.fromJSON (builtins.readFile ../installation/runtime-pins.json)).tools;
 
   # Pin-table target keys use Node/Python spellings so one string works on
   # both sides of the JS/Python boundary; Nix systems spell it the other
@@ -58,8 +57,7 @@ let
   # the Python registry does — see `pinned_file`.
   artifactOf =
     name: entry:
-    entry.files.any
-      or entry.files.${target}
+    entry.files.any or entry.files.${target}
       or (throw "runtime-pins: ${name} has no pinned download for ${target}");
 
   # fetchurl's `sha256` takes the bare lowercase hex the table already
@@ -93,8 +91,7 @@ let
         version = entry.version;
         src = fetchPinned name entry;
 
-        nativeBuildInputs =
-          [ unzip ] ++ lib.optionals stdenv.hostPlatform.isLinux [ autoPatchelfHook ];
+        nativeBuildInputs = [ unzip ] ++ lib.optionals stdenv.hostPlatform.isLinux [ autoPatchelfHook ];
         buildInputs = patchelfInputs;
 
         dontUnpack = true;
@@ -200,20 +197,24 @@ let
 
   tools = lib.mapAttrs mkTool pins;
 
-  # The registry code, as a store path. Only the leaf modules the
-  # fact-writing and PATH assembly import — all pure-stdlib, so a bare
-  # python3 loads them with no venv, and the bundle does not depend on
-  # the whole repo (which would rebuild it on any source change).
-  registrySrc = runCommand "hermes-runtime-registry-src" { } ''
-    mkdir -p "$out/hermes_cli"
-    touch "$out/hermes_cli/__init__.py"
-    cp ${../hermes_cli/runtime_registry.py} "$out/hermes_cli/runtime_registry.py"
-    cp ${../hermes_cli/runtime_provisioner.py} "$out/hermes_cli/runtime_provisioner.py"
-    cp ${../hermes_cli/runtime_env.py} "$out/hermes_cli/runtime_env.py"
-    cp ${../hermes_cli/runtime_tree.py} "$out/hermes_cli/runtime_tree.py"
-    cp ${../hermes_constants.py} "$out/hermes_constants.py"
-    cp ${../runtime-pins.json} "$out/runtime-pins.json"
-  '';
+  # The installation package, filtered to source. An allowlist of .py and
+  # .json rather than a copy of the directory: a stray __pycache__ or an
+  # editor swapfile would otherwise change this derivation's hash, so the
+  # bundle would rebuild depending on whether someone had run Python in
+  # the checkout.
+  installationSrc = lib.cleanSourceWith {
+    src = ../installation;
+    name = "hermes-installation-src";
+    filter =
+      path: type:
+      let
+        base = baseNameOf (toString path);
+      in
+      if type == "directory" then
+        base != "__pycache__"
+      else
+        lib.hasSuffix ".py" base || lib.hasSuffix ".json" base;
+  };
 
   # The bundle IS a runtime dir: `<dir>/<tool>/...` per the registry's
   # layout, plus the `runtimes.json` facts manifest. Symlinks, so the
@@ -235,69 +236,67 @@ let
         };
       }
       ''
-    mkdir -p "$out"
-    ${lib.concatStringsSep "\n" (
-      lib.mapAttrsToList (name: drv: ''ln -s ${drv} "$out/${name}"'') tools
-    )}
+        mkdir -p "$out"
+        ${lib.concatStringsSep "\n" (lib.mapAttrsToList (name: drv: ''ln -s ${drv} "$out/${name}"'') tools)}
 
-    export PYTHONPATH=${registrySrc}
-    ${python3}/bin/python3 - "$out" ${registrySrc} "${target}" <<'PY'
-    import sys
-    from pathlib import Path
+        mkdir -p "$TMPDIR/pypath"
+        ln -s ${installationSrc} "$TMPDIR/pypath/installation"
+        export PYTHONPATH="$TMPDIR/pypath"
+        ${python3}/bin/python3 - "$out" "${target}" <<'PY'
+        import sys
+        from pathlib import Path
 
-    from hermes_cli.runtime_registry import (
-        RuntimeFact, install_order, load_pins, path_order, save_facts,
-    )
-    from hermes_cli.runtime_provisioner import _binary_rel, _path_dirs
+        from installation.registry import (
+            RuntimeFact, install_order, load_pins, path_order, save_facts,
+        )
+        from installation.provisioner import _binary_rel, _path_dirs
 
-    runtime_dir, registry_src, target = (
-        Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3],
-    )
-    pins = load_pins(registry_src)
+        runtime_dir, target = Path(sys.argv[1]), sys.argv[2]
+        pins = load_pins()
 
-    facts = {}
-    for tool in install_order(pins):
-        rel = _binary_rel(tool, target)
-        if not (runtime_dir / rel).exists():
-            raise SystemExit(f"runtime-pins: {tool} is missing {rel}")
-        facts[tool] = RuntimeFact(
-            version=pins[tool]["version"],
-            path=rel,
-            path_dirs=_path_dirs(tool, target),
+        facts = {}
+        for tool in install_order(pins):
+            rel = _binary_rel(tool, target)
+            if not (runtime_dir / rel).exists():
+                raise SystemExit(f"runtime-pins: {tool} is missing {rel}")
+            facts[tool] = RuntimeFact(
+                version=pins[tool]["version"],
+                path=rel,
+                path_dirs=_path_dirs(tool, target),
+            )
+
+        save_facts(facts, runtime_dir, path_order=path_order(pins))
+
+        # Emit the assembled PATH dirs and tool env for Nix consumers,
+        # straight out of the assembler every Hermes subprocess uses. Written
+        # as files rather than recomputed in Nix because both are genuinely
+        # per-tool and already encoded here: uv and ripgrep keep their binary
+        # at the tree root while the rest use bin/ (`_dirs_for`), and dugite's
+        # git needs GIT_EXEC_PATH or it cannot find its own remote helpers
+        # (`managed_tool_env`).
+        from installation.env import managed_path_dirs, managed_tool_env  # noqa: E402
+
+        dirs = managed_path_dirs(runtime_dir)
+        assert len(dirs) >= len(facts), (
+            f"assembled {len(dirs)} PATH dirs for {len(facts)} tools — "
+            "a provisioned tool contributed nothing"
+        )
+        (runtime_dir / "path-dirs").write_text(
+            "".join(f"{d}\n" for d in dirs), encoding="utf-8"
         )
 
-    save_facts(facts, runtime_dir, path_order=path_order(pins))
+        # Shell-sourceable, one `export K=V` per line. shlex.quote because a
+        # store path is well-behaved but this is going through a shell.
+        import shlex  # noqa: E402
 
-    # Emit the assembled PATH dirs and tool env for Nix consumers,
-    # straight out of the assembler every Hermes subprocess uses. Written
-    # as files rather than recomputed in Nix because both are genuinely
-    # per-tool and already encoded here: uv and ripgrep keep their binary
-    # at the tree root while the rest use bin/ (`_dirs_for`), and dugite's
-    # git needs GIT_EXEC_PATH or it cannot find its own remote helpers
-    # (`managed_tool_env`).
-    from hermes_cli.runtime_env import managed_path_dirs, managed_tool_env  # noqa: E402
-
-    dirs = managed_path_dirs(runtime_dir)
-    assert len(dirs) >= len(facts), (
-        f"assembled {len(dirs)} PATH dirs for {len(facts)} tools — "
-        "a provisioned tool contributed nothing"
-    )
-    (runtime_dir / "path-dirs").write_text(
-        "".join(f"{d}\n" for d in dirs), encoding="utf-8"
-    )
-
-    # Shell-sourceable, one `export K=V` per line. shlex.quote because a
-    # store path is well-behaved but this is going through a shell.
-    import shlex  # noqa: E402
-
-    (runtime_dir / "tool-env").write_text(
-        "".join(
-            f"export {key}={shlex.quote(value)}\n"
-            for key, value in sorted(managed_tool_env(runtime_dir).items())
-        ),
-        encoding="utf-8",
-    )
-    PY
-  '';
+        (runtime_dir / "tool-env").write_text(
+            "".join(
+                f"export {key}={shlex.quote(value)}\n"
+                for key, value in sorted(managed_tool_env(runtime_dir).items())
+            ),
+            encoding="utf-8",
+        )
+        PY
+      '';
 in
 bundle

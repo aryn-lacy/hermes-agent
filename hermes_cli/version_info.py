@@ -91,7 +91,7 @@ def _resolve_stamp_file() -> Path | None:
         p = Path(override)
         return p if p.is_file() else None
     # Source/Docker: next to the code root.
-    from hermes_cli.runtime_tree import BUILD_INFO_NAME
+    from installation.tree import BUILD_INFO_NAME
 
     p = Path(__file__).parent.parent / BUILD_INFO_NAME
     return p if p.is_file() else None
@@ -113,7 +113,7 @@ def _stamp_version_info() -> VersionInfo | None:
 
     # A light artifact ships no Python runtime. Reading a light stamp from
     # a Python process means the artifact was mispackaged — same guard as
-    # runtime_tree.read_build_info().
+    # installation.tree.read_build_info().
     if data.get("payload") == "light":
         raise RuntimeError(
             f"install-stamp.json at {stamp_file} marks this artifact as 'light' "

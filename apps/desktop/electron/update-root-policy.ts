@@ -1,7 +1,7 @@
 /**
  * Pure policy for which update roots the desktop's git update flow may touch.
  *
- * Mirrors hermes_cli/runtime_tree.py (is_managed_install_root + the "source"
+ * Mirrors installation/tree.py (is_managed_install_root + the "source"
  * install method): a .git tree at a managed install root is ours to update; a
  * .git tree anywhere else is somebody's working tree, and the update flow
  * would stash local changes and move it to the update branch — so both check

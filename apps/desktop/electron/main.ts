@@ -584,7 +584,7 @@ const HERMES_HOME = resolveHermesHome()
 // runtime dir, not in HERMES_HOME — profile state and install artifacts have
 // different lifetimes, and two installs sharing a home must not share
 // binaries. The registry's facts file says which tools exist and where;
-// backend-env reads it (same data hermes_cli/runtime_env.py serves Python).
+// backend-env reads it (same data installation/env.py serves Python).
 const ACTIVE_RUNTIME_DIR = path.join(HERMES_HOME, 'hermes-agent', '.hermes-runtime')
 
 function pathWithHermesManagedNode(...entries) {
@@ -2509,7 +2509,7 @@ function resolveUpdateRoot() {
   return candidates.find(c => isGitCheckout(c)) || candidates[0] || ACTIVE_HERMES_ROOT
 }
 
-// Mirror the CLI's dev-tree guard (hermes_cli/runtime_tree.py): the desktop's
+// Mirror the CLI's dev-tree guard (installation/tree.py): the desktop's
 // git update flow stashes local changes and moves the checkout to the update
 // branch, which is only ever correct on the installer-created checkout at a
 // managed root. A checkout anywhere else (a pinned worktree, a dev clone) is

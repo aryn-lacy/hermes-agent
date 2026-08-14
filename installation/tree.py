@@ -18,8 +18,6 @@ If a future feature writes to user checkouts (nothing does today), it
 must add an explicit opt-out fact FIRST. The old ``manageStyle: ejected``
 stickiness guarded against desktop-side adoption and rematerialization;
 both are deleted, so the guard went with them.
-
-This is a pure-stdlib leaf module. It does not import hermes_cli.config.
 """
 
 from __future__ import annotations
