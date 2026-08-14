@@ -14,7 +14,7 @@ Provides subcommands for:
 import os
 import sys
 
-__version__ = "0.20.1"
+__version__ = "0.21.0"
 __release_date__ = "2026.8.13"
 # This is the commit count at the release tag, used only by immutable Nix builds that do
 # not carry git history. `scripts/release.py` updates it for each new release.
