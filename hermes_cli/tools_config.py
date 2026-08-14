@@ -800,79 +800,31 @@ def _pip_install(
 ):
     """Install Python packages from a post-setup hook.
 
-    Strategy (in order):
-    1. ``uv pip install`` if uv is on PATH — fast, doesn't need pip in the venv.
-    2. ``python -m pip install`` — works on stdlib venvs.
-    3. ``python -m ensurepip --upgrade`` then retry pip — covers ``uv venv``
-       which creates a venv WITHOUT pip.
+    A thin policy wrapper over ``installation.pip_ladder`` (the ONE
+    uv → pip → ensurepip ladder; this used to be the first of its three
+    divergent copies). Setup-hook policy:
 
-    Why this exists: the Windows installer creates the venv via ``uv venv``,
-    which doesn't seed pip. Post-setup hooks that shelled out to
-    ``[sys.executable, '-m', 'pip', 'install', ...]`` failed with
-    ``No module named pip`` on every fresh install. uv-first sidesteps that.
+    * ``ensure_uv()``, not a bare lookup — this runs during setup, where
+      downloading uv is in scope, and tier 2 is a pip that the Windows
+      installer's ``uv venv`` does not seed.
+    * uv failures fall through to pip: any tier that works is a win here,
+      unlike lazy installs where a uv resolver verdict is authoritative.
 
-    Returns the ``subprocess.CompletedProcess`` from whichever tier succeeded
-    (or the last failure for the caller to inspect).
+    Returns a CompletedProcess-shaped result (``.returncode``/``.stdout``/
+    ``.stderr``) so existing callers keep working.
     """
-    venv_root = Path(sys.executable).parent.parent
-    uv_env = {**os.environ, "VIRTUAL_ENV": str(venv_root)}
-
-    # Managed uv first: $HERMES_HOME/bin is never on PATH, so a bare which()
-    # misses the uv Hermes installed and prefers a system one when both exist.
-    # ensure_uv() rather than a pure lookup because this runs during setup,
-    # where installing uv is in scope — and tier 2 is a pip that the Windows
-    # installer's `uv venv` does not seed, so failing to find uv here is the
-    # difference between a working post-setup hook and "No module named pip".
     from hermes_cli.managed_uv import ensure_uv
+    from installation.pip_ladder import pip_install
 
-    uv_bin = ensure_uv()
-    if uv_bin:
-        try:
-            result = subprocess.run(
-                [uv_bin, "pip", "install", *args],
-                capture_output=capture_output, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                env=uv_env,
-                creationflags=_post_setup_no_window_flags(
-                    streams_to_console=not capture_output
-                ),
-            )
-            if result.returncode == 0:
-                return result
-            # Fall through to pip — uv may have failed for an unrelated reason
-            # (resolution conflict, network), and pip might handle it.
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-
-    pip_cmd = [sys.executable, "-m", "pip"]
-    try:
-        # Probe for pip; bootstrap via ensurepip if missing (uv venv lacks it).
-        probe = subprocess.run(
-            pip_cmd + ["--version"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
-            creationflags=_post_setup_no_window_flags(),
-        )
-        if probe.returncode != 0:
-            raise FileNotFoundError("pip not in venv")
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=True,
-                creationflags=_post_setup_no_window_flags(),
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            # Synthesize a result so callers see a clean failure path.
-            return subprocess.CompletedProcess(
-                pip_cmd, returncode=1, stdout="",
-                stderr=f"pip not available and ensurepip failed: {e}",
-            )
-
-    return subprocess.run(
-        pip_cmd + ["install", *args],
-        capture_output=capture_output, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+    return pip_install(
+        args,
+        uv_bin=ensure_uv(),
+        timeout=timeout,
+        capture_output=capture_output,
         creationflags=_post_setup_no_window_flags(
             streams_to_console=not capture_output
         ),
+        uv_resolver_failure_is_final=False,
     )
 
 

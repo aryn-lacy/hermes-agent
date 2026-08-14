@@ -718,7 +718,7 @@ def _core_constraints_file() -> Optional[Path]:
 
 
 def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
-    """Install ``specs`` using the uv → pip → ensurepip ladder.
+    """Install ``specs`` via the shared ladder (installation.pip_ladder).
 
     Two modes:
 
@@ -730,8 +730,16 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
       is append-only on ``sys.path`` so it can never shadow core. Used by
       the immutable Docker image to keep lazy installs off the sealed venv.
 
-    Mirrors the strategy in ``hermes_cli.tools_config._pip_install`` but
-    kept independent here so this module has no CLI dependency.
+    Lazy-install policy carried into the ladder as arguments (this used
+    to be the second of three divergent copies of the mechanics):
+
+    * ``resolve_uv()`` and never ``ensure_uv()`` — this runs mid-turn to
+      satisfy an optional import, and downloading uv as a side effect of
+      that is a far bigger action than the caller asked for. The pip
+      tier covers the no-uv case.
+    * a uv RESOLVER failure is final: falling through to pip would
+      discard uv policy such as ``exclude-newer`` and could install a
+      release the project quarantined.
     """
     if not specs:
         return _InstallResult(True, "", "")
@@ -745,96 +753,33 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
             return _InstallResult(False, "", err)
         constraints = _core_constraints_file()
 
-    target_args: list[str] = []
-    if target is not None:
-        # --target tells both uv and pip to install into an arbitrary dir.
-        target_args = ["--target", str(target)]
-    constraint_args: list[str] = []
-    if constraints is not None:
-        constraint_args = ["--constraint", str(constraints)]
-
     try:
-        venv_root = Path(sys.executable).parent.parent
         from tools.environments.local import hermes_subprocess_env
-        uv_env = hermes_subprocess_env(inherit_credentials=False)
-        uv_env["VIRTUAL_ENV"] = str(venv_root)
 
-        # Tier 1: uv (preferred — fast, doesn't need pip in the venv)
-        # Managed uv first: $HERMES_HOME/bin is never on PATH, so a bare
-        # which() misses the uv Hermes installed and falls through to the
-        # slower pip tier. Deliberately a lookup and not ensure_uv(): this runs
-        # mid-turn to install an optional dependency, and downloading uv +
-        # migrating the Python runtime as a side effect of that is a far bigger
-        # action than the caller asked for. Tier 2 pip covers the no-uv case.
+        env = hermes_subprocess_env(inherit_credentials=False)
+
         try:
             from hermes_cli.managed_uv import resolve_uv
 
             uv_bin = resolve_uv()
         except Exception:
             uv_bin = None
-        if uv_bin:
-            try:
-                r = subprocess.run(
-                    [uv_bin, "pip", "install", *target_args, *constraint_args, *specs],
-                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=uv_env,
-                    stdin=subprocess.DEVNULL,
-                    creationflags=windows_hide_flags(),
-                )
-                if r.returncode == 0:
-                    if target is not None:
-                        _activate_target_on_syspath(target)
-                    return _InstallResult(True, r.stdout or "", r.stderr or "")
-                logger.debug("uv pip install failed: %s", r.stderr)
-                # A resolver failure is authoritative. Falling through to pip
-                # here would silently discard uv policy such as exclude-newer
-                # and could install a release that the project quarantined.
-                return _InstallResult(False, r.stdout or "", r.stderr or "")
-            except subprocess.TimeoutExpired as e:
-                logger.debug("uv invocation failed: %s", e)
-                return _InstallResult(False, "", f"uv pip install timed out: {e}")
-            except FileNotFoundError as e:
-                # The resolved uv path disappeared between lookup and spawn.
-                # In that narrow availability failure, the pip tier remains a
-                # valid fallback because uv never evaluated the requirements.
-                logger.debug("uv invocation failed: %s", e)
 
-        # Tier 2: python -m pip (with ensurepip bootstrap if needed)
-        pip_cmd = [sys.executable, "-m", "pip"]
-        try:
-            probe = subprocess.run(
-                pip_cmd + ["--version"],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15,
-                stdin=subprocess.DEVNULL,
-                creationflags=windows_hide_flags(),
-            )
-            if probe.returncode != 0:
-                raise FileNotFoundError("pip not in venv")
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            try:
-                subprocess.run(
-                    [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120, check=True,
-                    stdin=subprocess.DEVNULL,
-                    creationflags=windows_hide_flags(),
-                )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                return _InstallResult(False, "",
-                                      f"pip not available and ensurepip failed: {e}")
+        from installation.pip_ladder import pip_install
 
-        try:
-            r = subprocess.run(
-                pip_cmd + ["install", *target_args, *constraint_args, *specs],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
-                stdin=subprocess.DEVNULL,
-                creationflags=windows_hide_flags(),
-            )
-            if r.returncode == 0 and target is not None:
-                _activate_target_on_syspath(target)
-            return _InstallResult(r.returncode == 0, r.stdout or "", r.stderr or "")
-        except subprocess.TimeoutExpired as e:
-            return _InstallResult(False, "", f"pip install timed out: {e}")
-        except Exception as e:
-            return _InstallResult(False, "", f"pip install failed: {e}")
+        result = pip_install(
+            specs,
+            uv_bin=uv_bin,
+            timeout=timeout,
+            target=target,
+            constraints=constraints,
+            env=env,
+            creationflags=windows_hide_flags(),
+            uv_resolver_failure_is_final=True,
+        )
+        if result.ok and target is not None:
+            _activate_target_on_syspath(target)
+        return _InstallResult(result.ok, result.stdout, result.stderr)
     finally:
         if constraints is not None:
             try:
