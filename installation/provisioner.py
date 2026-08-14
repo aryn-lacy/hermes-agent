@@ -240,7 +240,7 @@ def _probe_env(
 @dataclass
 class ToolResult:
     tool: str
-    action: str  # kept | adopted | downloaded | failed
+    action: str  # kept | adopted | downloaded | system | failed
     version: Optional[str] = None
     detail: Optional[str] = None
 
@@ -486,6 +486,81 @@ def _stage(
             dll_file.unlink()
 
 
+# ─── system-tool acceptance (decision 1: system-git-first) ─────────────────
+#
+# The floor is DERIVED FROM THE FLAGS THIS CODEBASE USES, not chosen by
+# taste. scripts/audit-git-flags.py extracts every git argv we build; the
+# newest-introduced flag sets the floor, because a system git older than
+# that would accept the probe and then fail mid-update on a real call.
+#
+# The audit's nontrivial finds (everything else predates 2.13):
+#
+#   flag                                introduced   used at
+#   ----                                ----------   -------
+#   stash push -u -m                    2.13         update_cmd.py:1349
+#   stash list --format=%gd %H          2.13*        update_cmd.py:1414
+#   rev-parse --path-format=absolute    2.31         kanban_db.py:7513
+#   branch --show-current               2.22         kanban_db.py:7551
+#   push --force-with-lease             1.8.5        update_cmd.py:1748
+#   diff --diff-filter=U                1.6-era      update_cmd.py:1512
+#   -c windows.appendAtomically         GfW-only†    update_cmd.py:4444
+#
+#   *  `git stash push` (the subcommand form) is the 2.13 item; the
+#      --format string itself is old reflog syntax.
+#   †  windows.appendAtomically exists ONLY in Git for Windows (their
+#      Documentation/config/windows.adoc; never upstreamed). Mainline
+#      git tolerates the unknown key — `-c foo.bar=x` only errors on a
+#      MALFORMED key, not an unknown one — and the sites that set it are
+#      win32-gated anyway, so it does not raise the floor. It DOES mean
+#      a macOS/Linux git can never satisfy a Windows install's needs,
+#      which is already true for bash.exe reasons.
+#
+# Floor: 2.31 (rev-parse --path-format=absolute, the newest).
+SYSTEM_GIT_FLOOR = (2, 31)
+
+
+def _macos_xcode_shim(binary: str) -> bool:
+    """The /usr/bin/git stub that pops the CLT install dialog is not git."""
+    try:
+        from installation.env import is_macos_xcode_shim
+
+        return is_macos_xcode_shim(binary)
+    except Exception:  # noqa: BLE001 — a probe helper must not take the sweep down
+        return False
+
+
+def probe_system_git() -> Optional[tuple[str, str]]:
+    """A usable machine-provided git: ``(absolute_path, version)`` or None.
+
+    Usable means: on PATH, not the xcode-select shim, answers
+    ``--version``, and meets ``SYSTEM_GIT_FLOOR`` so every flag this
+    codebase passes will be understood. Windows additionally requires
+    the managed git regardless (bash.exe ships with PortableGit, and a
+    winget/system git's bash may be missing or ASLR-broken), so the
+    probe is POSIX-only by design — install.ps1 owns the Windows call.
+    """
+    if sys.platform == "win32":
+        return None
+    found = shutil.which("git")
+    if found is None or _macos_xcode_shim(found):
+        return None
+    version = _probe_version(Path(found))
+    if version is None:
+        return None
+    numbers = version.split(".")
+    try:
+        pair = (int(numbers[0]), int(numbers[1]))
+    except (ValueError, IndexError):
+        return None
+    if pair < SYSTEM_GIT_FLOOR:
+        logger.info(
+            "system git %s is below the %d.%d floor — provisioning the pinned one",
+            version, *SYSTEM_GIT_FLOOR,
+        )
+        return None
+    return found, version
+
+
 # ─── the provisioning loop ──────────────────────────────────────────────────
 
 
@@ -608,6 +683,30 @@ def _provision_one(
         and (store / rel).is_file()
     ):
         return ToolResult(tool, "kept", version=version)
+
+    # System-git-first (decision 1): a machine git that clears the flag
+    # floor beats a 147MB download. The fact records the absolute path
+    # with source="system", and a still-valid system fact is `kept` on
+    # every later sweep. If the binary vanished (uninstall) or now fails
+    # the floor (downgrade — rare but real on distro rollbacks), fall
+    # through to the pinned download rather than limping.
+    if tool == "git":
+        if (
+            fact is not None
+            and fact.source == "system"
+            and Path(fact.path).is_file()
+            and probe_system_git() is not None
+        ):
+            return ToolResult(tool, "kept", version=fact.version)
+        if fact is None or fact.source == "system":
+            system = probe_system_git()
+            if system is not None:
+                path, sys_version = system
+                facts[tool] = RuntimeFact(
+                    version=sys_version, path=path, source="system"
+                )
+                save_facts(facts, facts_dir, path_order=path_order)
+                return ToolResult(tool, "system", version=sys_version)
 
     try:
         pin = pinned_file(tool, target, pins={tool: entry})
@@ -813,10 +912,19 @@ def stale_tools(
     for tool, entry in pins.items():
         fact = facts.get(tool)
         installed = fact.version if fact is not None else None
+        # A system-provided tool is deliberately NOT at the pinned
+        # version — it satisfied the flag floor instead (decision 1's
+        # third state). Reporting it as drift would make every install
+        # using its distro git look permanently broken. Only a vanished
+        # binary turns it back into work for the sweep.
+        if fact is not None and fact.source == "system":
+            if Path(fact.path).is_file():
+                continue
+            installed = None
         # The FACT's own path, not a recomputed one: a fact recorded at an
         # older pin names an older store entry, and asking whether THAT
         # is on disk is the question ("is what we recorded still there?").
-        if fact is not None and not (store / fact.path).is_file():
+        elif fact is not None and not (store / fact.path).is_file():
             # Recorded but vanished reads as unprovisioned everywhere
             # else; say so here too rather than reporting it as current.
             installed = None

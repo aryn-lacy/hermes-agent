@@ -242,6 +242,36 @@ class TestTheStoreSplitCrossesTheLanguageBoundary:
         assert python_dirs == [str(payload / "node-26.7.0-linux-x64" / "bin")]
         assert python_dirs == _ts_path_entries(tmp_path, payload)
 
+    def test_both_languages_keep_system_tools_off_the_managed_prefix(
+        self, tmp_path
+    ):
+        """A source="system" fact names a machine binary by absolute path.
+        Emitting its directory would put /usr/bin (or a fake of it) into
+        the managed PREFIX, hoisting every system binary above the pinned
+        tools — both readers must skip it, and for the same stated reason
+        rather than by accident of path-join semantics."""
+        facts_dir = tmp_path / "install" / ".hermes-runtime"
+        store = tmp_path / "tools"
+        self._provision_into_store(
+            facts_dir, store, "node-26.7.0-linux-x64", "bin/node"
+        )
+        system_git = tmp_path / "usrbin" / "git"
+        system_git.parent.mkdir(parents=True)
+        system_git.write_text("#!/bin/sh\n")
+        facts = rr.load_facts(facts_dir)
+        facts["git"] = rr.RuntimeFact(
+            version="2.44.1", path=str(system_git), source="system"
+        )
+        rr.save_facts(facts, facts_dir, path_order=["git", "node"])
+
+        python_dirs = [
+            str(d) for d in runtime_env.managed_path_dirs(facts_dir, store_dir=store)
+        ]
+
+        assert python_dirs == [str(store / "node-26.7.0-linux-x64" / "bin")]
+        assert str(system_git.parent) not in python_dirs
+        assert python_dirs == _ts_path_entries(tmp_path, facts_dir, store)
+
 
 class TestSchemaConstantsMatch:
     def test_schema_version_is_the_same_number_on_both_sides(self):

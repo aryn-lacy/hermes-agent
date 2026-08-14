@@ -67,6 +67,12 @@ def managed_path_dirs(
         fact = facts.get(tool)
         if fact is None or not (store / fact.path).is_file():
             continue
+        # A system-provided tool is already on the machine's own PATH.
+        # Promoting its directory into the MANAGED prefix would hoist
+        # everything else living there (/usr/bin) above the managed
+        # tools, which is the exact shadowing this order exists to stop.
+        if fact.source == "system":
+            continue
         for d in _dirs_for(fact, store):
             if d.is_dir() and d not in dirs:
                 dirs.append(d)
@@ -138,7 +144,7 @@ def managed_tool_env(
         env["npm_config_cache"] = str(runtime_cache_dir(facts_dir) / "npm")
 
     git = facts.get("git")
-    if git is not None and (store / git.path).is_file():
+    if git is not None and git.source != "system" and (store / git.path).is_file():
         root = (store / git.path).parent.parent
         for key, relative in (
             ("GIT_EXEC_PATH", Path("libexec") / "git-core"),

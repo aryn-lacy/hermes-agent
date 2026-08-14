@@ -35,10 +35,16 @@ def provisioned_git(tmp_path_factory) -> Path:
     """A real, digest-verified git from the pin table.
 
     Goes through the normal provisioner: this is the path users get, and
-    a fixture that shortcut it would prove less.
+    a fixture that shortcut it would prove less. The system-git-first
+    probe is disabled for the module — this host HAS a git, but these
+    tests exist to exercise the PINNED artifact's contract (the exec
+    path, templates, PREFIX), which a system fact deliberately skips.
     """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rp, "probe_system_git", lambda: None)
     runtime_dir = tmp_path_factory.mktemp("runtime")
     result = rp.provision_tool("git", runtime_dir=runtime_dir)
+    mp.undo()
     if not result.ok:  # offline CI, GitHub outage
         pytest.skip(f"could not provision git: {result.detail}")
     return runtime_dir

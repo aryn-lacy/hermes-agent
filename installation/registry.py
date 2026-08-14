@@ -360,6 +360,14 @@ class RuntimeFact:
     # Relative rather than absolute so one facts file stays valid when the
     # store moves (a different HOME, a packaged bundle that IS its own
     # store), and so nothing has to rewrite N installs' facts to relocate.
+    #
+    # EXCEPTION: a ``source: "system"`` fact records a tool the machine
+    # already had (decision 1: system-git-first), and its path is
+    # ABSOLUTE — there is no store entry to be relative to. Old readers
+    # degrade safely by accident of path semantics: pathlib's ``/`` lets
+    # an absolute right side win, so ``store / "/usr/bin/git"`` IS
+    # ``/usr/bin/git``, and Node's ``path.join`` concatenates into a
+    # path that does not exist, so the TS reader skips the entry.
     path: str
     installed_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
@@ -369,6 +377,12 @@ class RuntimeFact:
     # usr/bin). When None, the assembler derives the single dir containing
     # `path`.
     path_dirs: Optional[list[str]] = None
+    # "managed" = the provisioner published these bytes into the store,
+    # digest-verified. "system" = a machine-provided binary accepted by
+    # the version-floor probe; not ours, never on the managed PATH, and
+    # never handed tool-specific env (a system git resolves its own
+    # helpers; exporting GIT_EXEC_PATH at it would break it).
+    source: str = "managed"
 
     def to_json(self) -> dict:
         data: dict[str, object] = {
@@ -378,6 +392,11 @@ class RuntimeFact:
         }
         if self.path_dirs is not None:
             data["pathDirs"] = self.path_dirs
+        # Written only when it deviates: every fact ever recorded before
+        # this field existed was managed, so absence == managed keeps old
+        # files readable without a schema bump.
+        if self.source != "managed":
+            data["source"] = self.source
         return data
 
     @classmethod
@@ -387,6 +406,7 @@ class RuntimeFact:
             path=data["path"],
             installed_at=data.get("installedAt", ""),
             path_dirs=data.get("pathDirs"),
+            source=data.get("source", "managed"),
         )
 
 
@@ -521,7 +541,10 @@ def tool_path(
     fact = load_facts(facts_dir).get(name)
     if fact is None:
         return None
-    candidate = store / fact.path
+    # A system fact's path is absolute; pathlib's `/` already resolves
+    # `store / "/usr/bin/git"` to the right side alone, but spell it out
+    # rather than lean on an operator subtlety a reader has to know.
+    candidate = Path(fact.path) if fact.source == "system" else store / fact.path
     if not candidate.is_file():
         return None
     return candidate

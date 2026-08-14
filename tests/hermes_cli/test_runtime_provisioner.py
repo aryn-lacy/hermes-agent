@@ -1135,3 +1135,154 @@ class TestStaleReportingForOptionalTools:
         drift = rp.stale_tools(runtime_dir=rt, install_root=bumped)
 
         assert drift["ripgrep"] == ("9.9.9", "1.0.0")
+
+
+class TestSystemGitFirst:
+    """Decision 1: a machine git clearing the flag floor beats a 147MB
+    download. The floor (SYSTEM_GIT_FLOOR) is derived from the flags this
+    codebase actually passes — scripts/audit-git-flags.py — because the
+    only thing a floor buys is 'every argv we build will be understood'."""
+
+    def _git_pins(self, served, tmp_path, target, name="git-sys.tar.gz"):
+        root, base = served
+        sha = _make_tar(root, name, {"bin/git": _script()})
+        return _pins_file(tmp_path / f"repo-{name}", {"git": {
+            "version": "2.53.0",
+            "files": {target: {"url": f"{base}/{name}", "sha256": sha}}}})
+
+    def _fake_system_git(self, tmp_path, version="2.44.1"):
+        bin_dir = tmp_path / "sysbin"
+        bin_dir.mkdir(exist_ok=True)
+        git = bin_dir / "git"
+        git.write_text(f"#!/bin/sh\necho 'git version {version}'\n")
+        git.chmod(0o755)
+        return git
+
+    def test_a_floor_clearing_system_git_is_recorded_not_downloaded(
+        self, served, tmp_path, target, monkeypatch
+    ):
+        pins = self._git_pins(served, tmp_path, target)
+        rt, store = tmp_path / "rt", tmp_path / "store"
+        system = self._fake_system_git(tmp_path, "2.44.1")
+        monkeypatch.setattr(
+            rp.shutil, "which", lambda n: str(system) if n == "git" else None
+        )
+
+        def no_downloads(*a, **k):
+            raise AssertionError("system git accepted — nothing to download")
+
+        monkeypatch.setattr(rp, "_download", no_downloads)
+
+        results = rp.provision_runtimes(
+            runtime_dir=rt, install_root=pins, store_dir=store
+        )
+
+        assert [(r.action, r.version) for r in results] == [("system", "2.44.1")]
+        fact = rr.load_facts(rt)["git"]
+        assert fact.source == "system"
+        assert fact.path == str(system)  # absolute: no store entry exists
+        assert list(store.glob("git-*")) == []
+
+    def test_a_recorded_system_git_is_kept_while_it_still_works(
+        self, served, tmp_path, target, monkeypatch
+    ):
+        pins = self._git_pins(served, tmp_path, target)
+        rt, store = tmp_path / "rt", tmp_path / "store"
+        system = self._fake_system_git(tmp_path)
+        monkeypatch.setattr(
+            rp.shutil, "which", lambda n: str(system) if n == "git" else None
+        )
+        rp.provision_runtimes(runtime_dir=rt, install_root=pins, store_dir=store)
+
+        results = rp.provision_runtimes(
+            runtime_dir=rt, install_root=pins, store_dir=store
+        )
+
+        assert [r.action for r in results] == ["kept"]
+
+    def test_a_vanished_system_git_falls_back_to_the_pin(
+        self, served, tmp_path, target, monkeypatch
+    ):
+        """Uninstalling the distro git must not brick the install: the
+        next sweep provisions the pinned one instead of keeping a fact
+        that points at nothing."""
+        pins = self._git_pins(served, tmp_path, target)
+        rt, store = tmp_path / "rt", tmp_path / "store"
+        system = self._fake_system_git(tmp_path)
+        monkeypatch.setattr(
+            rp.shutil, "which", lambda n: str(system) if n == "git" else None
+        )
+        rp.provision_runtimes(runtime_dir=rt, install_root=pins, store_dir=store)
+
+        system.unlink()
+        monkeypatch.setattr(rp.shutil, "which", lambda n: None)
+
+        results = rp.provision_runtimes(
+            runtime_dir=rt, install_root=pins, store_dir=store
+        )
+
+        assert [(r.action, r.version) for r in results] == [
+            ("downloaded", "2.53.0")
+        ]
+        assert rr.load_facts(rt)["git"].source == "managed"
+
+    def test_a_below_floor_git_is_rejected(
+        self, served, tmp_path, target, monkeypatch
+    ):
+        """git 2.30 would accept the probe and then choke on
+        `rev-parse --path-format=absolute` (introduced 2.31) mid-flight.
+        The floor exists to fail HERE, where the fix is a download."""
+        pins = self._git_pins(served, tmp_path, target)
+        rt, store = tmp_path / "rt", tmp_path / "store"
+        old = self._fake_system_git(tmp_path, "2.30.2")
+        monkeypatch.setattr(
+            rp.shutil, "which", lambda n: str(old) if n == "git" else None
+        )
+
+        results = rp.provision_runtimes(
+            runtime_dir=rt, install_root=pins, store_dir=store
+        )
+
+        assert [(r.action, r.version) for r in results] == [
+            ("downloaded", "2.53.0")
+        ]
+
+    def test_a_system_fact_stays_off_the_managed_path_and_env(
+        self, served, tmp_path, target, monkeypatch
+    ):
+        """/usr/bin must never ride into the managed PATH prefix (it
+        would hoist every system binary above the pinned tools), and a
+        system git gets no GIT_EXEC_PATH — it resolves its own helpers,
+        and pointing it at ours would break it."""
+        from installation import env as renv
+
+        pins = self._git_pins(served, tmp_path, target)
+        rt, store = tmp_path / "rt", tmp_path / "store"
+        system = self._fake_system_git(tmp_path)
+        monkeypatch.setattr(
+            rp.shutil, "which", lambda n: str(system) if n == "git" else None
+        )
+        rp.provision_runtimes(runtime_dir=rt, install_root=pins, store_dir=store)
+
+        assert renv.managed_path_dirs(rt, store_dir=store) == []
+        env = renv.managed_tool_env(rt, store_dir=store)
+        assert "GIT_EXEC_PATH" not in env
+
+    def test_a_system_fact_is_not_drift(
+        self, served, tmp_path, target, monkeypatch
+    ):
+        pins = self._git_pins(served, tmp_path, target)
+        rt, store = tmp_path / "rt", tmp_path / "store"
+        system = self._fake_system_git(tmp_path)
+        monkeypatch.setattr(
+            rp.shutil, "which", lambda n: str(system) if n == "git" else None
+        )
+        rp.provision_runtimes(runtime_dir=rt, install_root=pins, store_dir=store)
+
+        assert rp.stale_tools(runtime_dir=rt, install_root=pins, store_dir=store) == {}
+
+    def test_windows_never_takes_the_system_lane(self, monkeypatch):
+        """PortableGit is load-bearing on Windows: bash.exe comes with
+        it, and a winget git's bash may be missing or ASLR-broken."""
+        monkeypatch.setattr(rp.sys, "platform", "win32")
+        assert rp.probe_system_git() is None

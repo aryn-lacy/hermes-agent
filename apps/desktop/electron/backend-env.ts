@@ -129,6 +129,15 @@ export type RuntimeFact = {
   installedAt?: string
   /** Optional multi-dir PATH surface (PortableGit: cmd, bin, usr/bin). */
   pathDirs?: string[]
+  /**
+   * "system" marks a machine-provided binary the provisioner accepted
+   * instead of downloading (its `path` is then ABSOLUTE, not
+   * store-relative). Absent means managed. System tools never join the
+   * managed PATH prefix: they already live on the machine's own PATH,
+   * and promoting their directory (/usr/bin) would hoist everything in
+   * it above the pinned tools.
+   */
+  source?: string
 }
 
 export type RuntimeFacts = {
@@ -221,6 +230,12 @@ export function managedRuntimePathEntries(
     const fact = facts[tool]
 
     if (!fact?.path) {
+      continue
+    }
+
+    // Mirror installation/env.py's managed_path_dirs: a system-provided
+    // tool contributes nothing to the MANAGED prefix.
+    if (fact.source === 'system') {
       continue
     }
 

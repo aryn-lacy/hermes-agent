@@ -26,9 +26,17 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def provisioned_git(tmp_path_factory) -> Path:
-    """A real, digest-verified git from the pin table."""
+    """A real, digest-verified git from the pin table.
+
+    System-git-first is bypassed: these tests assert the PINNED git's
+    env contract (GIT_EXEC_PATH and friends), which a system fact
+    deliberately does not get.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setattr(rp, "probe_system_git", lambda: None)
     runtime_dir = tmp_path_factory.mktemp("runtime")
     result = rp.provision_tool("git", runtime_dir=runtime_dir)
+    mp.undo()
     if not result.ok:  # offline CI, GitHub outage
         pytest.skip(f"could not provision git: {result.detail}")
     return runtime_dir
