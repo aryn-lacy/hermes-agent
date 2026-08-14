@@ -267,9 +267,47 @@ let
         runHook postInstall
       '';
 
-      passthru = {
-        inherit (renderer.passthru) packageJsonPath;
-      };
+      passthru =
+        let
+          electronRuntime = with pkgs; [
+            alsa-lib
+            at-spi2-atk
+            atk
+            cairo
+            cups
+            dbus
+            expat
+            fontconfig
+            freetype
+            glib
+            gtk3
+            libdrm
+            libgbm
+            libxkbcommon
+            mesa
+            nspr
+            nss
+            pango
+            systemd
+            libX11
+            libXcomposite
+            libXdamage
+            libXext
+            libXfixes
+            libXrandr
+            libXrender
+            libXtst
+            libxcb
+          ];
+        in
+        {
+          inherit (renderer.passthru) packageJsonPath;
+
+          devDeps = electronRuntime;
+          devShellHook = ''
+            export LD_LIBRARY_PATH=${lib.makeLibraryPath electronRuntime}
+          '';
+        };
 
       meta = with lib; {
         description =

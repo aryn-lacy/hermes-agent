@@ -17,42 +17,44 @@
       npmPackageJsonPaths = builtins.filter (p: p != null) (
         map (p: p.passthru.packageJsonPath or null) packages
       );
-
-      hermesAgentDevShellHook = self'.packages.default.passthru.devShellHook;
     in
     {
       devShells.default = pkgs.mkShell {
-        packages = with pkgs; [
-          (pkgs.runCommand "hermes" { } ''
-            mkdir -p $out/bin
-            install -Dm755 ${../hermes} $out/bin/hermes
-          '')
-          uv
-          # hermes egress setup (iron-proxy) shells out to openssl for CA
-          # generation; tests/test_iron_proxy_cli.py exercises that wizard.
-          openssl
-          # Validate GitHub Actions workflows before pushing CI changes.
-          actionlint
-        ]
-        # The sandbox (bubblewrap) and the Wayland E2E stack only exist on
-        # Linux. The macOS devshell carries the build toolchain alone.
-        ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-          self'.packages.sandbox
-          # Headless Wayland compositor for E2E tests (test:e2e:visual).
-          # cage renders a single client with no window management, so
-          # the Electron window opens at a fixed size without tiling.
-          # libglvnd provides libEGL.so.1 that cage needs on NixOS.
-          cage
-          libglvnd
-          # Graphical terminal + Wayland screenshot client for CLI/TUI UI
-          # evidence. `cage -- ghostty ...` keeps captures off the user's
-          # live compositor; grim runs inside that isolated client session.
-          ghostty
-          grim
-        ]
-        ++ self'.packages.default.passthru.devDeps;
+        packages =
+          with pkgs;
+          [
+            (pkgs.runCommand "hermes" { } ''
+              mkdir -p $out/bin
+              install -Dm755 ${../hermes} $out/bin/hermes
+            '')
+            uv
+            # hermes egress setup (iron-proxy) shells out to openssl for CA
+            # generation; tests/test_iron_proxy_cli.py exercises that wizard.
+            openssl
+            # Validate GitHub Actions workflows before pushing CI changes.
+            actionlint
+          ]
+          # The sandbox (bubblewrap) and the Wayland E2E stack only exist on
+          # Linux. The macOS devshell carries the build toolchain alone.
+          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            self'.packages.sandbox
+            # Headless Wayland compositor for E2E tests (test:e2e:visual).
+            # cage renders a single client with no window management, so
+            # the Electron window opens at a fixed size without tiling.
+            # libglvnd provides libEGL.so.1 that cage needs on NixOS.
+            cage
+            libglvnd
+            # Graphical terminal + Wayland screenshot client for CLI/TUI UI
+            # evidence. `cage -- ghostty ...` keeps captures off the user's
+            # live compositor; grim runs inside that isolated client session.
+            ghostty
+            grim
+          ]
+          ++ self'.packages.default.passthru.devDeps
+          ++ self'.packages.desktop.passthru.devDeps;
         shellHook = ''
-          ${hermesAgentDevShellHook}
+          ${self'.packages.default.passthru.devShellHook}
+          ${self'.packages.desktop.passthru.devShellHook}
           ${hermesNpmLib.mkNpmDevShellHook npmPackageJsonPaths}
 
           # Force Node to use Nix's playwright-test binary instead of node_modules/.bin
