@@ -2620,86 +2620,17 @@ print_success() {
 
 }
 
-ensure_browser() {
-    if ! command -v node >/dev/null 2>&1; then
-        local node_bin="$HERMES_HOME/node/bin/node"
-        if [ -x "$node_bin" ]; then
-            export PATH="$HERMES_HOME/node/bin:$PATH"
-        else
-            log_error "Node.js not found. Run with --ensure node first."
-            return 1
-        fi
-    fi
-
-    local npm_bin
-    npm_bin="$(command -v npm 2>/dev/null || echo "$HERMES_HOME/node/bin/npm")"
-    if [ ! -x "$npm_bin" ]; then
-        log_error "npm not found"
-        return 1
-    fi
-
-    # agent-browser itself is intentionally NOT installed here (#43564 /
-    # PR #44772 review): it resolves lazily via `npx agent-browser` instead,
-    # which every consumer (tools/browser_tool.py, `hermes update`'s npx
-    # cache warm) already goes through. Eagerly npm-installing a second,
-    # separately version-pinned copy here -- only reachable via this
-    # explicit --ensure browser fallback in the first place -- was redundant
-    # complexity and an extra credential/supply-chain surface for a path
-    # npx already covers.
-    log_info "Installing camofox browser server..."
-    local log_file
-    log_file="$(mktemp)"
-    # Time-boxed (#39219): a stalled npm registry fetch here would otherwise
-    # hang the installer with no progress, same class as the desktop build.
-    if ! run_with_timeout "$NODE_DEPS_TIMEOUT" "$npm_bin" install -g --prefix "$HERMES_HOME/node" --silent --ignore-scripts \
-        "@askjo/camofox-browser@^1.5.2" \
-        >"$log_file" 2>&1; then
-        log_error "npm install failed or timed out:"
-        cat "$log_file" >&2
-        rm -f "$log_file"
-        return 1
-    fi
-    rm -f "$log_file"
-    export PATH="$HERMES_HOME/node/bin:$PATH"
-
-    strip_snap_browser_override
-    local sys_browser
-    sys_browser="$(find_system_browser 2>/dev/null || true)"
-    if [ -n "$sys_browser" ]; then
-        configure_browser_env_from_system_browser "$sys_browser"
-        log_info "Explicit browser override set -- Chromium download will be skipped when agent-browser installs on demand"
-    fi
-
-    return 0
-}
-
 ensure_mode() {
     detect_os
-    # --ensure runs against an EXISTING install (dep_ensure.py spawns this
-    # script from inside the checkout), and the pinned uv now lives in the
-    # install-scoped runtime dir — resolve the layout so install_uv and the
-    # provisioner know where that is.
-    resolve_install_layout
 
+    # Only deps whose install is OS-package work reach this script now.
+    # node, browser and ripgrep are pinned tools: dep_ensure.py stages
+    # them through installation/provisioner.py directly, digest-verified
+    # and recorded, without spawning a shell.
     IFS=',' read -ra DEPS <<< "$ENSURE_DEPS"
     for dep in "${DEPS[@]}"; do
         dep="$(echo "$dep" | tr -d '[:space:]')"
         case "$dep" in
-            node)
-                provision_managed_runtimes || return
-                ;;
-            browser)
-                provision_managed_runtimes || return
-                ensure_browser
-                ;;
-            ripgrep)
-                # A managed runtime now: the provisioner installs the pinned
-                # ripgrep into the install root rather than asking a system
-                # package manager for whatever version it has.
-                if ! command -v rg &>/dev/null; then
-                    provision_managed_runtimes || return
-                fi
-                ;;
             ffmpeg)
                 if ! command -v ffmpeg &>/dev/null; then
                     HAS_FFMPEG=false

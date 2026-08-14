@@ -161,6 +161,37 @@
           "sha256": "e4abca10c3a64ebea742667dd7009449d49403db5460dd6873e389fa2945360f"
         }
       }
+    },
+    "camoufox": {
+      "$comment": "OPTIONAL: the Camoufox browser binary, staged on demand by dep_ensure('browser'). An install that never browses never downloads ~650MB. Without this pin camoufox-js picks the browser at INSTALL TIME: its postinstall queries the GitHub releases API and regex-matches the newest asset in a '>=alpha.1, <1' range, so two machines installing on different days get different browsers and an unauthenticated caller can be rate-limited (60 req/hour) into no browser at all. Hermes points camoufox-js at this staged copy with CAMOUFOX_INSTALL_DIR, so it never calls that API. win32-arm64 maps to the x86_64 zip on purpose: upstream ships no ARM build for Windows (camoufox-js's own OS_ARCH_MATRIX is win: x86_64/i686), so ARM runs it emulated -- UNVERIFIED on real hardware, and the alternative is no browser at all.",
+      "version": "152.0.4-beta.28",
+      "optional": true,
+      "files": {
+        "linux-x64": {
+          "url": "https://github.com/daijro/camoufox/releases/download/v152.0.4-beta.28/camoufox-152.0.4-beta.28-lin.x86_64.zip",
+          "sha256": "924f3109ccd6d47cd6a0384d67a345fadf975d48b6319f8dbbd5954c588982bd"
+        },
+        "linux-arm64": {
+          "url": "https://github.com/daijro/camoufox/releases/download/v152.0.4-beta.28/camoufox-152.0.4-beta.28-lin.arm64.zip",
+          "sha256": "3a105a2fc929e80a79b4b7fce2c93ed62c4fb2c877f3c1ed2a5d66a1c4fe968f"
+        },
+        "darwin-x64": {
+          "url": "https://github.com/daijro/camoufox/releases/download/v152.0.4-beta.28/camoufox-152.0.4-beta.28-mac.x86_64.zip",
+          "sha256": "6e0efd66f6db46bece072827cb2c5a4851bca822ff4fed95b8a0c2fb6f61a3d4"
+        },
+        "darwin-arm64": {
+          "url": "https://github.com/daijro/camoufox/releases/download/v152.0.4-beta.28/camoufox-152.0.4-beta.28-mac.arm64.zip",
+          "sha256": "8b7680a61818245cf4eb0150edab811d4ed937b6723514569e74c3e7df9685bd"
+        },
+        "win32-x64": {
+          "url": "https://github.com/daijro/camoufox/releases/download/v152.0.4-beta.28/camoufox-152.0.4-beta.28-win.x86_64.zip",
+          "sha256": "386fc2f41139685f9a1a9cef0d024bc041d899c315ea538d561171b5b282e57d"
+        },
+        "win32-arm64": {
+          "url": "https://github.com/daijro/camoufox/releases/download/v152.0.4-beta.28/camoufox-152.0.4-beta.28-win.x86_64.zip",
+          "sha256": "386fc2f41139685f9a1a9cef0d024bc041d899c315ea538d561171b5b282e57d"
+        }
+      }
     }
   }
 }

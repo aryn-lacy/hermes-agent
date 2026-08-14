@@ -652,52 +652,6 @@ function Write-BrowserEnv {
     Add-Content -Path $envFile -Value "AGENT_BROWSER_EXECUTABLE_PATH=$BrowserPath" -Encoding UTF8
 }
 
-function Install-AgentBrowser {
-    $npm = Resolve-NpmCmd
-    if (-not $npm) {
-        Write-Err "npm not found -- install Node.js first"
-        throw "npm not found"
-    }
-
-    # agent-browser itself is intentionally NOT installed here (#43564 /
-    # PR #44772 review): it resolves lazily via `npx agent-browser` instead,
-    # which every consumer (tools/browser_tool.py, `hermes update`'s npx
-    # cache warm) already goes through. Eagerly npm-installing a second,
-    # separately version-pinned copy here -- only reachable via this
-    # explicit -Ensure browser fallback in the first place -- was redundant
-    # complexity and an extra credential/supply-chain surface for a path
-    # npx already covers.
-    Write-Info "Installing camofox browser server..."
-    $prefixDir = Join-Path $HermesHome "node"
-    if (-not (Test-Path $prefixDir)) {
-        New-Item -ItemType Directory -Path $prefixDir -Force | Out-Null
-    }
-    $npmLog = [System.IO.Path]::GetTempFileName()
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    & $npm install -g --prefix $prefixDir --silent --ignore-scripts "@askjo/camofox-browser@^1.5.2" 2>&1 | Tee-Object -FilePath $npmLog | Out-Null
-    $npmExit = $LASTEXITCODE
-    $ErrorActionPreference = $prevEAP
-    if ($npmExit -ne 0) {
-        $npmDetail = Get-Content $npmLog -Raw -ErrorAction SilentlyContinue
-        Remove-Item $npmLog -Force -ErrorAction SilentlyContinue
-        Write-Err "npm install -g failed (exit $npmExit): $npmDetail"
-        Show-NpmCertHint $npmDetail | Out-Null
-        # This install runs with --silent, so $npmDetail is often near-empty;
-        # npm's debug log is the only place the real error survives.
-        Write-NpmDebugLogTail -NpmOutput $npmDetail
-        throw "npm install failed"
-    }
-    Remove-Item $npmLog -Force -ErrorAction SilentlyContinue
-
-    $sysBrowser = Find-SystemBrowser
-    if ($sysBrowser) {
-        Write-BrowserEnv -BrowserPath $sysBrowser
-        Write-Info "Explicit browser override set -- Chromium download will be skipped when agent-browser installs on demand"
-    }
-    Write-Success "Agent-browser ready"
-}
-
 # ============================================================================
 # Dependency checks
 # ============================================================================
@@ -4229,20 +4183,14 @@ function Invoke-AllStages {
 
 function Invoke-EnsureMode {
     param([string]$Deps)
+    # Only deps whose install is OS-package work reach this script now.
+    # node, browser and ripgrep are pinned tools: dep_ensure.py stages
+    # them through installation/provisioner.py directly, digest-verified
+    # and recorded, without spawning a shell.
     $depList = $Deps -split ","
     foreach ($dep in $depList) {
         $dep = $dep.Trim()
         switch ($dep) {
-            "node" {
-                if (-not (Invoke-RuntimeProvisioning)) { exit 1 }
-            }
-            "browser" {
-                if (-not (Invoke-RuntimeProvisioning)) { exit 1 }
-                Install-AgentBrowser
-            }
-            "ripgrep" {
-                Invoke-RuntimeProvisioning | Out-Null
-            }
             "ffmpeg" {
                 Write-Info "ffmpeg: install manually on Windows (scoop install ffmpeg)"
             }

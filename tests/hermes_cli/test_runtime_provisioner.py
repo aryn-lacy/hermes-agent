@@ -620,3 +620,266 @@ class TestTargetIsAnAssertionNotAChoice:
         assert rp.main(["--runtime-dir", str(rt), "--target", "sunos-vax"]) == 2
         assert called == []
         assert not rt.exists()
+
+
+class TestOptionalTools:
+    """An optional pin backs a capability the user may never touch.
+
+    The sweep must not download it, ``provision_tool`` must, and once it
+    is recorded the sweep owns it like any other tool — that last part is
+    what carries a pin bump onto an install that uses the capability.
+    """
+
+    @staticmethod
+    def _pins(root: Path, base: str, sha: str, target: str, opt_sha: str) -> Path:
+        return _pins_file(
+            root,
+            {
+                "gh": {
+                    "version": "2.97.0",
+                    "files": {target: {"url": f"{base}/opt-gh.tar.gz", "sha256": sha}},
+                },
+                "ripgrep": {
+                    "version": "1.0.0",
+                    "optional": True,
+                    "files": {
+                        target: {"url": f"{base}/opt-ripgrep.tar.gz", "sha256": opt_sha}
+                    },
+                },
+            },
+        )
+
+    def test_sweep_skips_an_optional_tool_nobody_asked_for(
+        self, served, tmp_path, target
+    ):
+        root, base = served
+        sha = _make_tar(root, "opt-gh.tar.gz", {"bin/gh": _script()})
+        opt_sha = _make_tar(root, "opt-ripgrep.tar.gz", {"rg": _script()})
+        pins = self._pins(tmp_path / "repo", base, sha, target, opt_sha)
+        rt = tmp_path / "rt"
+
+        results = rp.provision_runtimes(runtime_dir=rt, install_root=pins)
+
+        assert [r.tool for r in results] == ["gh"]
+        assert not (rt / "ripgrep").exists()
+        assert "ripgrep" not in rr.load_facts(rt)
+
+    def test_provision_tool_stages_it_on_demand(self, served, tmp_path, target):
+        root, base = served
+        sha = _make_tar(root, "opt-gh.tar.gz", {"bin/gh": _script()})
+        opt_sha = _make_tar(root, "opt-ripgrep.tar.gz", {"rg": _script()})
+        pins = self._pins(tmp_path / "repo", base, sha, target, opt_sha)
+        rt = tmp_path / "rt"
+
+        result = rp.provision_tool("ripgrep", runtime_dir=rt, install_root=pins)
+
+        assert (result.tool, result.action) == ("ripgrep", "downloaded")
+        assert rr.load_facts(rt)["ripgrep"].version == "1.0.0"
+
+    def test_the_sweep_owns_it_once_it_is_recorded(self, served, tmp_path, target):
+        """A pin bump has to reach an optional tool the install DOES use."""
+        root, base = served
+        sha = _make_tar(root, "opt-gh.tar.gz", {"bin/gh": _script()})
+        opt_sha = _make_tar(root, "opt-ripgrep.tar.gz", {"rg": _script()})
+        pins = self._pins(tmp_path / "repo", base, sha, target, opt_sha)
+        rt = tmp_path / "rt"
+        rp.provision_tool("ripgrep", runtime_dir=rt, install_root=pins)
+
+        # Same tool, new version: the sweep must pick the bump up.
+        bumped_sha = _make_tar(
+            root, "opt-ripgrep-2.tar.gz", {"rg": _script()}
+        )
+        bumped = _pins_file(
+            tmp_path / "repo2",
+            {
+                "ripgrep": {
+                    "version": "2.0.0",
+                    "optional": True,
+                    "files": {
+                        target: {
+                            "url": f"{base}/opt-ripgrep-2.tar.gz",
+                            "sha256": bumped_sha,
+                        }
+                    },
+                }
+            },
+        )
+        results = rp.provision_runtimes(runtime_dir=rt, install_root=bumped)
+
+        assert [(r.tool, r.action) for r in results] == [("ripgrep", "downloaded")]
+        assert rr.load_facts(rt)["ripgrep"].version == "2.0.0"
+
+    def test_provision_tool_brings_up_what_the_tool_extends(
+        self, served, tmp_path, target
+    ):
+        """Staging runs the extended tool, so the chain comes first."""
+        root, base = served
+        base_sha = _make_tar(root, "chain-base.tar.gz", {"bin/gh": _script()})
+        # 'ripgrep' extends 'gh': asking for ripgrep must stage gh too.
+        opt_sha = _make_tar(root, "chain-ripgrep.tar.gz", {"rg": _script()})
+        pins = _pins_file(
+            tmp_path / "repo",
+            {
+                "gh": {
+                    "version": "2.97.0",
+                    "files": {
+                        target: {"url": f"{base}/chain-base.tar.gz", "sha256": base_sha}
+                    },
+                },
+                "ripgrep": {
+                    "version": "1.0.0",
+                    "optional": True,
+                    "extends": ["gh"],
+                    "files": {
+                        target: {
+                            "url": f"{base}/chain-ripgrep.tar.gz",
+                            "sha256": opt_sha,
+                        }
+                    },
+                },
+            },
+        )
+        rt = tmp_path / "rt"
+
+        result = rp.provision_tool("ripgrep", runtime_dir=rt, install_root=pins)
+
+        assert result.ok, result.detail
+        facts = rr.load_facts(rt)
+        assert set(facts) == {"gh", "ripgrep"}
+
+
+class TestCamoufoxPin:
+    """The real pin-table entry, not a fixture.
+
+    camoufox is the Camoufox BROWSER binary (~650MB of Firefox), the
+    first optional tool. The npm module that drives it is not pinned
+    here — it lives in scripts/camofox-browser with its own
+    package-lock.json, because npm already pins a dependency tree by
+    integrity hash and this table cannot express one.
+    """
+
+    def test_is_optional_and_needs_no_other_tool(self):
+        pins = rr.load_pins()
+        assert rr.is_optional("camoufox", pins), (
+            "camoufox must stay optional: an install that never browses "
+            "must not download a 650MB browser"
+        )
+        # A self-contained archive, unlike an npm package: nothing has to
+        # be provisioned before it can be unpacked.
+        assert pins["camoufox"].get("extends", []) == []
+
+    def test_the_sweep_leaves_it_alone_until_it_is_installed(self):
+        """The required set is what every install pays for."""
+        pins = rr.load_pins()
+        required = [t for t in rr.install_order(pins) if not rr.is_optional(t, pins)]
+        assert "camoufox" not in required
+        assert {"node", "npm", "uv", "git"}.issubset(set(required))
+
+    def test_every_target_is_pinned_including_emulated_windows_arm(self):
+        """Upstream ships no win arm64 build; ARM runs the x64 one."""
+        pins = rr.load_pins()
+        files = pins["camoufox"]["files"]
+        assert set(files) == {
+            "linux-x64", "linux-arm64",
+            "darwin-x64", "darwin-arm64",
+            "win32-x64", "win32-arm64",
+        }
+        assert files["win32-arm64"]["url"] == files["win32-x64"]["url"]
+
+    def test_binary_layout_matches_the_launcher_camoufox_js_expects(self):
+        """camoufox-js's LAUNCH_FILE map, per platform."""
+        assert rp._binary_rel("camoufox", "linux-x64") == "camoufox/camoufox-bin"
+        assert rp._binary_rel("camoufox", "win32-x64") == "camoufox/camoufox.exe"
+        assert (
+            rp._binary_rel("camoufox", "darwin-arm64")
+            == "camoufox/Camoufox.app/Contents/MacOS/camoufox"
+        )
+
+    def test_version_json_is_split_the_way_camoufox_js_reads_it(self):
+        """Its fetcher greedily matches camoufox-(.+)-(.+)-<os>.<arch>.zip
+        and builds Version(match[2], match[1]) — version first, release
+        second. version.json must carry that same split back."""
+        assert rp._camoufox_version_json("152.0.4-beta.28") == {
+            "version": "152.0.4",
+            "release": "beta.28",
+        }
+
+    def test_a_pin_without_a_release_half_is_rejected(self):
+        """A malformed pin must fail loudly, not write a broken version.json."""
+        with pytest.raises(ValueError, match="version.*release"):
+            rp._camoufox_version_json("152.0.4")
+
+
+class TestStaleReportingForOptionalTools:
+    """An uninstalled optional tool is not drift.
+
+    stale_tools() drives `hermes doctor` and the sealed-install
+    require_current_runtimes() gate, so counting a capability nobody
+    asked for as stale would make every install that does not browse
+    report itself broken (it did: the nix runtime-dir check failed on
+    exactly this).
+    """
+
+    @staticmethod
+    def _pins(root: Path, target: str) -> Path:
+        return _pins_file(
+            root,
+            {
+                "gh": {
+                    "version": "2.97.0",
+                    "files": {target: {"url": "https://x/gh", "sha256": "0" * 64}},
+                },
+                "ripgrep": {
+                    "version": "1.0.0",
+                    "optional": True,
+                    "files": {target: {"url": "https://x/rg", "sha256": "0" * 64}},
+                },
+            },
+        )
+
+    def test_uninstalled_optional_tool_is_not_stale(self, tmp_path, target):
+        pins = self._pins(tmp_path / "repo", target)
+        rt = tmp_path / "rt"
+
+        drift = rp.stale_tools(runtime_dir=rt, install_root=pins)
+
+        # gh is required and absent → drift. ripgrep is optional → not.
+        assert "ripgrep" not in drift
+        assert drift["gh"] == ("2.97.0", None)
+
+    def test_an_installed_optional_tool_still_tracks_its_pin(
+        self, served, tmp_path, target
+    ):
+        """Once installed, a bump has to be reported like any other tool."""
+        root, base = served
+        opt_sha = _make_tar(root, "stale-rg.tar.gz", {"rg": _script()})
+        installed = _pins_file(
+            tmp_path / "repo",
+            {
+                "ripgrep": {
+                    "version": "1.0.0",
+                    "optional": True,
+                    "files": {
+                        target: {"url": f"{base}/stale-rg.tar.gz", "sha256": opt_sha}
+                    },
+                }
+            },
+        )
+        rt = tmp_path / "rt"
+        rp.provision_tool("ripgrep", runtime_dir=rt, install_root=installed)
+
+        bumped = _pins_file(
+            tmp_path / "repo2",
+            {
+                "ripgrep": {
+                    "version": "9.9.9",
+                    "optional": True,
+                    "files": {
+                        target: {"url": f"{base}/stale-rg.tar.gz", "sha256": opt_sha}
+                    },
+                }
+            },
+        )
+        drift = rp.stale_tools(runtime_dir=rt, install_root=bumped)
+
+        assert drift["ripgrep"] == ("9.9.9", "1.0.0")

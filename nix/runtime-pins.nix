@@ -195,7 +195,15 @@ let
   mkTool =
     name: entry: if extendsOf entry == [ ] then mkUnpackedTool name entry else mkNpmTool name entry;
 
-  tools = lib.mapAttrs mkTool pins;
+  # OPTIONAL tools are provisioned on demand into a writable runtime dir,
+  # and a Nix install has no such thing: its runtime dir is a sealed store
+  # path. Building them into the bundle would ship an on-demand capability
+  # to every user, so the bundle carries the required tools only. A Nix
+  # user who wants an optional capability gets it the way they get every
+  # other package: by adding it to their configuration.
+  requiredPins = lib.filterAttrs (_: entry: !(entry.optional or false)) pins;
+
+  tools = lib.mapAttrs mkTool requiredPins;
 
   # The installation package, filtered to source. An allowlist of .py and
   # .json rather than a copy of the directory: a stray __pycache__ or an
@@ -247,7 +255,7 @@ let
         from pathlib import Path
 
         from installation.registry import (
-            RuntimeFact, install_order, load_pins, path_order, save_facts,
+            RuntimeFact, install_order, is_optional, load_pins, path_order, save_facts,
         )
         from installation.provisioner import _binary_rel, _path_dirs
 
@@ -256,6 +264,12 @@ let
 
         facts = {}
         for tool in install_order(pins):
+            # Optional tools are provisioned on demand into a writable
+            # runtime dir; this bundle is a sealed store path and carries
+            # the required tools only (see requiredPins above). Recording
+            # one here would promise a binary that was never built.
+            if is_optional(tool, pins):
+                continue
             rel = _binary_rel(tool, target)
             if not (runtime_dir / rel).exists():
                 raise SystemExit(f"runtime-pins: {tool} is missing {rel}")

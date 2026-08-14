@@ -182,6 +182,9 @@ def load_pins(install_root: Path | None = None) -> dict[str, dict]:
             isinstance(dep, str) for dep in extends
         ):
             raise ValueError(f"{path}: tool {name!r} 'extends' must be a list of names")
+        optional = entry.get("optional", False)
+        if not isinstance(optional, bool):
+            raise ValueError(f"{path}: tool {name!r} 'optional' must be true or false")
         for dep in extends:
             if dep not in tools:
                 raise ValueError(
@@ -217,6 +220,37 @@ def load_pins(install_root: Path | None = None) -> dict[str, dict]:
 
 def _extends(tool: str, pins: dict[str, dict]) -> list[str]:
     return list(pins.get(tool, {}).get("extends", []))
+
+
+def is_optional(tool: str, pins: dict[str, dict]) -> bool:
+    """True when *tool* is provisioned on demand rather than for everyone.
+
+    A required tool is part of every install: the sweep brings it to its
+    pin and a failure fails the install. An OPTIONAL tool backs a
+    capability the user may never touch (a browser engine), so it is
+    staged only when something asks for it — and, once staged, it is
+    recorded in the facts like any other tool, which is what makes a
+    later sweep keep it at its pin.
+    """
+    return bool(pins.get(tool, {}).get("optional", False))
+
+
+def extends_closure(tool: str, pins: dict[str, dict]) -> set[str]:
+    """*tool* plus every tool it transitively extends.
+
+    Staging a tool may RUN the tools it extends, so "provision just this
+    one" really means "provision this one and the chain under it".
+    ``load_pins`` rejects cycles, so the walk terminates.
+    """
+    seen: set[str] = set()
+    stack = [tool]
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in pins:
+            continue
+        seen.add(name)
+        stack.extend(_extends(name, pins))
+    return seen
 
 
 def _ordered_by(

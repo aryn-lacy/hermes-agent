@@ -47,7 +47,9 @@ from installation.registry import (
     PinnedFile,
     RuntimeFact,
     current_target,
+    extends_closure,
     install_order,
+    is_optional,
     load_facts,
     load_pins,
     path_order,
@@ -244,6 +246,17 @@ def _binary_rel(tool: str, target: str) -> str:
         "git": "git/cmd/git.exe" if win else "git/bin/git",
         "gh": f"gh/bin/gh{ext}",
         "ripgrep": f"ripgrep/rg{ext}",
+        # camoufox-js's own LAUNCH_FILE map: the zip unpacks flat and the
+        # launcher sits at its root (mac keeps the .app bundle layout).
+        "camoufox": (
+            "camoufox/camoufox.exe"
+            if win
+            else (
+                "camoufox/Camoufox.app/Contents/MacOS/camoufox"
+                if target.startswith("darwin")
+                else "camoufox/camoufox-bin"
+            )
+        ),
     }[tool]
 
 
@@ -347,6 +360,42 @@ def _stage_npm(pin: PinnedFile, dest: Path, tmp: Path, rt: Path, target: str) ->
         raise RuntimeError(f"npm install exited {proc.returncode}: {proc.stderr[-400:]}")
 
 
+def _camoufox_version_json(pinned_version: str) -> dict[str, str]:
+    """Split a pin like ``152.0.4-beta.28`` the way camoufox-js does.
+
+    Its fetcher matches ``camoufox-(.+)-(.+)-<os>.<arch>.zip`` GREEDILY
+    against the asset name and builds ``Version(match[2], match[1])`` —
+    release second, version first — so ``152.0.4-beta.28`` is version
+    ``152.0.4``, release ``beta.28``. ``Version.fromPath`` reads the two
+    keys back out of version.json, and ``fullString`` re-joins them as
+    ``<version>-<release>``, so a wrong split shows up as a browser that
+    reports the wrong version rather than as a crash.
+    """
+    version, sep, release = pinned_version.partition("-")
+    if not sep:
+        raise ValueError(
+            f"camoufox pin {pinned_version!r} is not <version>-<release>; "
+            "camoufox-js cannot read a version.json without both halves"
+        )
+    return {"version": version, "release": release}
+
+
+def _stage_camoufox(pin: PinnedFile, dest: Path, tmp: Path) -> None:
+    """The Camoufox browser, plus the version file camoufox-js expects.
+
+    The zip unpacks flat (707 entries, ``camoufox-bin`` at the root), but
+    it does NOT contain ``version.json`` — camoufox-js writes that itself
+    after its own download, and ``Version.fromPath()`` raises
+    ``FileNotFoundError: Version information not found`` without it,
+    which its postinstall reports as a broken install. Writing it here is
+    what makes a provisioned browser look installed to the library.
+    """
+    _stage_archive(pin, dest, tmp)
+    (dest / "version.json").write_text(
+        json.dumps(_camoufox_version_json(pin.version)), encoding="utf-8"
+    )
+
+
 def _stage(
     tool: str, pin: PinnedFile, dest: Path, tmp: Path, target: str, rt: Path
 ) -> None:
@@ -361,6 +410,10 @@ def _stage(
 
     if tool == "npm":
         _stage_npm(pin, dest, tmp, rt, target)
+        return
+
+    if tool == "camoufox":
+        _stage_camoufox(pin, dest, tmp)
         return
 
     _stage_archive(pin, dest, tmp)
@@ -450,10 +503,17 @@ def provision_tool(
     runtime_dir: Path | None = None,
     install_root: Path | None = None,
 ) -> ToolResult:
-    """Provision a single pinned tool.
+    """Provision a single pinned tool, and whatever it extends.
 
     Used by the self-heal paths that need exactly one runtime (the
-    managed-Node bootstrap) without paying for a full sweep.
+    managed-Node bootstrap) without paying for a full sweep, and by the
+    on-demand path for OPTIONAL tools — a capability nobody asked for is
+    not downloaded until something asks.
+
+    A tool is staged by RUNNING what it extends (an npm package needs the
+    provisioned node and npm), so the chain is brought up first. Each
+    dependency goes through the same ``kept`` fast path, so this is a
+    no-op when they are already at their pins.
     """
     rt = runtime_dir if runtime_dir is not None else get_runtime_dir()
     rt.mkdir(parents=True, exist_ok=True)
@@ -461,14 +521,26 @@ def provision_tool(
     entry = pins.get(tool)
     if entry is None:
         return ToolResult(tool, "failed", detail=f"{tool} is not pinned")
-    return _provision_one(
-        tool,
-        entry,
-        rt,
-        load_facts(rt),
-        current_target(),
-        path_order=path_order(pins),
-    )
+
+    facts = load_facts(rt)
+    target = current_target()
+    order = path_order(pins)
+    # install_order is the full dependency-respecting order; keep the
+    # prefix this tool actually needs (itself plus what it transitively
+    # extends) rather than restating the traversal here.
+    needed = extends_closure(tool, pins)
+    chain = [name for name in install_order(pins) if name in needed]
+
+    result = ToolResult(tool, "failed", detail=f"{tool} was not provisioned")
+    for name in chain:
+        result = _provision_one(
+            name, pins[name], rt, facts, target, path_order=order
+        )
+        if not result.ok:
+            # A dependency that cannot be staged makes the request
+            # impossible; report the failure that actually happened.
+            return result
+    return result
 
 
 def provision_runtimes(
@@ -500,6 +572,12 @@ def provision_runtimes(
 
     for tool in install_order(pins):
         if only and tool not in only:
+            continue
+        # An optional tool is provisioned on demand (provision_tool), not
+        # for everyone. Once the facts record it, though, the sweep owns
+        # it like any other tool — that is what carries a pin bump onto
+        # an install that actually uses the capability.
+        if not only and is_optional(tool, pins) and tool not in facts:
             continue
         result = _provision_one(
             tool,
@@ -534,19 +612,27 @@ def stale_tools(
     every pin is satisfied. This is the same equality check
     ``_provision_one`` makes before deciding to re-download — exact pins
     make it an equality check, not a range check.
+
+    An OPTIONAL tool that was never installed is not stale: it is a
+    capability nobody asked for, and reporting it as drift would make
+    every install that does not browse look broken. Once it IS installed
+    the pin governs it like any other tool, so a bump shows up here.
     """
     rt = runtime_dir if runtime_dir is not None else get_runtime_dir()
     target = current_target()
     facts = load_facts(rt)
     drift: dict[str, tuple[str, Optional[str]]] = {}
 
-    for tool, entry in load_pins(install_root).items():
+    pins = load_pins(install_root)
+    for tool, entry in pins.items():
         fact = facts.get(tool)
         installed = fact.version if fact is not None else None
         if fact is not None and not (rt / _binary_rel(tool, target)).is_file():
             # Recorded but vanished reads as unprovisioned everywhere
             # else; say so here too rather than reporting it as current.
             installed = None
+        if installed is None and is_optional(tool, pins):
+            continue
         if installed != entry["version"]:
             drift[tool] = (entry["version"], installed)
     return drift

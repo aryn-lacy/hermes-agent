@@ -1,0 +1,9 @@
+{
+  "name": "hermes-camofox-browser",
+  "version": "1.0.0",
+  "description": "Camofox browser server sidecar for Hermes Agent. Installed on demand by dep_ensure('browser'); the browser BINARY it drives is pinned separately in installation/runtime-pins.json.",
+  "private": true,
+  "dependencies": {
+    "@askjo/camofox-browser": "1.13.1"
+  }
+}
