@@ -382,7 +382,6 @@ $PythonVersion = "3.11"
 # interpreters, so this list also matches a pre-existing system Python.  Single
 # source of truth shared by Test-Python's fallback and Resolve-AvailablePythonVersion.
 $PythonFallbackVersions = @("3.12", "3.13", "3.10")
-$NodeVersion = "26"
 # The npm range the root package.json pins in `engines.npm`.  A constant rather
 # than a manifest read like the POSIX side does: Test-Node runs BEFORE the repo
 # is cloned, so there is usually no package.json on disk yet (and none at all
@@ -1475,85 +1474,69 @@ function Set-GitBashEnvVar {
     Write-Info "If needed, set HERMES_GIT_BASH_PATH manually to your bash.exe path."
 }
 
-# The dependency tree's real Node floor is >=22.22.0, set by react-router 8.3.0
-# (`engines.node`). Keep this in sync with the root package.json: looser lets an
-# install reach a `npm ci` that dies with EBADENGINE, stricter replaces a working
-# user toolchain for nothing. Returns $true when a `node --version` string
-# clears that floor.
-function Test-NodeVersionOk {
-    param([string]$Version)
-    try {
-        $v = [version]($Version -replace '^v', '' -replace '-.*$', '')
-    } catch {
-        return $false
-    }
-    if ($v.Major -eq 22) { return ($v.Minor -ge 22) }
-    return ($v.Major -gt 22)
-}
-
-function Test-Node {
-    # Node is a MANAGED RUNTIME now: this installer no longer downloads it.
-    # Invoke-RuntimeProvisioning (after the venv exists) installs the pinned
-    # version from runtime-pins.json via the same provisioner `hermes update`
-    # uses. This function only reports what is already on the machine.
-    Write-Info "Checking Node.js (for browser tools)..."
-
-    if (Get-Command node -ErrorAction SilentlyContinue) {
-        $version = node --version
-        if (Test-NodeVersionOk $version) {
-            Ensure-NodeExeOnPath | Out-Null
-            Write-Success "Node.js $version found"
-            $script:HasNode = $true
-            return $true
-        }
-        Write-Warn "Node.js $version is too old -- Hermes will provision its own Node."
-    } else {
-        Write-Info "Node.js not found -- Hermes will provision its own Node."
-    }
-
-    $script:HasNode = $false
-    return $true
-}
-
 function Invoke-RuntimeProvisioning {
     # THE dep engine, shared with `hermes update`: one implementation of
     # "download the pinned tools", in Python, reading runtime-pins.json.
-    # This installer's job ends at "python can run"; node, git, gh and
+    # This installer's job ends at "python can run"; node, npm, git, gh and
     # ripgrep below that line belong to the provisioner.
-    Write-Info "Provisioning managed runtimes (node, git, gh, ripgrep)..."
+    #
+    # Run with `uv run --no-project`, NOT the venv python. The installation
+    # package is stdlib-only by contract, so provisioning does not need the
+    # venv and must not wait for it: uv is bootstrapped before this point,
+    # and the tools installed here are what later stages build with.
+    #
+    # FATAL on failure. Hermes runs its own toolchain -- the versions in
+    # runtime-pins.json are the ones every `npm ci` and every managed
+    # subprocess uses, and `engine-strict=true` means a system Node that
+    # happens to be present is not a substitute. An install that continues
+    # without them produces a Hermes that cannot build the web UI, cannot
+    # run browser tools, and reports no error until the user hits one of
+    # those. Better to fail here, where the cause is on screen.
+    Write-Info "Provisioning managed runtimes (node, npm, uv, git, gh, ripgrep)..."
 
-    $py = Join-Path $InstallDir "venv\Scripts\python.exe"
-    if (-not (Test-Path $py)) {
-        Write-Warn "No venv python at $py -- skipping runtime provisioning"
-        return $true
+    if (-not (Test-Path (Join-Path $InstallDir "installation"))) {
+        Write-Err "No installation package in $InstallDir -- the repository download did not complete."
+        return $false
+    }
+    Resolve-UvCmd
+    if (-not $script:UvCmd) {
+        Write-Err "uv is not available -- cannot run the provisioner"
+        return $false
     }
 
-    # Not fatal: a failed tool download leaves any system copy in play and
-    # the next `hermes update` retries. The provisioner reports per tool.
-    Push-Location $InstallDir
-    try {
-        & $py -m hermes_cli.post_update --install-phase
-        $code = $LASTEXITCODE
-    } finally {
-        Pop-Location
+    # Downloads fail transiently: a dropped connection, a slow mirror, a
+    # registry hiccup. Retrying costs seconds; failing the install costs the
+    # user a reinstall. The provisioner is idempotent and skips tools already
+    # at their pinned version, so a retry only re-fetches what is missing.
+    foreach ($attempt in 1..3) {
+        Push-Location $InstallDir
+        try {
+            & $script:UvCmd run --no-project python -m installation.provisioner
+            $code = $LASTEXITCODE
+        } finally {
+            Pop-Location
+        }
+
+        if ($code -eq 0) {
+            Write-Success "Managed runtimes provisioned"
+            $managedNode = Join-Path $InstallDir ".hermes-runtime\node"
+            if (Test-Path $managedNode) {
+                $env:Path = "$managedNode;$env:Path"
+            }
+            return $true
+        }
+
+        if ($attempt -lt 3) {
+            Write-Warn "Provisioning attempt $attempt failed -- retrying..."
+            Start-Sleep -Seconds ($attempt * 2)
+        }
     }
 
-    if ($code -eq 0) {
-        Write-Success "Managed runtimes provisioned"
-    } else {
-        Write-Warn "Some managed runtimes could not be provisioned (see above)"
-        Write-Info "They will be retried on the next 'hermes update'."
-    }
-
-    # Re-check Node so later stages (browser deps, desktop build) see the
-    # freshly provisioned tree.
-    $managedNode = Join-Path $InstallDir ".hermes-runtime\node\node.exe"
-    if (Test-Path $managedNode) {
-        $env:Path = (Split-Path $managedNode) + ";$env:Path"
-        $script:HasNode = $true
-    }
-
-    return $true
+    Write-Err "Could not provision the managed runtimes after 3 attempts."
+    Write-Err "Hermes needs its own pinned Node, npm, git, gh and ripgrep;"
+    Write-Err "a system copy is not a substitute (engine-strict=true)."
+    Write-Info "Check your network and re-run the installer."
+    return $false
 }
 
 function Update-ProcessPathForPackages {
@@ -2840,17 +2823,6 @@ You are Hermes Agent, an intelligent AI assistant created by Nous Research. You 
 }
 
 function Install-NodeDeps {
-    if (-not $HasNode) {
-        # Cross-process driver mode (Hermes-Setup.exe runs each -Stage NAME
-        # in a fresh powershell.exe) means $script:HasNode set by Stage-Node
-        # in the previous process isn't visible here. Re-probe rather than
-        # trust the stale global -- Stage-Node already ran successfully or
-        # the bootstrap would've aborted, so npm is reachable.
-        if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
-            Write-Info "Skipping Node.js dependencies (Node not installed)"
-            return
-        }
-    }
 
     # npm lifecycle scripts need node.exe on the PATH visible to child
     # cmd.exe processes.  Stage-Node may have run in a prior process, so
@@ -3383,18 +3355,13 @@ function Install-Desktop {
     # so an "unpacked" build (electron-builder --dir) is enough -- we
     # don't need to produce an NSIS/MSI artifact here.
 
-    # Always re-resolve Node here. Stages run in separate PowerShell
-    # processes, so $script:HasNode from Stage-Node isn't visible, and the
-    # build must never run on a too-old system Node -- the cause of the
-    # opaque "Build desktop app ... exit code 1" failure (Vite crashes on
-    # old Node). Test-Node reports; Invoke-RuntimeProvisioning guarantees a
-    # pinned Node and puts it on PATH (no-op when already satisfied).
-    Test-Node | Out-Null
-    if (-not $script:HasNode) { Invoke-RuntimeProvisioning | Out-Null }
-    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
-        Write-Warn "Skipping desktop build (Node.js / npm not on PATH)"
-        $script:_StageSkippedReason = "Node.js not available"
-        return
+    # Re-provision here. Stages run in separate PowerShell processes, so
+    # the PATH an earlier stage exported is gone; this is a no-op when the
+    # pins are already satisfied and it puts the managed tree back on PATH.
+    # The build must never run on a system Node -- Vite crashes on an old
+    # one, which surfaced as "Build desktop app ... exit code 1".
+    if (-not (Invoke-RuntimeProvisioning)) {
+        throw "Cannot build the desktop app: the managed runtimes are not available"
     }
 
     $desktopDir = "$InstallDir\apps\desktop"
@@ -3988,13 +3955,6 @@ function Write-Completion {
     Write-Host "[*] Restart your terminal for PATH changes to take effect" -ForegroundColor Yellow
     Write-Host ""
     
-    if (-not $HasNode) {
-        Write-Host "Note: Node.js could not be installed automatically." -ForegroundColor Yellow
-        Write-Host "Browser tools need Node.js. Install manually:" -ForegroundColor Yellow
-        Write-Host "  https://nodejs.org/en/download/" -ForegroundColor Yellow
-        Write-Host ""
-    }
-    
 }
 
 # ============================================================================
@@ -4124,9 +4084,9 @@ function Stage-Git              {
 # existing Write-Completion behavior that prints a "Note: Node.js could
 # not be installed" hint instead of aborting.
 function Stage-Node             {
-    # Reports the machine's Node; the provisioner (Stage-NodeDeps) installs
-    # the pinned one. No manual-install hint: Hermes provisions its own.
-    [void](Test-Node)
+    # The pinned Node arrives with the other managed runtimes in
+    # Stage-NodeDeps, after the venv exists. Nothing to probe here: a system
+    # Node is not used, whatever version it happens to be.
 }
 function Stage-SystemPackages   { Install-SystemPackages }
 function Stage-Repository       { Install-Repository }
@@ -4245,20 +4205,11 @@ function Invoke-EnsureMode {
         $dep = $dep.Trim()
         switch ($dep) {
             "node" {
-                [void](Test-Node)
-                if (-not $script:HasNode) {
-                    Write-Err "Node.js could not be installed"
-                    exit 1
-                }
+                if (-not (Invoke-RuntimeProvisioning)) { exit 1 }
             }
             "browser" {
-                [void](Test-Node)
-                if ($script:HasNode) {
-                    Install-AgentBrowser
-                } else {
-                    Write-Err "Node.js is required for browser tools but could not be installed"
-                    exit 1
-                }
+                if (-not (Invoke-RuntimeProvisioning)) { exit 1 }
+                Install-AgentBrowser
             }
             "ripgrep" {
                 Invoke-RuntimeProvisioning | Out-Null

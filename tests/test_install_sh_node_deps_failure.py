@@ -56,7 +56,23 @@ fi
 exit 0
 """,
     )
-    _write_executable(managed_bin / "uv", "#!/bin/sh\necho 'uv probe'\n")
+    # The node-deps stage provisions the managed runtimes first, and a failed
+    # provision is now fatal. Stand in for it: an `installation` package so
+    # the pre-flight check passes, and a uv whose `run` reports success —
+    # this test is about npm lifecycle failures, not about downloading tools.
+    (install_dir / "installation").mkdir(parents=True, exist_ok=True)
+    _write_executable(
+        managed_bin / "uv",
+        """#!/bin/sh
+if [ "${1:-}" = "run" ]; then
+    exit 0
+fi
+echo 'uv probe'
+""",
+    )
+    # Provisioning normally puts the managed node on PATH; the stub node and
+    # npm above already stand in for it.
+    (install_dir / ".hermes-runtime" / "node" / "bin").mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
     env.update(

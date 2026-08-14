@@ -57,7 +57,6 @@ else
     INSTALL_DIR_EXPLICIT=false
 fi
 PYTHON_VERSION="3.11"
-NODE_VERSION="26"
 
 # FHS-style root install layout (set by resolve_install_layout when applicable):
 #   code at /usr/local/lib/hermes-agent, command at /usr/local/bin/hermes,
@@ -767,102 +766,65 @@ check_git() {
     exit 1
 }
 
-# The dependency tree's real Node floor is >=22.22.0, set by react-router 8.3.0
-# (`engines.node`), with Vite ^8 next at `^20.19 || >=22.12`. Keep this in sync
-# with the root package.json — a gate looser than the manifest lets an install
-# proceed to a `npm ci` that then dies with EBADENGINE, and a gate stricter than
-# the manifest replaces a working user toolchain for nothing. Returns 0 when the
-# given `node --version` string clears the floor; anything below it is replaced
-# with the Hermes-managed Node $NODE_VERSION.
-node_satisfies_build() {
-    local ver="${1#v}"
-    local major="${ver%%.*}"
-    local minor="${ver#*.}"; minor="${minor%%.*}"
-    case "$major" in ''|*[!0-9]*) return 1 ;; esac
-    case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
-    if [ "$major" -ge 22 ] && { [ "$major" -gt 22 ] || [ "$minor" -ge 22 ]; }; then return 0; fi
-    return 1
-}
-
-# npm 11.10.0–11.16.x honor `min-release-age` but ignore
-# `min-release-age-exclude`, both of which `.npmrc` sets. That combination
-# applies the 14-day age gate to packages we deliberately exempted, so every
-# install fails ETARGET on a freshly published dependency. The root
-# package.json excludes that band via `engines.npm`, and `engine-strict=true`
-# makes it fatal — so a system npm in the band cannot install this repo, no
-# matter how new its Node is. Returns 0 when the npm is usable.
-npm_supports_npmrc() {
-    local ver="${1#v}"
-    local major="${ver%%.*}"
-    local minor="${ver#*.}"; minor="${minor%%.*}"
-    case "$major" in ''|*[!0-9]*) return 1 ;; esac
-    case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
-    # The bad band is 11.10.0 through 11.16.x.
-    if [ "$major" -eq 11 ] && [ "$minor" -ge 10 ] && [ "$minor" -le 16 ]; then
-        return 1
-    fi
-    return 0
-}
-
-check_node() {
-    # Node is a MANAGED RUNTIME now: the installer no longer downloads it.
-    # provision_managed_runtimes() (run after the venv exists) installs the
-    # pinned version from runtime-pins.json via the same provisioner that
-    # `hermes update` uses. This function only reports what is already on
-    # the machine so later stages can decide whether to use a system Node.
-    log_info "Checking Node.js (for browser tools)..."
-
-    if command -v node &> /dev/null && node_satisfies_build "$(node --version)"; then
-        if ! command -v npm &> /dev/null || npm_supports_npmrc "$(npm --version 2>/dev/null)"; then
-            log_success "Node.js $(node --version) found"
-            HAS_NODE=true
-            return 0
-        fi
-        # A bad-band npm (see npm_supports_npmrc) fails `npm ci` outright;
-        # the managed Node the provisioner installs bundles one that works.
-        log_warn "npm $(npm --version) cannot honor this repo's .npmrc (npm 11.10-11.16 ignore"
-        log_warn "min-release-age-exclude) — Hermes will provision its own Node."
-        HAS_NODE=false
-        return 0
-    fi
-
-    if command -v node &> /dev/null; then
-        log_warn "Node.js $(node --version) is too old — Hermes will provision its own Node."
-    else
-        log_info "Node.js not found — Hermes will provision its own Node."
-    fi
-    HAS_NODE=false
-}
-
 provision_managed_runtimes() {
     # THE dep engine, shared with `hermes update`: one implementation of
     # "download the pinned tools", in Python, reading runtime-pins.json.
-    # The installer's job ends at "python can run"; everything below that
-    # line (node, git, gh, ripgrep) belongs to the provisioner.
-    log_info "Provisioning managed runtimes (node, git, gh, ripgrep)..."
+    #
+    # Run with `uv run --no-project`, NOT the venv python. The installation
+    # package is stdlib-only by contract (tests/test_installation_stdlib_only.py
+    # runs it under an interpreter with no site-packages), so provisioning
+    # does not need the venv and must not wait for it: uv is the one thing
+    # bootstrapped before this point, and the tools installed here are what
+    # later stages build with.
+    #
+    # FATAL on failure. Hermes runs its own toolchain -- the versions in
+    # runtime-pins.json are the ones every `npm ci` and every managed
+    # subprocess uses, and `engine-strict=true` means a system Node that
+    # happens to be present is not a substitute. An install that continues
+    # without them produces a Hermes that cannot build the web UI, cannot
+    # run browser tools, and reports no error until the user hits one of
+    # those. Better to fail here, where the cause is on screen.
+    log_info "Provisioning managed runtimes (node, npm, uv, git, gh, ripgrep)..."
 
-    local py="$INSTALL_DIR/venv/bin/python"
-    if [ ! -x "$py" ]; then
-        log_warn "No venv python at $py — skipping runtime provisioning"
-        return 0
+    if [ ! -d "$INSTALL_DIR/installation" ]; then
+        log_error "No installation package at $INSTALL_DIR/installation"
+        log_error "The repository download did not complete."
+        return 1
+    fi
+    # Stages run in separate processes, so $UV_CMD from an earlier stage is
+    # gone. install_uv reuses the managed binary when it is already there,
+    # so this is a no-op in the common case.
+    if [ -z "$UV_CMD" ]; then
+        install_uv
+    fi
+    if [ -z "$UV_CMD" ]; then
+        log_error "uv is not available -- cannot run the provisioner"
+        return 1
     fi
 
-    # Not fatal: a failed tool download leaves the system copy in play and
-    # the next `hermes update` retries. The provisioner reports per tool.
-    if (cd "$INSTALL_DIR" && "$py" -m hermes_cli.post_update --install-phase); then
-        log_success "Managed runtimes provisioned"
-    else
-        log_warn "Some managed runtimes could not be provisioned (see above)"
-        log_info "They will be retried on the next 'hermes update'."
-    fi
+    # Downloads fail transiently: a dropped connection, a slow mirror, a
+    # registry hiccup. Retrying costs seconds; failing the install costs the
+    # user a reinstall. The provisioner is idempotent and skips tools that
+    # are already at their pinned version, so a retry only re-fetches what
+    # is still missing.
+    local attempt
+    for attempt in 1 2 3; do
+        if (cd "$INSTALL_DIR" && "$UV_CMD" run --no-project python -m installation.provisioner); then
+            log_success "Managed runtimes provisioned"
+            export PATH="$INSTALL_DIR/.hermes-runtime/node/bin:$PATH"
+            return 0
+        fi
+        if [ "$attempt" -lt 3 ]; then
+            log_warn "Provisioning attempt $attempt failed -- retrying..."
+            sleep $((attempt * 2))
+        fi
+    done
 
-    # Re-check Node so later stages (browser deps, desktop build) see the
-    # freshly provisioned tree.
-    local managed_node="$INSTALL_DIR/.hermes-runtime/node/bin/node"
-    if [ -x "$managed_node" ]; then
-        export PATH="$INSTALL_DIR/.hermes-runtime/node/bin:$PATH"
-        HAS_NODE=true
-    fi
+    log_error "Could not provision the managed runtimes after 3 attempts."
+    log_error "Hermes needs its own pinned Node, npm, git, gh and ripgrep;"
+    log_error "a system copy is not a substitute (engine-strict=true)."
+    log_info "Check your network and re-run the installer."
+    return 1
 }
 
 check_network_prerequisites() {
@@ -2125,11 +2087,6 @@ configure_browser_env_from_system_browser() {
 }
 
 install_node_deps() {
-    if [ "$HAS_NODE" = false ]; then
-        log_info "Skipping Node.js dependencies (Node not installed)"
-        return 0
-    fi
-
     if [ "$DISTRO" = "termux" ]; then
         log_info "Skipping automatic Node/browser dependency setup on Termux"
         log_info "Browser automation is not part of the tested Termux install path yet."
@@ -2572,19 +2529,6 @@ print_success() {
         echo ""
     fi
 
-    # Show Node.js warning if auto-install failed
-    if [ "$HAS_NODE" = false ]; then
-        echo -e "${YELLOW}"
-        echo "Note: Node.js could not be installed automatically."
-        echo "Browser tools need Node.js. Install manually:"
-        if [ "$DISTRO" = "termux" ]; then
-            echo "  pkg install nodejs"
-        else
-            echo "  https://nodejs.org/en/download/"
-        fi
-        echo -e "${NC}"
-    fi
-
 }
 
 ensure_browser() {
@@ -2648,26 +2592,18 @@ ensure_mode() {
         dep="$(echo "$dep" | tr -d '[:space:]')"
         case "$dep" in
             node)
-                check_node
-                if [ "$HAS_NODE" != true ]; then
-                    provision_managed_runtimes
-                fi
+                provision_managed_runtimes || return
                 ;;
             browser)
-                check_node
-                if [ "$HAS_NODE" != true ]; then
-                    provision_managed_runtimes
-                fi
-                if [ "$HAS_NODE" = true ]; then
-                    ensure_browser
-                fi
+                provision_managed_runtimes || return
+                ensure_browser
                 ;;
             ripgrep)
                 # A managed runtime now: the provisioner installs the pinned
                 # ripgrep into the install root rather than asking a system
                 # package manager for whatever version it has.
                 if ! command -v rg &>/dev/null; then
-                    provision_managed_runtimes
+                    provision_managed_runtimes || return
                 fi
                 ;;
             ffmpeg)
@@ -2878,21 +2814,12 @@ install_desktop() {
     # (--include-desktop / 'desktop' stage), so a missing toolchain is a hard
     # failure, not a silent skip — a silent skip yields a "complete" install
     # with no app and a confusing "couldn't find a built desktop" at launch.
-    # Always re-resolve Node here. Stages run in separate processes, so we
-    # can't trust an earlier check, and the build must never run on a
-    # too-old system Node — the cause of the opaque "Build desktop app …
-    # exit code 1" failure (Vite crashes on old Node). check_node reports
-    # what's on the machine; provision_managed_runtimes guarantees a
-    # pinned one and puts it on PATH (no-op when already satisfied).
-    check_node
-    if [ "$HAS_NODE" != true ]; then
-        provision_managed_runtimes
-    fi
-    if ! command -v npm >/dev/null 2>&1; then
-        log_error "Cannot build desktop app: Node.js / npm unavailable"
-        log_info "Install Node.js and retry: cd $desktop_dir && npm run pack"
-        return 1
-    fi
+    # Re-provision here. Stages run in separate processes, so the PATH an
+    # earlier stage exported is gone; this is a no-op when the pins are
+    # already satisfied and it puts the managed tree back on PATH. The
+    # build must never run on a system Node — Vite crashes on an old one,
+    # which surfaced as the opaque "Build desktop app … exit code 1".
+    provision_managed_runtimes || return
     if [ ! -f "$desktop_dir/package.json" ]; then
         log_warn "Skipping desktop build (apps/desktop not present in checkout)"
         return 0
@@ -3116,7 +3043,6 @@ run_stage_body() {
             install_uv
             check_python
             check_git
-            check_node
             check_network_prerequisites
             install_system_packages
             ;;
@@ -3149,8 +3075,7 @@ run_stage_body() {
             # Stage NAME is protocol (the GUI driver renders it); its body is
             # now the shared provisioner. Managed runtimes first, then the
             # npm-installed browser tooling that needs a working node.
-            check_node
-            provision_managed_runtimes
+            provision_managed_runtimes || return
             install_node_deps
             ;;
         path)
@@ -3186,8 +3111,7 @@ run_stage_body() {
             # .hermes-runtime) isn't on PATH here. Re-provisioning is a
             # cheap no-op when the pin is already satisfied, and it puts
             # the tree back on PATH so install_desktop finds npm.
-            check_node
-            provision_managed_runtimes
+            provision_managed_runtimes || return
             install_desktop_voice_deps
             install_desktop
             ;;
@@ -3255,11 +3179,14 @@ main() {
     install_uv
     check_python
     check_git
-    check_node
     check_network_prerequisites
     install_system_packages
 
     clone_repo
+    # Before the venv: the provisioner is stdlib-only and runs under
+    # `uv run --no-project`, and the tools it installs (node, npm, git) are
+    # what the steps below build with.
+    provision_managed_runtimes || return
     setup_venv
     install_deps
     install_node_deps || return

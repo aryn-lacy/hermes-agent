@@ -112,31 +112,6 @@ class TestEnginesAreSatisfiable:
             "every fresh install fails at the first `npm ci`."
         )
 
-    def test_node_floor_is_met_by_the_managed_runtime(self):
-        """The Node major the installers provision must clear engines.node."""
-        node_range = _root_manifest()["engines"]["node"]
-        install_sh = (REPO_ROOT / "scripts" / "install.sh").read_text()
-        for line in install_sh.splitlines():
-            if line.startswith("NODE_VERSION="):
-                managed_major = int(line.split("=", 1)[1].strip().strip('"').strip("'"))
-                break
-        else:  # pragma: no cover - install.sh always defines it
-            pytest.fail("install.sh does not define NODE_VERSION")
-
-        # install.sh fetches latest-v{major}.x, not {major}.0.0, so compare on
-        # the major: the newest release of that line must be able to clear the
-        # floor. A floor in a HIGHER major than we provision can never be met.
-        floor_majors = [
-            int(m.group(1))
-            for m in re.finditer(r">=\s*v?(\d+)", node_range)
-        ]
-        assert floor_majors, f"cannot read a floor out of {node_range!r}"
-        assert managed_major >= min(floor_majors), (
-            f"engines.node is {node_range!r} but install.sh provisions Node "
-            f"{managed_major}.x. The runtime we ship must satisfy the floor we "
-            "declare, or the install we just performed cannot install deps."
-        )
-
     def test_desktop_node_floor_is_not_stricter_than_its_toolchain(self):
         """apps/desktop must not demand more Node than its own build tools do.
 
