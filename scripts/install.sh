@@ -532,9 +532,9 @@ detect_os() {
 # Dependency checks
 # ============================================================================
 
-# --- BEGIN GENERATED: uv bootstrap pins (scripts/gen-uv-bootstrap-pins.py) ---
+# --- BEGIN GENERATED: bootstrap pins (scripts/gen-bootstrap-pins.py) ---
 # Derived from installation/runtime-pins.json. DO NOT EDIT BY HAND:
-# run scripts/gen-uv-bootstrap-pins.py after a pin bump.
+# run scripts/gen-bootstrap-pins.py after a pin bump.
 UV_PIN_VERSION="0.12.3"
 
 # Sets UV_PIN_URL + UV_PIN_SHA256 for a <os>-<arch> target key.
@@ -563,7 +563,7 @@ uv_bootstrap_pin() {
             ;;
     esac
 }
-# --- END GENERATED: uv bootstrap pins ---
+# --- END GENERATED: bootstrap pins ---
 
 # Map this host to a pin-table target key (<os>-<arch>, Node spellings).
 uv_bootstrap_target() {

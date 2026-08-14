@@ -382,13 +382,6 @@ $PythonVersion = "3.11"
 # interpreters, so this list also matches a pre-existing system Python.  Single
 # source of truth shared by Test-Python's fallback and Resolve-AvailablePythonVersion.
 $PythonFallbackVersions = @("3.12", "3.13", "3.10")
-# The npm range the root package.json pins in `engines.npm`.  A constant rather
-# than a manifest read like the POSIX side does: Test-Node runs BEFORE the repo
-# is cloned, so there is usually no package.json on disk yet (and none at all
-# when install.ps1 is piped straight from the web).  Get-NpmRange prefers the
-# manifest whenever it does exist, so a drifted constant self-corrects on any
-# run against an existing checkout.
-$NpmRange = ">=12.0.0"
 
 # Stage-protocol version.  Bumped only for genuinely breaking changes to the
 # manifest schema, stage-name set semantics, or stdout JSON shape.  Adding a
@@ -656,9 +649,9 @@ function Write-BrowserEnv {
 # Dependency checks
 # ============================================================================
 
-# --- BEGIN GENERATED: uv bootstrap pins (scripts/gen-uv-bootstrap-pins.py) ---
+# --- BEGIN GENERATED: bootstrap pins (scripts/gen-bootstrap-pins.py) ---
 # Derived from installation/runtime-pins.json. DO NOT EDIT BY HAND:
-# run scripts/gen-uv-bootstrap-pins.py after a pin bump.
+# run scripts/gen-bootstrap-pins.py after a pin bump.
 $script:UvPinVersion = "0.12.3"
 $script:UvPinFiles = @{
     "win32-x64" = @{
@@ -670,7 +663,19 @@ $script:UvPinFiles = @{
         Sha256 = "4343217d668727b8a8eb5cad92389a1d2eeead93c89940d1b955ba1bb15462eb"
     }
 }
-# --- END GENERATED: uv bootstrap pins ---
+
+$script:GitPinVersion = "2.53.0"
+$script:GitPinFiles = @{
+    "win32-x64" = @{
+        Url    = "https://github.com/git-for-windows/git/releases/download/v2.53.0.windows.3/PortableGit-2.53.0.3-64-bit.7z.exe"
+        Sha256 = "b365da794b1d2225eb24d5f5e09ef7792cfd5fa26c3a3586210280c80dff3a2a"
+    }
+    "win32-arm64" = @{
+        Url    = "https://github.com/git-for-windows/git/releases/download/v2.53.0.windows.3/PortableGit-2.53.0.3-arm64.7z.exe"
+        Sha256 = "0db54010054c01f35501cf69e1e32d3710138ecb934d188bd77093afed24300e"
+    }
+}
+# --- END GENERATED: bootstrap pins ---
 
 function Install-Uv {
     # Hermes owns its own uv at $InstallDir\.hermes-runtime\uv\uv.exe -- the
@@ -823,100 +828,6 @@ function Set-ManagedNodeFirstOnUserPath {
     if ($updated -ne $userPath) {
         [Environment]::SetEnvironmentVariable("Path", $updated, "User")
     }
-}
-
-# The npm range to install into the managed Node tree.  Prefers the checkout's
-# root package.json so the installer and the manifest cannot drift; falls back
-# to the $NpmRange constant, which is the common case here because Test-Node
-# runs before the repo is cloned.
-function Get-NpmRange {
-    $manifest = Join-Path $InstallDir "package.json"
-    if (Test-Path $manifest) {
-        try {
-            $engines = (Get-Content $manifest -Raw | ConvertFrom-Json).engines
-            if ($engines -and $engines.npm) { return [string]$engines.npm }
-        } catch { }
-    }
-    return $NpmRange
-}
-
-# Upgrade the Hermes-managed Node tree's bundled npm into $NpmRange.
-#
-# The nodejs.org zip ships whatever npm that Node major bundles -- Node 26.5.1
-# bundles npm 11.17.0, one minor below the root package.json's own
-# `engines.npm` floor of >=12.  The repo .npmrc sets `engine-strict=true`, so
-# that is fatal rather than a warning and a brand-new install dies at the first
-# `npm ci` with EBADENGINE.  Provision the right npm here instead of reacting
-# to the failure later.
-#
-# Three details are load-bearing, mirroring _nb_ensure_bundled_npm_range in
-# scripts/lib/node-bootstrap.sh and upgrade_managed_npm in
-# hermes_cli/npm_engine.py:
-#   - a temp cwd, so the checkout's own .npmrc (engine-strict,
-#     min-release-age) does not gate the very upgrade meant to satisfy it;
-#   - npm_config_min_release_age=0, which also neutralises a user ~/.npmrc;
-#   - an explicit --prefix at the managed tree, so the upgrade rewrites the
-#     tree's own npm rather than installing a second copy elsewhere.
-#
-# Best-effort: a failure leaves a working Node with an old npm, which beats no
-# Node at all, and npm_engine.py still covers the EBADENGINE that follows.
-function Update-ManagedNpm {
-    param([string]$NodeDir)
-
-    $npmCmd = Join-Path $NodeDir "npm.cmd"
-    if (-not (Test-Path $npmCmd)) { return $false }
-
-    $range = Get-NpmRange
-
-    # Skip the network round-trip when the bundled npm already satisfies the
-    # range.  Only the ">=N" shape we actually author is parsed; anything more
-    # exotic falls through to letting npm itself decide.
-    if ($range -match '^>=(\d+)') {
-        $want = [int]$Matches[1]
-        try {
-            $have = (& $npmCmd --version 2>$null)
-            if ($have -match '^(\d+)') {
-                if ([int]$Matches[1] -ge $want) { return $true }
-            }
-        } catch { }
-    }
-
-    Write-Info "Upgrading bundled npm to satisfy $range ..."
-
-    $tmpCwd = Join-Path $env:TEMP ("hermes-npm-upgrade-" + [Guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Force -Path $tmpCwd | Out-Null
-    $prevAge = $env:npm_config_min_release_age
-    $prevCI = $env:CI
-    $prevEAP = $ErrorActionPreference
-    Push-Location $tmpCwd
-    try {
-        $env:npm_config_min_release_age = "0"
-        $env:CI = "1"
-        # Relax EAP=Stop so npm's stderr lines don't get wrapped as
-        # ErrorRecords and short-circuit before $LASTEXITCODE is checked.
-        # Same pattern as Install-Uv.
-        $ErrorActionPreference = "Continue"
-        & $npmCmd install --global --prefix $NodeDir "npm@$range" `
-            --no-fund --no-audit --progress=false 2>&1 | Out-Null
-        $exit = $LASTEXITCODE
-    } catch {
-        $exit = 1
-    } finally {
-        $ErrorActionPreference = $prevEAP
-        Pop-Location
-        $env:npm_config_min_release_age = $prevAge
-        $env:CI = $prevCI
-        Remove-Item -Recurse -Force $tmpCwd -ErrorAction SilentlyContinue
-    }
-
-    if ($exit -ne 0) {
-        Write-Warn "Could not upgrade bundled npm to $range -- ``npm ci`` may fail with EBADENGINE."
-        Write-Info  "Fix manually: npm install -g --prefix `"$NodeDir`" npm@`"$range`""
-        return $false
-    }
-
-    Write-Success "npm $(& $npmCmd --version 2>$null) installed"
-    return $true
 }
 
 # Re-discover uv without re-installing it.  Cross-process stage drivers
@@ -1262,58 +1173,52 @@ function Install-Git {
     #
     # This is the BOOTSTRAP git: it must exist before the repo is cloned,
     # so it cannot come from the provisioner (which lives in the repo).
-    # It lands in the legacy $HermesHome location on purpose --
-    # Invoke-RuntimeProvisioning salvages that tree into the install-scoped
-    # runtime dir by MOVE on its first run, so the bootstrap copy and the
-    # managed copy end up being the same bytes, downloaded once.
+    # It lands in the legacy $HermesHome location on purpose: `git clone`
+    # refuses a non-empty target, so git cannot be staged into the install
+    # dir's own .hermes-runtime\git before the clone that creates it.
+    # Invoke-RuntimeProvisioning stages the managed copy separately; both
+    # come from the same pinned URL and digest below, so they are at least
+    # the same VERSION even though the bytes are fetched twice. Collapsing
+    # that second fetch needs the clone itself reworked (init + fetch into
+    # an existing dir), which is its own change.
     Write-Info "Git not found -- downloading PortableGit to $HermesHome\git\ ..."
     Write-Info "(no admin rights required; isolated from any system Git install)"
 
     try {
         $arch = Get-WindowsArch
-        if ($arch -eq 'arm64') {
-            $assetTag = 'arm64'
-            $downloadIsZip = $false
-        } elseif ($arch -eq 'x64') {
-            $assetTag = '64-bit'
-            $downloadIsZip = $false
-        } else {
-            # PortableGit does not ship 32-bit / arm builds -- fall back to MinGit
-            # 32-bit with a warning that bash-based features will be unavailable.
-            $assetTag = '32-bit-mingit'
-            $downloadIsZip = $true
+
+        # The pinned git-for-windows artifact, generated from
+        # installation/runtime-pins.json (see the GENERATED block above).
+        # Hard-coded version literals used to live here and had already
+        # drifted a full minor ahead of the pin table, so a Windows box got
+        # one git from the installer and a different one from the
+        # provisioner. Deriving both from the table is what keeps them
+        # equal. Static release URLs also dodge the api.github.com
+        # rate limit (60/hour/IP unauthenticated) that breaks installs
+        # behind CGNAT and corporate NAT.
+        $pinTarget = if ($arch -eq 'arm64') { "win32-arm64" } else { "win32-x64" }
+        $gitPin = $script:GitPinFiles[$pinTarget]
+        if (-not $gitPin) {
+            throw "No pinned PortableGit for $pinTarget (32-bit Windows is not supported: PortableGit ships 64-bit and arm64 only, and Hermes needs the bash it bundles)"
         }
 
-        # Pinned git-for-windows release. We deliberately do NOT hit
-        # api.github.com/repos/.../releases/latest here: that endpoint
-        # is rate-limited to 60 requests/hour/IP for unauthenticated
-        # callers, and users behind CGNAT / corporate NAT / dorm WiFi
-        # routinely hit the limit, breaking the installer.
-        # Static github.com/.../releases/download/<tag>/<asset> URLs
-        # are not subject to the API rate limit.
-        $gitTag    = "v2.55.0.windows.3"
-        $gitVer    = "2.55.0.3"
-        $gitVerTag = "v2.55.0.windows.3"
-
-        if ($arch -eq "32-bit-mingit") {
-            Write-Warn "32-bit Windows detected -- PortableGit is 64-bit only.  Installing MinGit 32-bit as a last resort; bash-dependent Hermes features (terminal tool, agent-browser) will not work on this machine."
-            $assetName    = "MinGit-$gitVer-32-bit.zip"
-            $downloadIsZip = $true
-        } elseif ($arch -eq "arm64") {
-            $assetName    = "PortableGit-$gitVer-arm64.7z.exe"
-            $downloadIsZip = $false
-        } else {
-            $assetName    = "PortableGit-$gitVer-64-bit.7z.exe"
-            $downloadIsZip = $false
-        }
-
-        $downloadUrl = "https://github.com/git-for-windows/git/releases/download/$gitTag/$assetName"
-        $downloadExt = if ($downloadIsZip) { "zip" } else { "7z.exe" }
+        $downloadUrl = $gitPin.Url
+        $assetName = Split-Path $downloadUrl -Leaf
         $tmpFile = "$env:TEMP\$assetName"
         $gitDir = "$HermesHome\git"
 
-        Write-Info "Downloading $assetName (Git for Windows $gitVerTag)..."
+        Write-Info "Downloading $assetName (Git for Windows $script:GitPinVersion)..."
         Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -UseBasicParsing
+
+        # Verify BEFORE extracting: this artifact is a self-extracting
+        # executable, so an unverified download is arbitrary code that the
+        # next line runs. Same reason installation/provisioner.py checks the
+        # digest before handing the file to itself.
+        $actualHash = (Get-FileHash -Path $tmpFile -Algorithm SHA256).Hash.ToLower()
+        if ($actualHash -ne $gitPin.Sha256.ToLower()) {
+            Remove-Item -Force $tmpFile -ErrorAction SilentlyContinue
+            throw "PortableGit digest mismatch: expected $($gitPin.Sha256), got $actualHash"
+        }
 
         if (Test-Path $gitDir) {
             Write-Info "Removing previous Git install at $gitDir ..."
@@ -1321,19 +1226,16 @@ function Install-Git {
         }
         New-Item -ItemType Directory -Path $gitDir -Force | Out-Null
 
-        if ($downloadIsZip) {
-            Expand-Archive -Path $tmpFile -DestinationPath $gitDir -Force
-        } else {
-            # PortableGit is a self-extracting 7z archive.  Invoke it with
-            # `-o<target> -y` (silent) to extract to $gitDir.  No 7z install
-            # required; it's fully self-contained.
-            Write-Info "Extracting PortableGit to $gitDir ..."
-            $extractProc = Start-Process -FilePath $tmpFile `
-                -ArgumentList "-o`"$gitDir`"", "-y" `
-                -NoNewWindow -Wait -PassThru
-            if ($extractProc.ExitCode -ne 0) {
-                throw "PortableGit extraction failed (exit code $($extractProc.ExitCode))"
-            }
+        # PortableGit is a self-extracting 7z archive.  Invoke it with
+        # `-o<target> -y` (silent) to extract to $gitDir.  No 7z install
+        # required; it's fully self-contained. Both pinned targets are
+        # .7z.exe, so there is no archive branch to choose between.
+        Write-Info "Extracting PortableGit to $gitDir ..."
+        $extractProc = Start-Process -FilePath $tmpFile `
+            -ArgumentList "-o`"$gitDir`"", "-y" `
+            -NoNewWindow -Wait -PassThru
+        if ($extractProc.ExitCode -ne 0) {
+            throw "PortableGit extraction failed (exit code $($extractProc.ExitCode))"
         }
         Remove-Item -Force $tmpFile -ErrorAction SilentlyContinue
 
@@ -1415,10 +1317,10 @@ function Set-GitBashEnvVar {
     # this with a system-Git-only installation anyway.
     #
     # Layouts:
-    #   PortableGit (our default): $HermesHome\git\bin\bash.exe
-    #   MinGit (32-bit fallback):  $HermesHome\git\usr\bin\bash.exe
+    #   PortableGit (what we install): $HermesHome\git\bin\bash.exe
+    #   A system Git for Windows may instead keep it under usr\bin.
     $candidates += "$HermesHome\git\bin\bash.exe"       # PortableGit layout (primary)
-    $candidates += "$HermesHome\git\usr\bin\bash.exe"   # MinGit / PortableGit usr\bin fallback
+    $candidates += "$HermesHome\git\usr\bin\bash.exe"   # usr\bin fallback
 
     # git.exe on PATH can tell us where the install root is
     $gitCmd = Get-Command git -ErrorAction SilentlyContinue

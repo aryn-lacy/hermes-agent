@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Generate the uv bootstrap pin fragments inside install.sh and install.ps1.
+"""Generate the bootstrap pin fragments inside install.sh and install.ps1.
 
-The installers bootstrap uv BEFORE any checkout exists (uv builds the venv
-that runs everything else), so they cannot read installation/runtime-pins.json
-at run time: they are fetched standalone (`curl | sh`, `irm | iex`) and there
-is no JSON parser they can rely on that early (no jq guarantee; python is
-what uv installs on Windows). Instead, this script derives a plain-data
-fragment from the pin table and splices it between markers in each installer.
-The bytes are stored, the truth is derived, and the drift test
-(tests/test_uv_bootstrap_pins_fragment.py) fails when they disagree.
+The installers bootstrap uv (and, on Windows, git) BEFORE any checkout
+exists, so they cannot read installation/runtime-pins.json at run time:
+they are fetched standalone (`curl | sh`, `irm | iex`) and there is no
+JSON parser they can rely on that early (no jq guarantee; python is what
+uv installs on Windows). Instead, this script derives a plain-data
+fragment from the pin table and splices it between markers in each
+installer. The bytes are stored, the truth is derived, and the drift test
+(tests/test_bootstrap_pins_fragment.py) fails when they disagree.
 
-Run after bumping the uv entry in installation/runtime-pins.json:
+Run after bumping a bootstrapped tool in installation/runtime-pins.json:
 
-    python3 scripts/gen-uv-bootstrap-pins.py          # rewrite fragments
-    python3 scripts/gen-uv-bootstrap-pins.py --check  # exit 1 on drift
+    python3 scripts/gen-bootstrap-pins.py          # rewrite fragments
+    python3 scripts/gen-bootstrap-pins.py --check  # exit 1 on drift
 """
 
 from __future__ import annotations
@@ -26,30 +26,41 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PINS_PATH = REPO_ROOT / "installation" / "runtime-pins.json"
 
-BEGIN_MARK = "# --- BEGIN GENERATED: uv bootstrap pins (scripts/gen-uv-bootstrap-pins.py) ---"
-END_MARK = "# --- END GENERATED: uv bootstrap pins ---"
+BEGIN_MARK = "# --- BEGIN GENERATED: bootstrap pins (scripts/gen-bootstrap-pins.py) ---"
+END_MARK = "# --- END GENERATED: bootstrap pins ---"
 
 _POSIX_TARGETS = ("linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64")
 _WINDOWS_TARGETS = ("win32-x64", "win32-arm64")
 
 
 def _load_uv_pin() -> dict:
+    return _load_pin("uv", _POSIX_TARGETS + _WINDOWS_TARGETS)
+
+
+def _load_git_pin() -> dict:
+    # Windows only: install.sh gets git from a system package manager (or
+    # the user already has one), while Windows has no such thing and the
+    # installer downloads PortableGit itself.
+    return _load_pin("git", _WINDOWS_TARGETS)
+
+
+def _load_pin(tool: str, targets: tuple[str, ...]) -> dict:
     data = json.loads(PINS_PATH.read_text(encoding="utf-8"))
-    uv = data["tools"]["uv"]
-    for target in _POSIX_TARGETS + _WINDOWS_TARGETS:
-        entry = uv["files"][target]  # KeyError on a missing target is the point
-        if not entry["url"].startswith("https://"):
-            raise ValueError(f"uv pin for {target}: url must be https")
-        if len(entry["sha256"]) != 64:
-            raise ValueError(f"uv pin for {target}: sha256 must be 64 hex chars")
-    return uv
+    entry = data["tools"][tool]
+    for target in targets:
+        spec = entry["files"][target]  # KeyError on a missing target is the point
+        if not spec["url"].startswith("https://"):
+            raise ValueError(f"{tool} pin for {target}: url must be https")
+        if len(spec["sha256"]) != 64:
+            raise ValueError(f"{tool} pin for {target}: sha256 must be 64 hex chars")
+    return entry
 
 
 def _sh_fragment(uv: dict) -> str:
     lines = [
         BEGIN_MARK,
         "# Derived from installation/runtime-pins.json. DO NOT EDIT BY HAND:",
-        "# run scripts/gen-uv-bootstrap-pins.py after a pin bump.",
+        "# run scripts/gen-bootstrap-pins.py after a pin bump.",
         f'UV_PIN_VERSION="{uv["version"]}"',
         "",
         "# Sets UV_PIN_URL + UV_PIN_SHA256 for a <os>-<arch> target key.",
@@ -77,16 +88,30 @@ def _sh_fragment(uv: dict) -> str:
     return "\n".join(lines)
 
 
-def _ps1_fragment(uv: dict) -> str:
+def _ps1_fragment(uv: dict, git: dict) -> str:
     lines = [
         BEGIN_MARK,
         "# Derived from installation/runtime-pins.json. DO NOT EDIT BY HAND:",
-        "# run scripts/gen-uv-bootstrap-pins.py after a pin bump.",
+        "# run scripts/gen-bootstrap-pins.py after a pin bump.",
         f'$script:UvPinVersion = "{uv["version"]}"',
         "$script:UvPinFiles = @{",
     ]
     for target in _WINDOWS_TARGETS:
         entry = uv["files"][target]
+        lines += [
+            f'    "{target}" = @{{',
+            f'        Url    = "{entry["url"]}"',
+            f'        Sha256 = "{entry["sha256"]}"',
+            "    }",
+        ]
+    lines += [
+        "}",
+        "",
+        f'$script:GitPinVersion = "{git["version"]}"',
+        "$script:GitPinFiles = @{",
+    ]
+    for target in _WINDOWS_TARGETS:
+        entry = git["files"][target]
         lines += [
             f'    "{target}" = @{{',
             f'        Url    = "{entry["url"]}"',
@@ -123,19 +148,20 @@ def main() -> int:
     args = parser.parse_args()
 
     uv = _load_uv_pin()
+    git = _load_git_pin()
     results = {
         "scripts/install.sh": _splice(
             REPO_ROOT / "scripts" / "install.sh", _sh_fragment(uv), args.check
         ),
         "scripts/install.ps1": _splice(
-            REPO_ROOT / "scripts" / "install.ps1", _ps1_fragment(uv), args.check
+            REPO_ROOT / "scripts" / "install.ps1", _ps1_fragment(uv, git), args.check
         ),
     }
     stale = [name for name, fresh in results.items() if not fresh]
     if args.check and stale:
         print(
-            "uv bootstrap pin fragments drifted from installation/runtime-pins.json "
-            f"in: {', '.join(stale)}\nrun: python3 scripts/gen-uv-bootstrap-pins.py",
+            "bootstrap pin fragments drifted from installation/runtime-pins.json "
+            f"in: {', '.join(stale)}\nrun: python3 scripts/gen-bootstrap-pins.py",
             file=sys.stderr,
         )
         return 1
