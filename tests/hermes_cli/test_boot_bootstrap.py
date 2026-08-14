@@ -348,3 +348,75 @@ def test_maybe_run_never_raises(monkeypatch, tmp_path):
         lambda root: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     boot_bootstrap.maybe_run_boot_bootstrap(tmp_path)  # must not raise
+
+
+def test_deferred_machine_steps_execute(repo, tmp_path, monkeypatch):
+    """Stamp-gap item 4: the machine scope defers to a REAL thread — the
+    record is written first (boot readiness must not wait on network
+    installers), and the steps still actually run. No synchronous-thread
+    fake here on purpose: the claim under test is that the deferred work
+    happens, not that the registry is wired."""
+    import threading
+
+    from hermes_cli import post_update
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    ran = threading.Event()
+    monkeypatch.setattr(post_update, "HOME_STEPS", ())
+    monkeypatch.setattr(
+        post_update,
+        "MACHINE_STEPS",
+        (("probe", lambda: (ran.set(), {"ok": True})[1]),),
+    )
+
+    result = run_boot_bootstrap(repo)
+
+    assert result["machine"] == "deferred"
+    # The record was written BEFORE the steps finished (that ordering is
+    # the design: a crash mid-step must not retrigger every boot).
+    record = boot_bootstrap.record_path(repo, "machine")
+    assert json.loads(record.read_text())["results"]["deferred"] is True
+    assert ran.wait(timeout=10), "deferred machine steps never executed"
+
+
+def test_sealed_tree_bootstrap_end_to_end(tmp_path, monkeypatch):
+    """Stamp-gap item 5: the desktop-bundle-swap scenario. A sealed tree
+    (install-stamp.json, no .git) must bootstrap on first boot, no-op on
+    the second, and RE-RUN when the stamp's commit changes — that is the
+    only signal a bundle swap emits."""
+    import json as _json
+
+    from hermes_cli import post_update
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    sealed = tmp_path / "payload"
+    sealed.mkdir()
+    (sealed / "install-stamp.json").write_text(
+        _json.dumps({"commit": "aaaa1111", "payload": "full"})
+    )
+
+    calls = {"n": 0}
+
+    def count():
+        calls["n"] += 1
+        return {"ok": True}
+
+    monkeypatch.setattr(post_update, "HOME_STEPS", (("h", count),))
+    monkeypatch.setattr(post_update, "MACHINE_STEPS", ())
+
+    assert run_boot_bootstrap(sealed)["home"] != "skipped"
+    assert calls["n"] == 1
+    assert run_boot_bootstrap(sealed)["home"] == "skipped"
+    assert calls["n"] == 1  # second boot: identity unchanged, no work
+
+    # The bundle swap: same root, new stamp commit.
+    (sealed / "install-stamp.json").write_text(
+        _json.dumps({"commit": "bbbb2222", "payload": "full"})
+    )
+
+    assert run_boot_bootstrap(sealed)["home"] != "skipped"
+    assert calls["n"] == 2, "a swapped bundle must re-run the bootstrap"

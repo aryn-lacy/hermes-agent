@@ -18,7 +18,9 @@ The scopes must match the record that gates them in ``boot_bootstrap``
 from __future__ import annotations
 
 import logging
+import os
 import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -238,6 +240,67 @@ def run_steps(steps: Iterable) -> dict:
     return results
 
 
+def resync_and_reexec(args) -> int | None:
+    """Phase 1 of the update-phase: own the venv sync, then hand off.
+
+    Runs in whatever interpreter called us — usually the venv python the
+    tree swap just invalidated — so it touches as little as possible:
+    ``venv_sync`` (stdlib-only by contract) decides from the lockfile
+    digest whether the venv is stale, syncs it via managed uv when it
+    is, and then this process REPLACES ITSELF with a fresh interpreter
+    that has never mapped a pre-sync module.
+
+    Returns None to mean "you are already the fresh process — run phase
+    2", or an exit code to propagate.
+
+    The boundary is double-guarded (§B decision):
+
+    * the ``--resumed-after-sync`` argv flag is the loop-proofing — the
+      exec'd child must not sync again even if another writer moves the
+      stamp between exec and check, because a flag in argv cannot race;
+    * the venv_sync stamp is the idempotence — a re-run of the whole
+      update sees a fresh stamp and skips the sync entirely.
+
+    POSIX uses ``os.execv``: same pid, so the update-lock marker's owner
+    stays literally correct. Windows has no true exec — spawn + wait +
+    propagate, and the child passes the lock by process ancestry exactly
+    as the ``--update-phase`` spawn already does.
+    """
+    if args.resumed_after_sync:
+        return None
+
+    from hermes_cli import venv_sync
+
+    result = venv_sync.sync()
+    state = result.get("state")
+    if state == "failed":
+        print(f"  ✗ venv sync failed: {result.get('detail')}")
+        return 1
+    if state in ("sealed", "current"):
+        # Nothing changed under us — this interpreter is as good as a
+        # fresh one, and an exec would only cost startup time.
+        return None
+
+    print("  ✓ venv synced — handing off to a fresh interpreter")
+    argv = [sys.executable, "-m", "hermes_cli.post_update", "--update-phase",
+            "--resumed-after-sync"]
+    if args.gateway_mode:
+        argv.append("--gateway-mode")
+    if args.assume_yes:
+        argv.append("--assume-yes")
+    if args.pre_update_snapshot_id:
+        argv.extend(["--pre-update-snapshot-id", str(args.pre_update_snapshot_id)])
+
+    if os.name == "posix":
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execv(sys.executable, argv)
+        # unreachable: execv only returns by raising
+
+    completed = subprocess.run(argv)
+    return completed.returncode
+
+
 def main(argv: list | None = None) -> int:
     """``python -m hermes_cli.post_update`` — run in a FRESH interpreter
     so every step imports post-pull code (no reload lists).
@@ -250,7 +313,8 @@ def main(argv: list | None = None) -> int:
       skills sync, state.db guard, notices, self-heals, cua refresh, and
       the gateway fleet restart. ``hermes update`` spawns this with
       inherited stdio; the desktop's streamed-update consumer forwards
-      our lines unchanged.
+      our lines unchanged. Phase 1 (``resync_and_reexec``) syncs the venv
+      first and re-execs, so phase 2 always runs on the synced world.
     """
     import argparse
 
@@ -260,11 +324,20 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--gateway-mode", action="store_true")
     parser.add_argument("--assume-yes", action="store_true")
     parser.add_argument("--pre-update-snapshot-id", default=None)
+    parser.add_argument(
+        "--resumed-after-sync",
+        action="store_true",
+        help="internal: this process IS the post-sync interpreter; never sync again",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     if args.update_phase:
+        handoff = resync_and_reexec(args)
+        if handoff is not None:
+            return handoff
+
         # This process was just born, so update_cmd and everything it
         # imports come from the pulled tree. The in-function reload
         # band-aids (_reload_config_modules) turn into no-ops here —

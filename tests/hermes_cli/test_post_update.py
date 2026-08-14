@@ -209,7 +209,10 @@ def test_main_scope_selects_registries(monkeypatch):
 def test_main_update_phase_delegates_with_parsed_flags(monkeypatch):
     """--update-phase routes to update_cmd._run_update_phase_inline with
     the CLI flags mapped through and NO windows resume token (the token
-    is process-local to the parent)."""
+    is process-local to the parent). Modeled as the post-sync process
+    (--resumed-after-sync): phase 1's sync/re-exec is its own test class
+    below, and the real phase 2 always runs under this flag or after an
+    in-place fall-through."""
     import hermes_cli.update_cmd as uc
 
     seen = {}
@@ -220,8 +223,8 @@ def test_main_update_phase_delegates_with_parsed_flags(monkeypatch):
 
     monkeypatch.setattr(uc, "_run_update_phase_inline", fake_phase)
     rc = post_update.main([
-        "--update-phase", "--gateway-mode", "--assume-yes",
-        "--pre-update-snapshot-id", "snap-123",
+        "--update-phase", "--resumed-after-sync", "--gateway-mode",
+        "--assume-yes", "--pre-update-snapshot-id", "snap-123",
     ])
     assert rc == 0
     assert seen == {
@@ -308,3 +311,112 @@ def test_spawn_none_when_runner_missing(monkeypatch, tmp_path):
 def test_spawn_none_when_spawn_raises(monkeypatch, tmp_path):
     rc, _ = _spawn(monkeypatch, tmp_path, run_raises=OSError("no exec"))
     assert rc is None
+
+
+# ── the re-exec-after-sync handoff (installer-redesign §B) ───────────
+
+
+class _Args:
+    """The argparse surface resync_and_reexec consumes."""
+
+    def __init__(self, resumed=False, gateway=False, yes=False, snap=None):
+        self.resumed_after_sync = resumed
+        self.gateway_mode = gateway
+        self.assume_yes = yes
+        self.pre_update_snapshot_id = snap
+
+
+class TestResyncAndReexec:
+    def test_the_resumed_flag_is_absolute(self, monkeypatch):
+        """Loop-proofing: the post-sync process must never sync again,
+        even when the stamp looks stale (another writer could move it
+        between exec and check — argv cannot race)."""
+
+        def no_sync(*a, **k):
+            raise AssertionError("--resumed-after-sync must not sync")
+
+        from hermes_cli import venv_sync
+
+        monkeypatch.setattr(venv_sync, "sync", no_sync)
+
+        assert post_update.resync_and_reexec(_Args(resumed=True)) is None
+
+    def test_current_and_sealed_run_phase2_in_place(self, monkeypatch):
+        """No world change, no exec: the running interpreter is as good
+        as a fresh one and the exec would only cost startup."""
+        from hermes_cli import venv_sync
+
+        for state in ("current", "sealed"):
+            monkeypatch.setattr(
+                venv_sync, "sync", lambda *a, s=state, **k: {"state": s, "ok": True}
+            )
+            monkeypatch.setattr(
+                post_update.os, "execv",
+                lambda *a: (_ for _ in ()).throw(AssertionError("must not exec")),
+            )
+            assert post_update.resync_and_reexec(_Args()) is None
+
+    def test_a_failed_sync_stops_the_phase(self, monkeypatch):
+        from hermes_cli import venv_sync
+
+        monkeypatch.setattr(
+            venv_sync,
+            "sync",
+            lambda *a, **k: {"state": "failed", "ok": False, "detail": "uv exited 3"},
+        )
+
+        assert post_update.resync_and_reexec(_Args()) == 1
+
+    def test_a_synced_world_reexecs_with_carried_args(self, monkeypatch):
+        """POSIX: os.execv, same pid, update-lock owner stays correct.
+        Every serialized arg must survive the handoff, plus the resumed
+        marker."""
+        from hermes_cli import venv_sync
+
+        monkeypatch.setattr(
+            venv_sync, "sync", lambda *a, **k: {"state": "synced", "ok": True}
+        )
+        seen = {}
+
+        def fake_execv(exe, argv):
+            seen["exe"] = exe
+            seen["argv"] = argv
+            raise SystemExit(0)  # execv never returns; simulate the replacement
+
+        monkeypatch.setattr(post_update.os, "execv", fake_execv)
+        monkeypatch.setattr(post_update.os, "name", "posix")
+
+        with pytest.raises(SystemExit):
+            post_update.resync_and_reexec(
+                _Args(gateway=True, yes=True, snap="snap-7")
+            )
+
+        argv = seen["argv"]
+        assert seen["exe"] == post_update.sys.executable
+        assert argv[1:4] == ["-m", "hermes_cli.post_update", "--update-phase"]
+        assert "--resumed-after-sync" in argv
+        assert "--gateway-mode" in argv and "--assume-yes" in argv
+        assert argv[argv.index("--pre-update-snapshot-id") + 1] == "snap-7"
+
+    def test_windows_spawns_and_propagates(self, monkeypatch):
+        """No exec on Windows: spawn + wait + propagate the child's code;
+        the child passes the update lock by ancestry."""
+        from hermes_cli import venv_sync
+
+        monkeypatch.setattr(
+            venv_sync, "sync", lambda *a, **k: {"state": "synced", "ok": True}
+        )
+        monkeypatch.setattr(post_update.os, "name", "nt")
+        seen = {}
+
+        class _Done:
+            returncode = 7
+
+        def fake_run(argv, **kwargs):
+            seen["argv"] = argv
+            return _Done()
+
+        monkeypatch.setattr(post_update.subprocess, "run", fake_run)
+
+        assert post_update.resync_and_reexec(_Args()) == 7
+        assert "--resumed-after-sync" in seen["argv"]

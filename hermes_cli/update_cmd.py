@@ -4931,6 +4931,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # based on a narrow 7-package import probe (#58004 review).
         _m()._clear_update_incomplete_marker()
 
+        # Record the sync as done so post_update's phase 1 (venv_sync +
+        # re-exec) sees "current" and does not resolve the same lockfile
+        # a second time. This is the transition seam: sync ownership is
+        # MOVING to post_update (installer-redesign §B), and until the
+        # legacy install path above is deleted, the stamp is how the two
+        # owners agree the work happened exactly once.
+        try:
+            from hermes_cli import venv_sync as _venv_sync
+
+            _digest = _venv_sync._lock_digest(Path(_m().PROJECT_ROOT))
+            if _digest:
+                _venv_sync.write_stamp(Path(_m().PROJECT_ROOT), _digest)
+        except Exception as exc:  # noqa: BLE001 — stamping is an optimization
+            logger.debug("venv-sync stamp write failed: %s", exc)
+
         # The update process is still the old Python interpreter process. Run
         # one final cache/module refresh immediately before lazy backend
         # refresh, which imports newly-pulled modules that may depend on fresh
