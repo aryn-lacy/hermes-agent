@@ -286,14 +286,38 @@ class TestRealPinTable:
             assert not version.endswith(".x"), tool
             assert not version.startswith(">="), tool
 
-    def test_digests_are_unique_per_target(self):
-        """Copy-paste is the likely failure when hand-editing 30 digests,
-        and a duplicated digest means one target downloads the wrong
-        file and fails verification. A tool pinning one 'any' artifact
-        has nothing to copy-paste wrong."""
+    def test_digests_and_urls_agree_in_both_directions(self):
+        """Copy-paste is the likely failure when hand-editing 30 digests.
+
+        The bug that matters is a digest pasted onto the WRONG url: that
+        target then downloads a file whose bytes cannot match, and fails
+        verification. So the rule is a bijection rather than plain
+        uniqueness -- one url has one digest, and one digest belongs to
+        one url.
+
+        Two targets legitimately share a row when upstream ships no build
+        for one of them: camoufox has no Windows arm64 artifact, so
+        win32-arm64 points at the x86_64 zip and runs it emulated. Same
+        url, same digest, deliberately -- the aliasing is visible in the
+        url, which is exactly what a copy-paste error is not.
+        """
         for tool, entry in rr.load_pins().items():
-            digests = [spec["sha256"] for spec in entry["files"].values()]
-            assert len(digests) == len(set(digests)), tool
+            by_url: dict[str, str] = {}
+            by_digest: dict[str, str] = {}
+            for target, spec in entry["files"].items():
+                url, digest = spec["url"], spec["sha256"]
+                if url in by_url:
+                    assert by_url[url] == digest, (
+                        f"{tool}/{target}: same url, two digests -- "
+                        f"one of them cannot verify"
+                    )
+                if digest in by_digest:
+                    assert by_digest[digest] == url, (
+                        f"{tool}/{target}: digest is reused across two urls "
+                        f"({by_digest[digest]} and {url}) -- a pasted digest"
+                    )
+                by_url[url] = digest
+                by_digest[digest] = url
 
     def test_every_extends_edge_names_a_pinned_tool(self):
         """A dangling edge would silently drop out of both derived
