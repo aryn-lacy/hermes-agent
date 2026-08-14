@@ -81,11 +81,11 @@ def _browser_available() -> bool:
         return True
     try:
         from hermes_cli.doctor import PROJECT_ROOT
-        from hermes_constants import iter_hermes_node_dirs
+        from installation import env as runtime_env
 
         if (PROJECT_ROOT / "node_modules" / "agent-browser").exists():
             return True
-        for candidate in iter_hermes_node_dirs():
+        for candidate in runtime_env.managed_path_dirs():
             if shutil.which("agent-browser", path=str(candidate)):
                 return True
     except Exception:

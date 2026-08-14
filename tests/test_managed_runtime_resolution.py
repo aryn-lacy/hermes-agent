@@ -11,8 +11,9 @@ code has two failure modes:
   how a generated systemd unit or launchd plist can bake a system Node in and
   keep resolving it across reboots.
 
-The fix per call site is one of ``find_node_executable()``,
-``iter_hermes_node_dirs()``, ``resolve_uv()``, or ``ensure_uv()``. This test is
+The fix per call site is one of ``installation.nodejs.node_path()``,
+``installation.env.managed_path_dirs()``, ``resolve_uv()``, or ``ensure_uv()``.
+This test is
 the ratchet that stops a new bare lookup from being added back.
 
 Reading source is normally banned (see AGENTS.md). It is the right tool here and
@@ -70,22 +71,9 @@ _ALLOWED: dict[tuple[str, str], str] = {
         "Termux fallback: a pkg-installed uv lands on PATH but not in the "
         "managed bin dir, and it is checked only after resolve_uv() misses."
     ),
-    ("hermes_cli/update_cmd.py", "npm"): (
-        "WSL diagnostic: deliberately inspects what PATH resolves so it can "
-        "warn that the only reachable npm is the Windows one."
-    ),
-    ("tools/lazy_deps.py", "uv"): (
-        "Fallback after resolve_uv(), plus the except-branch for the "
-        "hermes_cli import guard."
-    ),
-    ("tools/browser_use_cli.py", "uv"): (
-        "install_cli()'s fallback after ensure_uv() misses — a user-installed "
-        "uv on PATH is a legitimate last rung before giving up with install "
-        "guidance."
-    ),
     ("hermes_cli/gateway.py", "node"): (
         "Fallback rung of _append_node_dir_for_service(), after the managed "
-        "dirs from iter_hermes_node_dirs() are already appended."
+        "dirs from managed_path_dirs() are already appended."
     ),
     ("hermes_cli/main.py", "node"): (
         "_ensure_tui_node()'s idempotence gate: the question really is 'is "
@@ -93,10 +81,6 @@ _ALLOWED: dict[tuple[str, str], str] = {
     ),
     ("hermes_cli/main.py", "npm"): (
         "Same _ensure_tui_node() gate as node."
-    ),
-    ("tools/browser_tool.py", "npx"): (
-        "agent-browser runs via `npx`, resolved against the extended browser "
-        "PATH that _merge_browser_path() already seeds with the managed dirs."
     ),
 }
 
@@ -171,8 +155,8 @@ def test_no_unreviewed_bare_managed_runtime_lookups():
         "— on an install that has a managed one.\n"
         "Use instead:\n"
         "  uv       -> managed_uv.resolve_uv() (lookup) or ensure_uv() (may install)\n"
-        "  node/npm -> hermes_constants.find_node_executable()\n"
-        "  PATH env -> hermes_constants.iter_hermes_node_dirs()\n"
+        "  node/npm -> installation.nodejs.node_path() / npm_path()\n"
+        "  PATH env -> installation.env.managed_path_dirs()\n"
         "If PATH really is the right question, add the site to _ALLOWED with a "
         "reason."
     )
@@ -191,19 +175,22 @@ def test_allowlist_has_no_stale_entries():
 
 
 @pytest.mark.parametrize(
-    "helper",
+    ("module", "helper"),
     [
-        "find_node_executable",
-        "find_hermes_node_executable",
-        "iter_hermes_node_dirs",
-        "with_hermes_node_path",
+        ("installation.nodejs", "node_path"),
+        ("installation.nodejs", "npm_path"),
+        ("installation.nodejs", "npx_path"),
+        ("installation.nodejs", "run_npm"),
+        ("installation.nodejs", "npm_install"),
+        ("installation.env", "managed_path_dirs"),
+        ("installation.env", "with_managed_runtimes"),
     ],
 )
-def test_managed_node_helpers_exist(helper):
+def test_managed_node_helpers_exist(module, helper):
     """The alternatives this guard points contributors at must be importable."""
-    import hermes_constants
+    import importlib
 
-    assert callable(getattr(hermes_constants, helper))
+    assert callable(getattr(importlib.import_module(module), helper))
 
 
 def test_managed_uv_helpers_exist():
@@ -211,6 +198,12 @@ def test_managed_uv_helpers_exist():
 
     assert callable(resolve_uv)
     assert callable(ensure_uv)
-    # Install-scoped layout (hermes-home lifetime split): .hermes-runtime/uv/
+    # Install-scoped layout (hermes-home lifetime split): <runtime dir>/uv/.
+    # Asserted against get_runtime_dir() rather than the literal
+    # ".hermes-runtime": a packager can point HERMES_RUNTIME_DIR at a built
+    # tree (Nix does), and the invariant is that uv lives inside whatever
+    # runtime dir this install resolves — not what that dir is called.
+    from installation.paths import get_runtime_dir
+
     assert managed_uv_path().parent.name == "uv"
-    assert managed_uv_path().parent.parent.name == ".hermes-runtime"
+    assert managed_uv_path().parent.parent == get_runtime_dir()

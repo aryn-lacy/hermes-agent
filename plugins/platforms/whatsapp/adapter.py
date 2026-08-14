@@ -28,11 +28,8 @@ from pathlib import Path
 from typing import Dict, Optional, Any
 
 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
-from hermes_constants import (
-    find_node_executable,
-    get_hermes_dir,
-    with_hermes_node_path,
-)
+from hermes_constants import get_hermes_dir
+from installation import env as runtime_env, nodejs
 
 def _wenv(name: str, default: str = "") -> str:
     """Read a WHATSAPP_* env var through the profile secret scope.
@@ -363,7 +360,7 @@ def check_whatsapp_requirements() -> bool:
     """
     # Prefer Hermes-managed Node/npm so Windows installs are not broken by a
     # bad or elevation-triggering system Node on PATH.
-    _node = find_node_executable("node")
+    _node = str(nodejs.node_path())
     if not _node:
         return False
     try:
@@ -585,7 +582,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 print(f"[{self.name}] Installing WhatsApp bridge dependencies...")
                 # Resolve npm path so Windows uses npm.cmd from the
                 # Hermes-managed portable Node before falling back to PATH.
-                _npm_bin = find_node_executable("npm") or "npm"
+                _npm_bin = str(nodejs.npm_path())
                 try:
                     # Read timeout from environment variable, default to 300 seconds (5 minutes)
                     # to accommodate slower systems like Unraid NAS
@@ -596,7 +593,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         capture_output=True,
                         text=True, encoding='utf-8', errors='replace',
                         timeout=npm_install_timeout,
-                        env=with_hermes_node_path(),
+                        env=runtime_env.with_managed_runtimes(),
                     )
                     if install_result.returncode != 0:
                         print(f"[{self.name}] npm install failed: {install_result.stderr}")
@@ -688,8 +685,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Build bridge subprocess environment.
             # Pass WHATSAPP_REPLY_PREFIX from config.yaml so the Node bridge
             # can use it without the user needing to set a separate env var.
-            # with_hermes_node_path() copies os.environ when called with no arg.
-            bridge_env = with_hermes_node_path()
+            # runtime_env.with_managed_runtimes() copies os.environ when called with no arg.
+            bridge_env = runtime_env.with_managed_runtimes()
             if self._reply_prefix is not None:
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
@@ -734,7 +731,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
             self._bridge_process = subprocess.Popen(
                 [
-                    find_node_executable("node") or "node",
+                    str(nodejs.node_path()),
                     str(bridge_path),
                     "--port", str(self._bridge_port),
                     "--session", str(self._session_path),

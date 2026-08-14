@@ -185,8 +185,8 @@ def _has_agent_browser() -> bool:
         # are prepended to PATH at runtime but usually absent from the *probe*
         # process's PATH. Without this rung a successful install keeps
         # reporting "needs setup" on Windows.
-        from hermes_constants import with_hermes_node_path
-        managed_path = with_hermes_node_path().get("PATH", "")
+        from installation import env as runtime_env
+        managed_path = runtime_env.with_managed_runtimes().get("PATH", "")
         if managed_path:
             managed_hit = shutil.which("agent-browser", path=managed_path)
             if managed_hit and agent_browser_runnable(managed_hit):

@@ -89,9 +89,12 @@ class TestFindAgentBrowser:
                 return False
             return original_path_exists(self)
 
+        # npx now comes from the pin table, so "nothing works" means the
+        # managed tree is gone as well as PATH being empty.
         with patch("shutil.which", return_value=None), \
              patch("os.path.isdir", return_value=False), \
              patch.object(Path, "exists", mock_path_exists), \
+             patch("tools.browser_tool._resolve_npx_bin", return_value=None), \
              patch(
                  "tools.browser_tool._discover_homebrew_node_dirs",
                  return_value=[],
@@ -203,13 +206,6 @@ class TestFindAgentBrowser:
     def test_npx_fallback_validate_false(self):
         """The npx sentinel must resolve through the validate=False path too,
         independent of the fully-mocked coverage in test_nous_subscription.py."""
-        def mock_which(cmd, path=None):
-            if cmd == "agent-browser":
-                return None
-            if cmd == "npx":
-                return "/usr/bin/npx"
-            return None
-
         original_path_exists = Path.exists
 
         def mock_path_exists(self):
@@ -217,10 +213,13 @@ class TestFindAgentBrowser:
                 return False
             return original_path_exists(self)
 
-        with patch("shutil.which", side_effect=mock_which), \
+        with patch("shutil.which", return_value=None), \
              patch("os.path.isdir", return_value=False), \
              patch.object(Path, "exists", mock_path_exists), \
-             patch("tools.browser_tool.node_tool_runnable", return_value=True), \
+             patch(
+                 "tools.browser_tool._resolve_npx_bin",
+                 return_value="/managed/npm/bin/npx",
+             ), \
              patch(
                  "tools.browser_tool._discover_homebrew_node_dirs",
                  return_value=[],
@@ -495,86 +494,52 @@ class TestRunChromeFallbackCommandNpxResolution:
         assert first_cmd[9] == "--json"
 
 
-class TestResolveNpxBinPriority:
-    """The extended/managed search must be checked before a bare ambient
-    PATH lookup, so a broken/unexpected system npx can't shadow a healthy
-    Hermes-managed one — and each candidate must be validated (actually
-    runs) before being trusted, mirroring _find_agent_browser's own
-    validation discipline for agent-browser itself."""
+class TestResolveNpxBin:
+    """npx comes from the pin table, not from a PATH search.
 
-    def test_prefers_managed_extended_path_over_bare_path(self, monkeypatch):
+    The priority ladder this replaced (extended PATH, then bare PATH, each
+    validated by running it) existed because npx might have been any version
+    from anywhere. Every install now provisions the pinned npm tree, npx
+    ships inside it, and the provisioner records that tree only after
+    running it — so there is one candidate and it is known good.
+    """
+
+    def test_returns_the_pinned_npx(self, monkeypatch, tmp_path):
         import tools.browser_tool as bt
+        from installation import nodejs
 
-        monkeypatch.setattr(bt, "_merge_browser_path", lambda _p: "/hermes/node/bin")
-        monkeypatch.setattr(
-            bt.shutil, "which",
-            lambda cmd, path=None: (
-                "/hermes/node/bin/npx" if path == "/hermes/node/bin"
-                else "/usr/local/bin/npx"
-            ),
-        )
-        monkeypatch.setattr(bt, "node_tool_runnable", lambda p: True)
+        pinned = tmp_path / "npm" / "bin" / "npx"
+        pinned.parent.mkdir(parents=True)
+        pinned.touch()
+        monkeypatch.setattr(nodejs, "npx_path", lambda: pinned)
 
-        assert bt._resolve_npx_bin() == "/hermes/node/bin/npx"
+        assert bt._resolve_npx_bin() == str(pinned)
 
-    def test_falls_back_to_bare_path_when_managed_candidate_is_broken(self, monkeypatch):
+    def test_does_not_search_path(self, monkeypatch, tmp_path):
+        """A system npx must never be picked up, however findable it is."""
         import tools.browser_tool as bt
+        from installation import nodejs
 
-        monkeypatch.setattr(bt, "_merge_browser_path", lambda _p: "/hermes/node/bin")
-        monkeypatch.setattr(
-            bt.shutil, "which",
-            lambda cmd, path=None: (
-                "/hermes/node/bin/npx" if path == "/hermes/node/bin"
-                else "/usr/local/bin/npx"
-            ),
-        )
-        monkeypatch.setattr(bt, "node_tool_runnable", lambda p: p == "/usr/local/bin/npx")
+        pinned = tmp_path / "npm" / "bin" / "npx"
+        pinned.parent.mkdir(parents=True)
+        pinned.touch()
+        monkeypatch.setattr(nodejs, "npx_path", lambda: pinned)
 
-        assert bt._resolve_npx_bin() == "/usr/local/bin/npx"
+        def explode(*_a, **_k):
+            raise AssertionError("npx must not be resolved through PATH")
 
-    def test_returns_none_when_nothing_runnable(self, monkeypatch):
+        monkeypatch.setattr(bt.shutil, "which", explode)
+        assert bt._resolve_npx_bin() == str(pinned)
+
+    def test_returns_none_when_the_tree_is_damaged(self, monkeypatch):
+        """An unprovisioned tree degrades rather than raising at the caller."""
         import tools.browser_tool as bt
+        from installation import nodejs
 
-        monkeypatch.setattr(bt, "_merge_browser_path", lambda _p: "")
-        monkeypatch.setattr(bt.shutil, "which", lambda cmd, path=None: "/usr/local/bin/npx")
-        monkeypatch.setattr(bt, "node_tool_runnable", lambda p: False)
+        def missing():
+            raise nodejs.NotProvisioned("npx is missing")
 
+        monkeypatch.setattr(nodejs, "npx_path", missing)
         assert bt._resolve_npx_bin() is None
 
-    def test_skips_extended_lookup_when_merge_browser_path_returns_empty(self, monkeypatch):
-        """_merge_browser_path("") returning a falsy string (no extended
-        candidate dirs found on disk) must short-circuit straight to the
-        bare-PATH rung — shutil.which must not be called with a path=""
-        kwarg (which would silently mean "search cwd only" on some
-        platforms rather than "no extended search"), and node_tool_runnable
-        must only be asked about the one real candidate."""
-        import tools.browser_tool as bt
 
-        which_calls = []
-
-        def fake_which(cmd, path=None):
-            which_calls.append((cmd, path))
-            return "/usr/bin/npx" if path is None else None
-
-        monkeypatch.setattr(bt, "_merge_browser_path", lambda _p: "")
-        monkeypatch.setattr(bt.shutil, "which", fake_which)
-        monkeypatch.setattr(bt, "node_tool_runnable", lambda p: p == "/usr/bin/npx")
-
-        assert bt._resolve_npx_bin() == "/usr/bin/npx"
-        assert which_calls == [("npx", None)]
-
-    def test_falls_back_to_bare_path_when_extended_dir_has_no_npx(self, monkeypatch):
-        """A non-empty extended search PATH that simply doesn't contain an
-        npx binary (shutil.which returns None there) must fall through to
-        the bare-PATH rung rather than treating "no extended npx" the same
-        as "extended npx found but broken"."""
-        import tools.browser_tool as bt
-
-        monkeypatch.setattr(bt, "_merge_browser_path", lambda _p: "/hermes/node/bin")
-        monkeypatch.setattr(
-            bt.shutil, "which",
-            lambda cmd, path=None: None if path == "/hermes/node/bin" else "/usr/bin/npx",
-        )
-        monkeypatch.setattr(bt, "node_tool_runnable", lambda p: True)
-
-        assert bt._resolve_npx_bin() == "/usr/bin/npx"

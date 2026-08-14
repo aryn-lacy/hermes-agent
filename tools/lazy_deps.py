@@ -769,9 +769,9 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         try:
             from hermes_cli.managed_uv import resolve_uv
 
-            uv_bin = resolve_uv() or shutil.which("uv")
+            uv_bin = resolve_uv()
         except Exception:
-            uv_bin = shutil.which("uv")
+            uv_bin = None
         if uv_bin:
             try:
                 r = subprocess.run(

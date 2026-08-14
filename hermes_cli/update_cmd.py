@@ -2228,54 +2228,35 @@ def _npm_manifests_digest() -> str | None:
 
     Returns None when the lockfile is missing (never skip then).
     """
-    if not (_m().PROJECT_ROOT / "package-lock.json").exists():
-        return None
-    h = hashlib.sha256()
-    for p in _npm_manifest_paths():
-        h.update(str(p.relative_to(_m().PROJECT_ROOT)).encode())
-        try:
-            h.update(p.read_bytes())
-        except OSError:
-            h.update(b"<missing>")
-    return h.hexdigest()
+    from installation import nodejs
+
+    return nodejs.manifests_digest(_m().PROJECT_ROOT)
 
 def _npm_lockfile_changed(hermes_root: Path) -> bool:
-    current = _npm_manifests_digest()
-    if current is None:
+    """True when the workspace needs an npm install.
+
+    The digest/cache mechanics live in installation.nodejs; the extra
+    condition here is Hermes-specific: a web build toolchain that never
+    landed must force a reinstall even when the manifests are unchanged,
+    or every later `hermes update` rebuilds against a half-installed tree
+    and serves a stale dist.
+    """
+    from installation import nodejs
+
+    project_root = _m().PROJECT_ROOT
+    if nodejs.lockfile_changed(hermes_root, project_root):
         return True
-    # Also check that node_modules exists; a matching hash with missing
-    # node_modules means the cache was recorded by another checkout.
-    if not (_m().PROJECT_ROOT / "node_modules").is_dir():
-        return True
-    # A matching lockfile hash over a tree whose web build toolchain never
-    # landed must NOT skip the reinstall — otherwise every later `hermes
-    # update` keeps rebuilding against a half-installed tree and serving a
-    # stale dist.
-    web_dir = _m().PROJECT_ROOT / "web"
+    web_dir = project_root / "web"
     if (web_dir / "package.json").is_file() and not _web_build_toolchain_ready(
         *_web_toolchain_roots(web_dir)
     ):
         return True
-    try:
-        # Key the cache by PROJECT_ROOT so parallel worktrees don't collide.
-        cache_key = hashlib.sha256(str(_m().PROJECT_ROOT).encode()).hexdigest()[:12]
-        cache_file = hermes_root / f".npm_lock_hash_{cache_key}"
-        if not cache_file.exists():
-            return True
-        return cache_file.read_text(encoding="utf-8").strip() != current
-    except OSError:
-        return True
+    return False
 
 def _record_npm_lockfile_hash(hermes_root: Path) -> None:
-    digest = _npm_manifests_digest()
-    if digest is None:
-        return
-    try:
-        cache_key = hashlib.sha256(str(_m().PROJECT_ROOT).encode()).hexdigest()[:12]
-        cache_file = hermes_root / f".npm_lock_hash_{cache_key}"
-        cache_file.write_text(digest, encoding="utf-8")
-    except OSError:
-        logger.debug("Could not write npm lockfile hash cache")
+    from installation import nodejs
+
+    nodejs.record_lockfile_hash(hermes_root, _m().PROJECT_ROOT)
 
 def _repair_node_deps_on_current_checkout(print_completion) -> None:
     """Repair Node deps on the ``commit_count == 0`` path (#77211).
@@ -2317,24 +2298,17 @@ def _update_node_dependencies() -> list[str]:
 
     npm = _m()._resolve_node_runtime_npm()
     if not npm:
-        # If the only npm reachable inside this WSL shell is the Windows one,
-        # flag it loudly: silently skipping leaves ui-tui deps stale while the
-        # rest of the update proceeds, and running it would corrupt the tree.
-        from hermes_constants import is_wsl
-
-        path_npm = shutil.which("npm")
-        if is_wsl() and path_npm and _m()._is_windows_npm_path(path_npm):
-            print("→ Updating Node.js dependencies...")
-            print("  ⚠ Skipped: only a Windows npm is reachable from this WSL shell.")
-            print("    Install Node.js inside the WSL distro (nvm, or your distro's")
-            print("    package manager), then re-run `hermes update`.")
-            failed = []
-            if any(
-                (_m().PROJECT_ROOT / workspace / "package.json").exists()
-                for workspace in ("ui-tui", "web")
-            ):
-                failed.append("ui-tui, web workspaces")
-            return failed
+        # A damaged runtime dir. Report it as a failed workspace rather than
+        # skipping silently, which would leave deps stale while the rest of
+        # the update says "complete" (#30271).
+        print("→ Updating Node.js dependencies...")
+        print("  ⚠ Skipped: the managed npm is missing from this install.")
+        print("    Run `hermes update` again to re-provision it.")
+        if any(
+            (_m().PROJECT_ROOT / workspace / "package.json").exists()
+            for workspace in ("ui-tui", "web")
+        ):
+            return ["ui-tui, web workspaces"]
         return []
 
     from hermes_constants import get_default_hermes_root
@@ -2390,21 +2364,20 @@ def _update_node_dependencies() -> list[str]:
         "--include-workspace-root",
     ]
 
-    from hermes_constants import with_hermes_node_path
+    from installation import env as runtime_env, nodejs
 
-    nixos_env = with_hermes_node_path(_m()._nixos_build_env())
+    from installation import nodejs
 
     # NOTE: capture_output=False here is deliberate (#18840) — optional
     # postinstall scripts print download progress, and capturing it makes a
     # long download look hung. The chatty npm-deprecation noise during
     # `hermes update` comes from the *desktop* build, not this step; that
     # one is captured to update.log.
-    result = _m()._run_npm_install_deterministic(
-        npm,
+    result = nodejs.npm_install(
         _m().PROJECT_ROOT,
         extra_args=tuple(install_args),
         capture_output=False,
-        env=nixos_env,
+        env=_m()._nixos_build_env(),
     )
     if result.returncode == 0:
         _record_npm_lockfile_hash(shared_hermes_root)
@@ -5124,9 +5097,9 @@ def _run_update_phase_inline(
             # (Desktop → hermes-setup → hermes update), the shell PATH
             # customizations are lost, so a bare-PATH child would fail with
             # `node: not found` before cmd_gui can self-heal.
-            from hermes_constants import with_hermes_node_path
+            from installation import env as runtime_env, nodejs
 
-            _build_env = with_hermes_node_path()
+            _build_env = runtime_env.with_managed_runtimes()
             build_result = _m()._run_logged_subprocess(_desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=_build_env)
             if build_result.returncode != 0:
                 build_result = _m()._run_logged_subprocess(_desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=_build_env)

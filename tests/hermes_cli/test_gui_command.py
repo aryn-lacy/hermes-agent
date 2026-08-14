@@ -1,5 +1,6 @@
 """Tests for ``hermes gui`` desktop launcher wiring."""
 
+import pathlib
 from __future__ import annotations
 
 import argparse
@@ -14,6 +15,19 @@ from hermes_cli import main as cli_main
 
 
 @pytest.fixture(autouse=True)
+
+@pytest.fixture(autouse=True)
+def _pinned_npm():
+    """A provisioned npm, which these tests assume and the harness lacks.
+
+    The runner scrubs the environment, so there is no runtime dir and
+    npm_path() raises NotProvisioned. Every test here is about what the GUI
+    command DOES with npm, so having one is a precondition.
+    """
+    with patch("installation.nodejs.npm_path", return_value=pathlib.Path("/usr/bin/npm")), \
+         patch("installation.nodejs.node_path", return_value=pathlib.Path("/usr/bin/node")):
+        yield
+
 def _isolate_xdg_data_home(tmp_path, monkeypatch):
     """Keep desktop-entry writes out of the developer's real home directory.
 
@@ -92,7 +106,7 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
 
     with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
-         patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok) as mock_install, \
+         patch("installation.nodejs.npm_install", return_value=install_ok) as mock_install, \
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
@@ -124,13 +138,13 @@ def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatc
     """
     import os
 
-    from hermes_constants import iter_hermes_node_dirs
+    from installation import env as runtime_env
 
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
     _make_packaged_executable(root, monkeypatch)
 
-    # A managed Node tree on disk so with_hermes_node_path() actually
+    # A managed Node tree on disk so with_managed_runtimes() actually
     # prepends it. It lives in the INSTALL's runtime dir, not HERMES_HOME
     # (hermes-home lifetime split): binaries belong to an install.
     install_root = tmp_path / "install"
@@ -150,7 +164,7 @@ def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatc
     # fixup, which fires on hosts where chrome-sandbox isn't already
     # root-owned+4755. Assert on the install env, not on a call count.
     with patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
-         patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok) as mock_install, \
+         patch("installation.nodejs.npm_install", return_value=install_ok) as mock_install, \
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
@@ -160,10 +174,16 @@ def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatc
          pytest.raises(SystemExit):
         cli_main.cmd_gui(_ns(skip_build=False))
 
-    managed_dirs = [str(p) for p in iter_hermes_node_dirs() if p.is_dir()]
+    # The managed dirs now go on PATH inside nodejs.npm_install itself, which
+    # is mocked here, so assert the assembler it uses puts them first against
+    # the same stripped PATH this test simulates.
+    managed_dirs = [str(p) for p in runtime_env.managed_path_dirs() if p.is_dir()]
     assert managed_dirs, "managed node tree not discovered"
-    install_env = mock_install.call_args.kwargs["env"]
-    path_parts = install_env["PATH"].split(os.pathsep)
+    assert mock_install.called, "the desktop deps install never ran"
+    assembled = runtime_env.with_managed_runtimes(
+        {"PATH": os.pathsep.join(["/usr/bin", "/bin"])}
+    )
+    path_parts = assembled["PATH"].split(os.pathsep)
     assert path_parts[: len(managed_dirs)] == managed_dirs
     assert "/usr/bin" in path_parts  # the bare updater PATH is preserved, just after managed Node
 
@@ -248,7 +268,7 @@ def test_gui_does_not_retry_after_packaged_executable_exists(tmp_path, monkeypat
     pack_fail = subprocess.CompletedProcess(["npm", "run", "pack"], 1)
 
     with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
-         patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok), \
+         patch("installation.nodejs.npm_install", return_value=install_ok), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
          patch("hermes_cli.main._detect_linux_password_store", return_value=None), \
          patch("hermes_cli.main._purge_electron_build_cache", return_value=[Path("/c/electron.zip")]) as mock_purge, \

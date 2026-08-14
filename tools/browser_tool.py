@@ -71,7 +71,6 @@ from hermes_constants import (
     get_hermes_home,
     get_hermes_home_override,
     hermes_home_key,
-    node_tool_runnable,
 )
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
@@ -246,12 +245,12 @@ def _discover_homebrew_node_dirs() -> tuple[str, ...]:
 
 def _browser_candidate_path_dirs() -> list[str]:
     """Return ordered browser CLI PATH candidates shared by discovery and execution."""
-    from hermes_constants import iter_hermes_node_dirs
+    from installation import env as runtime_env, nodejs
 
     # Managed Node lives in the install-scoped runtime dir, not the profile
     # home; one resolver owns that location, so this list follows it rather
     # than restating a path shape that moved.
-    hermes_node_dirs = [str(d) for d in iter_hermes_node_dirs()]
+    hermes_node_dirs = [str(d) for d in runtime_env.managed_path_dirs()]
     hermes_nm_bin = str(get_hermes_home() / "node_modules" / ".bin")
     return [*hermes_node_dirs, hermes_nm_bin, *list(_discover_homebrew_node_dirs()), *_SANE_PATH_DIRS]
 
@@ -2379,24 +2378,19 @@ def _agent_browser_candidate_present(path: str | None) -> bool:
 
 
 def _resolve_npx_bin() -> Optional[str]:
-    """Resolve a runnable npx binary, preferring the Hermes-managed/Homebrew
-    extended search over a bare ambient PATH lookup.
+    """The pinned npx, which every install provisions.
 
-    Checking bare PATH first would let a broken or unrelated system npx
-    shadow a healthy Hermes-managed one with no recovery — every candidate
-    is therefore validated with ``node_tool_runnable`` (the same check
-    ``find_hermes_node_executable`` uses to self-heal a managed Node tree)
-    before being trusted, falling through to the next candidate otherwise.
+    No PATH search and no runnability probe: npx ships inside the managed
+    npm tree, and the provisioner records that tree only after running it.
+    A system npx would be whatever version the machine happens to carry,
+    which is the thing the pin table exists to avoid.
     """
-    extended_path = _merge_browser_path("")
-    if extended_path:
-        extended_npx = shutil.which("npx", path=extended_path)
-        if extended_npx and node_tool_runnable(extended_npx):
-            return extended_npx
-    npx_path = shutil.which("npx")
-    if npx_path and node_tool_runnable(npx_path):
-        return npx_path
-    return None
+    from installation import nodejs
+
+    try:
+        return str(nodejs.npx_path())
+    except nodejs.NotProvisioned:
+        return None
 
 
 def _find_agent_browser(*, validate: bool = True) -> str:

@@ -21,16 +21,24 @@ import subprocess
 import sys
 from pathlib import Path
 
-from hermes_constants import agent_browser_runnable, find_node_executable
+from hermes_constants import agent_browser_runnable
 from tools.environments.local import hermes_subprocess_env
 
 _IS_WINDOWS = platform.system() == "Windows"
 
+
+def _node_present() -> bool:
+    """The pinned node is provisioned at install time; this reports on it."""
+    from installation import registry
+
+    return registry.tool_path("node") is not None
+
+
 _DEP_CHECKS = {
-    # find_node_executable() rather than a bare which(): $HERMES_HOME/node is
-    # not on PATH, so which() would report Node missing on an install that has
-    # a managed one and trigger a redundant re-install.
-    "node": lambda: find_node_executable("node") is not None,
+    # The recorded fact rather than a bare which(): the managed tree is not on
+    # PATH, so which() would report Node missing on an install that has one and
+    # trigger a redundant re-install.
+    "node": _node_present,
     "browser": lambda: (
         agent_browser_runnable(shutil.which("agent-browser"))
         or _has_system_browser()
@@ -80,13 +88,15 @@ def _has_npx_agent_browser() -> bool:
 
 
 def _has_hermes_agent_browser() -> bool:
-    from hermes_constants import iter_hermes_node_dirs
+    from installation import env as runtime_env
 
-    # The managed Node tree is install-scoped; iter_hermes_node_dirs owns
+    # The managed Node tree is install-scoped; managed_path_dirs owns
     # where it lives and the per-platform layout order (npm -g --prefix
     # drops .cmd shims in the prefix root on Windows, bin/ on POSIX).
     name = "agent-browser.cmd" if _IS_WINDOWS else "agent-browser"
-    return any((directory / name).is_file() for directory in iter_hermes_node_dirs())
+    return any(
+        (directory / name).is_file() for directory in runtime_env.managed_path_dirs()
+    )
 
 
 def _find_install_script(

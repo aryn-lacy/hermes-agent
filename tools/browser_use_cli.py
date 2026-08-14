@@ -252,8 +252,6 @@ def install_cli(timeout_s: int = 600) -> Tuple[bool, str]:
     except Exception as e:
         logger.debug("Managed uv bootstrap unavailable: %s", e)
     if not uv_bin:
-        uv_bin = shutil.which("uv")
-    if not uv_bin:
         return False, (
             "uv is not available and could not be bootstrapped. Install uv "
             "(https://docs.astral.sh/uv/) and run `uv tool install browser-use`."

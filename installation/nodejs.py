@@ -21,6 +21,7 @@ nothing here tries to recover from it.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -36,16 +37,12 @@ __all__ = [
     "node_path",
     "npm_install",
     "npm_path",
+    "npx_path",
     "record_lockfile_hash",
     "run_node",
     "run_npm",
+    "run_npx",
 ]
-
-# Manifests that decide whether an npm tree is current. A change to any of
-# them means the installed dependency tree no longer matches what the repo
-# asks for.
-_MANIFEST_NAMES = ("package.json", "package-lock.json")
-
 
 class NotProvisioned(RuntimeError):
     """A pinned tool is missing from an install that must have provisioned it.
@@ -76,6 +73,22 @@ def node_path() -> Path:
 def npm_path() -> Path:
     """The pinned npm binary."""
     return _binary("npm")
+
+
+def npx_path() -> Path:
+    """The pinned npx.
+
+    npx is not pinned separately — it ships inside the npm tree, beside the
+    npm binary the pin table names — so it is located relative to npm rather
+    than given a fact of its own.
+    """
+    candidate = npm_path().parent / ("npx.cmd" if os.name == "nt" else "npx")
+    if not candidate.exists():
+        raise NotProvisioned(
+            f"npx is missing from the managed npm tree at {candidate.parent}. "
+            "Run `hermes update` to re-provision it."
+        )
+    return candidate
 
 
 def _run(
@@ -147,6 +160,26 @@ def run_npm(
     )
 
 
+def run_npx(
+    args: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    capture_output: bool = True,
+    check: bool = False,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
+    """Run the pinned npx with *args*."""
+    return _run(
+        [npx_path(), *args],
+        cwd=cwd,
+        env=env,
+        capture_output=capture_output,
+        check=check,
+        timeout=timeout,
+    )
+
+
 def npm_install(
     project_dir: Path,
     *,
@@ -193,23 +226,59 @@ def npm_install(
     )
 
 
-def manifests_digest(project_dir: Path) -> str | None:
-    """Digest of *project_dir*'s dependency manifests, or None when absent.
+def _manifest_paths(project_dir: Path) -> tuple[Path, ...]:
+    """The manifests whose contents decide whether an install is current.
 
-    None means "no manifests to compare", which callers must treat as "assume
-    changed" rather than "unchanged" — a missing manifest is not evidence that
-    an install is current.
+    The lockfile alone is not a sufficient key: a developer can edit any
+    package.json without running npm, leaving the lockfile untouched while
+    the tree needs syncing.
+
+    Workspace members come from the root package.json's own ``workspaces``
+    globs — npm's source of truth — so adding a workspace cannot silently
+    escape the key. Every member counts, even ones a given install command
+    does not name, because one lockfile spans the whole graph and any
+    manifest edit can put it out of sync. An unreadable root manifest falls
+    back to the root pair, which over-installs rather than wrongly skipping.
     """
+    lockfile = project_dir / "package-lock.json"
+    root_manifest = project_dir / "package.json"
+    paths = [lockfile, root_manifest]
+    try:
+        workspaces = json.loads(root_manifest.read_text(encoding="utf-8")).get(
+            "workspaces", []
+        )
+    except (OSError, ValueError):
+        return tuple(paths)
+    if isinstance(workspaces, dict):  # legacy {"packages": [...]} form
+        workspaces = workspaces.get("packages", [])
+    for pattern in workspaces:
+        for match in sorted(project_dir.glob(str(pattern))):
+            manifest = match / "package.json"
+            if manifest.is_file():
+                paths.append(manifest)
+    return tuple(paths)
+
+
+def manifests_digest(project_dir: Path) -> str | None:
+    """Digest of *project_dir*'s dependency manifests, or None without a lockfile.
+
+    None means "no lockfile to compare against", which callers must treat as
+    "assume changed" rather than "unchanged" — a missing lockfile is not
+    evidence that an install is current.
+
+    Each path is hashed along with its name so that moving a manifest changes
+    the digest even when the bytes are identical.
+    """
+    if not (project_dir / "package-lock.json").exists():
+        return None
     digest = hashlib.sha256()
-    found = False
-    for name in _MANIFEST_NAMES:
-        path = project_dir / name
+    for path in _manifest_paths(project_dir):
+        digest.update(str(path.relative_to(project_dir)).encode())
         try:
             digest.update(path.read_bytes())
         except OSError:
-            continue
-        found = True
-    return digest.hexdigest() if found else None
+            digest.update(b"<missing>")
+    return digest.hexdigest()
 
 
 def _hash_cache_path(state_dir: Path, project_dir: Path) -> Path:

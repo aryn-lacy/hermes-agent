@@ -213,6 +213,7 @@ class TestLockfileHashCache:
         proj = tmp_path / "p"
         (proj / "node_modules").mkdir(parents=True)
         (proj / "package.json").write_text('{"name":"p"}', encoding="utf-8")
+        (proj / "package-lock.json").write_text('{"lockfileVersion":3}', encoding="utf-8")
         nodejs.record_lockfile_hash(tmp_path, proj)
         assert nodejs.lockfile_changed(tmp_path, proj) is False
 
@@ -237,11 +238,49 @@ class TestLockfileHashCache:
         a, b = tmp_path / "a", tmp_path / "b"
         for p in (a, b):
             (p / "node_modules").mkdir(parents=True)
+            (p / "package-lock.json").write_text(
+                '{"lockfileVersion":3}', encoding="utf-8"
+            )
         (a / "package.json").write_text('{"name":"a"}', encoding="utf-8")
         (b / "package.json").write_text('{"name":"b"}', encoding="utf-8")
         nodejs.record_lockfile_hash(tmp_path, a)
         assert nodejs.lockfile_changed(tmp_path, a) is False
         assert nodejs.lockfile_changed(tmp_path, b) is True
+
+    def test_a_workspace_manifest_edit_counts_as_changed(self, tmp_path):
+        """One lockfile spans the whole graph, so any member edit matters.
+
+        A developer can edit a workspace package.json without running npm:
+        the lockfile is untouched, but the tree needs syncing. Hashing only
+        the root pair would skip that install and leave node_modules stale.
+        """
+        proj = tmp_path / "p"
+        (proj / "node_modules").mkdir(parents=True)
+        (proj / "package-lock.json").write_text(
+            '{"lockfileVersion":3}', encoding="utf-8"
+        )
+        (proj / "package.json").write_text(
+            '{"name":"p","workspaces":["packages/*"]}', encoding="utf-8"
+        )
+        member = proj / "packages" / "one"
+        member.mkdir(parents=True)
+        (member / "package.json").write_text('{"name":"one"}', encoding="utf-8")
+
+        nodejs.record_lockfile_hash(tmp_path, proj)
+        assert nodejs.lockfile_changed(tmp_path, proj) is False
+
+        (member / "package.json").write_text(
+            '{"name":"one","dependencies":{"left-pad":"^1.0.0"}}', encoding="utf-8"
+        )
+        assert nodejs.lockfile_changed(tmp_path, proj) is True
+
+    def test_a_lockfile_is_required_for_a_digest(self, tmp_path):
+        """No lockfile means no basis for comparison, so never skip."""
+        proj = tmp_path / "p"
+        proj.mkdir()
+        (proj / "package.json").write_text('{"name":"p"}', encoding="utf-8")
+        assert nodejs.manifests_digest(proj) is None
+        assert nodejs.lockfile_changed(tmp_path, proj) is True
 
     def test_a_project_with_no_manifests_has_no_digest(self, tmp_path):
         proj = tmp_path / "empty"

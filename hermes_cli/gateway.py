@@ -2811,11 +2811,11 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     if _is_dir(node_bin):
         candidates.append(str(node_bin))
 
-    # Managed Node is install-scoped; iter_hermes_node_dirs owns its
+    # Managed Node is install-scoped; managed_path_dirs owns its
     # location and platform ordering (hermes-home lifetime split).
-    from hermes_constants import iter_hermes_node_dirs
+    from installation import env as runtime_env
 
-    for managed in iter_hermes_node_dirs():
+    for managed in runtime_env.managed_path_dirs():
         if _is_dir(managed):
             candidates.append(str(managed))
 
@@ -2910,9 +2910,9 @@ def _append_node_dir_for_service(
 
     PATH lookup remains the fallback rung for installs with no managed Node.
     """
-    from hermes_constants import iter_hermes_node_dirs
+    from installation import env as runtime_env
 
-    for directory in iter_hermes_node_dirs(hermes_root):
+    for directory in runtime_env.managed_path_dirs(hermes_root):
         entry = str(directory)
         try:
             present = directory.is_dir()

@@ -1,5 +1,6 @@
 """_tui_need_npm_install: auto npm when node_modules is behind the lockfile."""
 
+import pathlib
 import os
 import types
 from pathlib import Path
@@ -64,6 +65,9 @@ def test_make_tui_argv_uses_bundled_tui_when_workspace_missing(
     bundled_entry.parent.mkdir(parents=True)
     bundled_entry.write_text("// bundled TUI")
     monkeypatch.setattr(main_mod, "_find_bundled_tui", lambda: bundled_entry)
+    monkeypatch.setattr(
+        "installation.nodejs.node_path", lambda: pathlib.Path("/usr/bin/node")
+    )
 
     def which(name: str) -> str | None:
         if name == "node":
@@ -158,6 +162,12 @@ def test_make_tui_argv_omits_workspace_when_tui_has_own_lockfile(
     monkeypatch.setenv("PREFIX", "/usr")
     monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
     monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(
+        "installation.nodejs.node_path", lambda: pathlib.Path("/bin/node")
+    )
+    monkeypatch.setattr(
+        "installation.nodejs.npm_path", lambda: pathlib.Path("/bin/npm")
+    )
     calls = []
 
     def fake_run(*args, **kwargs):

@@ -1916,22 +1916,14 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             env_node = os.environ.get("HERMES_NODE")
             if env_node and os.path.isfile(env_node) and os.access(env_node, os.X_OK):
                 return env_node
-        # find_node_executable() prefers the managed $HERMES_HOME/node tree,
-        # which is not on PATH — a bare which() would declare "node not found"
-        # and exit on an install whose only Node is the one Hermes installed,
-        # and would pick a system Node over the managed one when both exist.
-        from hermes_constants import find_node_executable
+        # The pinned tool, not a PATH lookup: the managed tree is not on
+        # PATH, and a system Node would be the wrong version anyway.
+        from installation import nodejs
 
-        path = find_node_executable(bin)
-        if not path and bin == "node":
-            try:
-                from hermes_cli.dep_ensure import ensure_dependency
-                if ensure_dependency("node"):
-                    path = find_node_executable("node")
-            except Exception:
-                pass
-        if not path:
-            print(f"{bin} not found — install Node.js to use the TUI.")
+        try:
+            path = str(nodejs.npm_path() if bin == "npm" else nodejs.node_path())
+        except nodejs.NotProvisioned as exc:
+            print(f"{exc}")
             sys.exit(1)
         return path
 
@@ -2023,37 +2015,13 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             "--progress=false",
         ]
 
-        def _run_tui_install() -> subprocess.CompletedProcess:
-            from hermes_constants import with_hermes_node_path
+        from installation import nodejs
 
-            # Managed tree first on PATH: if the EBADENGINE repair below
-            # provisioned a managed Node, npm's shebang/lifecycle scripts must
-            # resolve that node, not the mismatched system one.
-            return subprocess.run(
-                npm_install_cmd,
-                cwd=str(npm_cwd),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env={**with_hermes_node_path(), "CI": "1"},
-            )
-
-        result = _run_tui_install()
-        if result.returncode != 0:
-            # An npm outside the root package.json's `engines.npm` range fails
-            # here before doing any work; repair once (upgrade a Hermes-managed
-            # npm in place, or provision a managed runtime when the npm belongs
-            # to the user) and retry rather than dumping EBADENGINE at the user.
-            from hermes_cli.npm_engine import maybe_repair_npm_engine
-
-            combined_output = f"{result.stdout or ''}\n{result.stderr or ''}"
-            repaired_npm = maybe_repair_npm_engine(npm, combined_output)
-            if repaired_npm:
-                npm = repaired_npm
-                npm_install_cmd[0] = repaired_npm
-                result = _run_tui_install()
+        result = nodejs.run_npm(
+            npm_install_cmd[1:],
+            cwd=npm_cwd,
+            env={"CI": "1"},
+        )
         if result.returncode != 0:
             combined = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
             preview = "\n".join(combined.splitlines()[-30:])
@@ -2785,7 +2753,7 @@ def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
     _require_tty("whatsapp")
     from hermes_cli.config import get_env_value, save_env_value
-    from hermes_constants import find_node_executable, with_hermes_node_path
+    from installation import env as runtime_env, nodejs
 
     print()
     print("⚕ WhatsApp Setup")
@@ -2900,7 +2868,7 @@ def cmd_whatsapp(args):
         print(
             "\n→ Installing WhatsApp bridge dependencies (this can take a few minutes)..."
         )
-        npm = find_node_executable("npm")
+        npm = str(nodejs.npm_path())
         if not npm:
             print("  ✗ npm not found on PATH — install Node.js first")
             return
@@ -2913,7 +2881,7 @@ def cmd_whatsapp(args):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env=with_hermes_node_path(),
+                env=runtime_env.with_managed_runtimes(),
             )
         except KeyboardInterrupt:
             print("\n  ✗ Install cancelled")
@@ -2971,14 +2939,14 @@ def cmd_whatsapp(args):
     try:
         subprocess.run(
             [
-                find_node_executable("node") or "node",
+                str(nodejs.node_path()),
                 str(bridge_script),
                 "--pair-only",
                 "--session",
                 str(session_dir),
             ],
             cwd=str(bridge_dir),
-            env=with_hermes_node_path(),
+            env=runtime_env.with_managed_runtimes(),
         )
     except KeyboardInterrupt:
         pass
@@ -5514,136 +5482,6 @@ def _nixos_build_env() -> dict[str, str] | None:
         pass  # nix-shell not available — caller will get None
 
     return None
-def _run_npm_install_deterministic(
-    npm: str,
-    cwd: Path,
-    *,
-    extra_args: tuple[str, ...] = (),
-    capture_output: bool = True,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess:
-    """Run a deterministic npm install that does not mutate ``package-lock.json``.
-
-    Prefers ``npm ci`` (strict, lockfile-preserving) when a lockfile is present;
-    falls back to ``npm install`` only if ``npm ci`` fails (e.g. lockfile out of
-    sync on a WIP checkout).  Without this, ``npm install`` on npm ≥ 10 silently
-    rewrites committed lockfiles (stripping ``"peer": true`` etc.), which leaves
-    the working tree dirty and causes the next ``hermes update`` to stash the
-    lockfile — repeatedly.
-
-    ``--include=dev`` is forced on every invocation: the callers are frontend
-    builds (web UI / TUI / desktop workspaces), and those builds need the dev
-    toolchain (``tsc``, ``vite``, ``electron-builder`` — all
-    ``devDependencies``).  If the caller's environment has
-    ``NODE_ENV=production`` (or npm config ``omit=dev``) — which leaks in from
-    a shell profile, a container image, or the bundled TUI launcher that sets
-    ``NODE_ENV=production`` on its subprocess env — npm silently omits
-    devDependencies (exit 0, no error), so the build toolchain never installs
-    and the subsequent build dies with ``tsc: command not found`` (exit 127).
-    The flag overrides both the env var and npm config, unlike scrubbing
-    ``NODE_ENV`` from the environment which only fixes the env-leak case.
-
-    ``--no-save`` on the ``npm install`` fallback keeps it true to this
-    function's contract: never mutate ``package-lock.json``.  Without it, an
-    out-of-sync lockfile gets rewritten by the fallback, which drifts the
-    committed lockfile and makes every future ``npm ci`` fail — a
-    self-reinforcing cycle where web devDeps never install and a stale dist
-    is served on every update (PR #65595).
-    """
-    # unicode-animations' postinstall animates to /dev/tty (bypasses
-    # --silent/capture_output). It no-ops when CI is set — same as the TUI
-    # install path and nix/lib.nix npm ci hooks.
-    run_env = {**os.environ, **(env or {}), "CI": "1"}
-
-    def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-        return _run_npm_watching_for_engine_failure(
-            cmd,
-            cwd=cwd,
-            env=run_env,
-            capture_output=capture_output,
-        )
-
-    def _attempt(npm_exe: str) -> subprocess.CompletedProcess:
-        lockfile = cwd / "package-lock.json"
-        if lockfile.exists():
-            ci_result = _run([npm_exe, "ci", "--include=dev", *extra_args])
-            if ci_result.returncode == 0:
-                return ci_result
-            # Fall through to `npm install` — lockfile may be out of sync on a
-            # WIP fork/branch, or `npm ci` may not be available on very old npm.
-        return _run([npm_exe, "install", "--no-save", "--include=dev", *extra_args])
-
-    result = _attempt(npm)
-    if result.returncode == 0:
-        return result
-
-    # An npm outside the root package.json's `engines.npm` range fails every
-    # command here identically (the `npm install` fallback included), so the
-    # failure is worth exactly one repair attempt. `maybe_repair_npm_engine`
-    # returns the npm to retry with — the same one after an in-place upgrade
-    # of a Hermes-managed install, or a freshly provisioned managed npm when
-    # the failing npm belongs to the user's own toolchain.
-    from hermes_cli.npm_engine import maybe_repair_npm_engine
-
-    combined = f"{result.stdout or ''}\n{result.stderr or ''}"
-    repaired_npm = maybe_repair_npm_engine(npm, combined)
-    if not repaired_npm:
-        return result
-    # The repaired npm may be a freshly provisioned managed one whose shebang
-    # and lifecycle scripts resolve `node` from PATH — put the managed tree
-    # first so they find the managed Node, not the mismatched system one.
-    from hermes_constants import with_hermes_node_path
-
-    run_env["PATH"] = with_hermes_node_path(run_env)["PATH"]
-    return _attempt(repaired_npm)
-
-
-def _run_npm_watching_for_engine_failure(
-    cmd: list[str],
-    *,
-    cwd: Path,
-    env: dict[str, str],
-    capture_output: bool,
-) -> subprocess.CompletedProcess:
-    """Run *cmd*, always retaining stderr so ``EBADENGINE`` stays detectable.
-
-    ``capture_output=False`` callers stream npm's progress live and would
-    otherwise hand back a ``CompletedProcess`` with ``stderr=None``, leaving the
-    engine-failure recovery nothing to read. Tee stderr instead: each line is
-    forwarded to this process's stderr as it arrives (so live output is
-    unchanged) and accumulated for the caller.
-    """
-    if capture_output:
-        return subprocess.run(
-            cmd,
-            cwd=cwd,
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-
-    captured: list[str] = []
-    with subprocess.Popen(
-        cmd,
-        cwd=cwd,
-        env=env,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    ) as proc:
-        if proc.stderr is not None:
-            for line in proc.stderr:
-                captured.append(line)
-                sys.stderr.write(line)
-            sys.stderr.flush()
-        returncode = proc.wait()
-    return subprocess.CompletedProcess(cmd, returncode, None, "".join(captured))
-
-
 def _missing_web_build_tool(output: str) -> str | None:
     """Return the build tool a failed ``npm run build`` could not resolve.
 
@@ -5736,7 +5574,7 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
             encoding = getattr(sys.stdout, "encoding", None) or "ascii"
             print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
 
-    from hermes_constants import with_hermes_node_path
+    from installation import env as runtime_env, nodejs
 
     npm = _resolve_node_runtime_npm()
     if not npm:
@@ -5744,7 +5582,7 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
             _say("Web UI frontend not built and npm is not available.")
             _say("Install Node.js, then run:  cd web && npm install && npm run build")
         return not fatal
-    build_env = with_hermes_node_path()
+    build_env = runtime_env.with_managed_runtimes()
     _say("→ Building web UI...")
 
     def _relay(result: "subprocess.CompletedProcess") -> None:
@@ -5792,8 +5630,9 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
         npm_cwd, npm_workspace_args = _termux_workspace_install_context(web_dir)
 
     def _install_web_deps(*, silent: bool) -> "subprocess.CompletedProcess":
-        return _run_npm_install_deterministic(
-            npm,
+        from installation import nodejs
+
+        return nodejs.npm_install(
             npm_cwd,
             extra_args=(*npm_workspace_args, "--silent", "--prefer-offline") if silent else (*npm_workspace_args, "--prefer-offline"),
             env=build_env,
@@ -6566,9 +6405,9 @@ def _redownload_electron_dist(
     installer = electron_dir / "install.js"
     if not installer.is_file():
         return False
-    from hermes_constants import find_node_executable, with_hermes_node_path
+    from installation import env as runtime_env, nodejs
 
-    node = find_node_executable("node")
+    node = str(nodejs.node_path())
     if not node:
         return False
 
@@ -6579,7 +6418,7 @@ def _redownload_electron_dist(
     except OSError:
         pass
 
-    dl_env = with_hermes_node_path(env)
+    dl_env = runtime_env.with_managed_runtimes(env)
     if mirror:
         dl_env["ELECTRON_MIRROR"] = mirror
     try:
@@ -7132,10 +6971,10 @@ def cmd_gui(args: argparse.Namespace):
     except Exception:
         pass
 
-    from hermes_constants import with_hermes_node_path
+    from installation import env as runtime_env, nodejs
 
-    # with_hermes_node_path() copies os.environ when called with no arg.
-    env = with_hermes_node_path()
+    # runtime_env.with_managed_runtimes() copies os.environ when called with no arg.
+    env = runtime_env.with_managed_runtimes()
     if getattr(args, "fake_boot", False):
         env["HERMES_DESKTOP_BOOT_FAKE"] = "1"
     if getattr(args, "ignore_existing", False):
@@ -7228,8 +7067,11 @@ def cmd_gui(args: argparse.Namespace):
             # hermes update) loses shell PATH customizations. Wrapping the
             # NixOS build env keeps its PYTHON hint while restoring managed Node
             # ahead of a bare PATH (same idiom as the `hermes update` path).
-            nixos_env = with_hermes_node_path(_nixos_build_env())
-            install_result = _run_npm_install_deterministic(npm, PROJECT_ROOT, capture_output=False, env=nixos_env)
+            from installation import nodejs
+
+            install_result = nodejs.npm_install(
+                PROJECT_ROOT, capture_output=False, env=_nixos_build_env()
+            )
             if install_result.returncode != 0:
                 if not _electron_pkg_staged_missing_dist(PROJECT_ROOT):
                     print("✗ Desktop dependency install failed")
@@ -8993,41 +8835,24 @@ def _is_windows_npm_path(npm_path: str) -> bool:
 
 
 def _resolve_node_runtime_npm() -> str | None:
-    """Resolve an npm executable that belongs to the host's Node runtime.
+    """The pinned npm.
 
-    On WSL/Linux ``shutil.which("npm")`` may resolve a Windows npm exposed
-    through PATH interop. Running that Windows npm against the Linux checkout
-    operates over ``\\wsl.localhost\\...`` UNC paths and fails with EISDIR /
-    symlink errors in symlink-heavy trees like ``ui-tui`` (#30271). Refuse a
-    Windows npm on a POSIX host and re-scan PATH (skipping ``/mnt/*`` interop
-    entries) for a Linux-native npm. Returns the npm path, or ``None`` when
-    no suitable npm is reachable.
+    This used to reject a Windows npm reached through WSL's PATH interop and
+    re-scan for a Linux-native one: running that npm against the Linux
+    checkout operates over \\\\wsl.localhost UNC paths and fails with EISDIR
+    in symlink-heavy trees like ui-tui (#30271). None of that can happen to a
+    path this install provisioned for its own platform, so the resolution is
+    a lookup and the WSL guard is gone with it.
+
+    Still returns Optional: a damaged runtime dir is a real state, and the
+    callers already degrade rather than crash.
     """
-    from hermes_constants import find_node_executable
+    from installation import nodejs
 
-    npm = find_node_executable("npm")
-
-    # On native Windows the platform npm (``npm.cmd``) is exactly what we
-    # want — only reject Windows shims when we're a POSIX/WSL process.
-    if _is_windows():
-        return npm
-
-    if not npm:
+    try:
+        return str(nodejs.npm_path())
+    except nodejs.NotProvisioned:
         return None
-
-    if not _is_windows_npm_path(npm):
-        return npm
-
-    # The first resolution was a Windows npm. Re-scan PATH skipping the
-    # ``/mnt/*`` Windows drive mounts WSL injects, so a Linux-native npm that
-    # came later on PATH is still found.
-    for directory in os.environ.get("PATH", "").split(os.pathsep):
-        if not directory or directory.lower().startswith("/mnt/"):
-            continue
-        candidate = shutil.which("npm", path=directory)
-        if candidate and not _is_windows_npm_path(candidate):
-            return candidate
-    return None
 
 
 class _UpdateOutputStream:

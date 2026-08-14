@@ -214,7 +214,7 @@ def test_agent_browser_npx_warmup_hides_npx_window(monkeypatch):
         browser_tool.shutil, "which",
         lambda name, path=None: "/usr/bin/npx",
     )
-    monkeypatch.setattr(browser_tool, "node_tool_runnable", lambda p: True)
+    monkeypatch.setattr(browser_tool, "_resolve_npx_bin", lambda: "/usr/bin/npx")
     monkeypatch.setattr(browser_tool, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
     monkeypatch.setattr(browser_tool.subprocess, "Popen", _FakePopen)
 
@@ -384,6 +384,10 @@ def test_lazy_deps_uv_install_hides_console_window(monkeypatch):
     monkeypatch.setattr(lazy_deps, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
     monkeypatch.setattr(lazy_deps.subprocess, "run", fake_run)
     monkeypatch.setattr(lazy_deps.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    # resolve_uv() is the first rung and finds a real managed uv wherever the
+    # runtime dir is populated (the Nix dev shell points at a built one), so
+    # the PATH stub below would never be reached.
+    monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: None)
 
     res = lazy_deps._venv_pip_install(("left-pad",))
 

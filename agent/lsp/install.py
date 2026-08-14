@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
-from hermes_constants import find_node_executable
+from installation import nodejs
 
 logger = logging.getLogger("agent.lsp.install")
 
@@ -253,7 +253,7 @@ def _install_npm(
     # Managed npm first: $HERMES_HOME/node is not on an arbitrary process's
     # PATH, so a bare which() misses the Node that Hermes installed and
     # reports "npm not on PATH" on a machine that has a perfectly good one.
-    npm = find_node_executable("npm")
+    npm = str(nodejs.npm_path())
     if npm is None:
         logger.info("[install] cannot install %s: no usable npm found", pkg)
         return None

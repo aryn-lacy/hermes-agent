@@ -323,7 +323,7 @@ def test_has_agent_browser_import_failure_falls_back_to_hermes_managed_node_path
         ),
     )
     monkeypatch.setattr(
-        "hermes_constants.with_hermes_node_path", lambda: {"PATH": str(managed_dir)}
+        "installation.env.with_managed_runtimes", lambda *a, **k: {"PATH": str(managed_dir)}
     )
     monkeypatch.setattr(
         "hermes_constants.agent_browser_runnable",

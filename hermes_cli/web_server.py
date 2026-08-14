@@ -8679,10 +8679,10 @@ def _ensure_whatsapp_bridge_dependencies(bridge_dir: Path) -> None:
     if (bridge_dir / "node_modules").exists():
         return
 
-    from hermes_constants import find_node_executable, with_hermes_node_path
+    from installation import env as runtime_env, nodejs
     from utils import env_int
 
-    npm = find_node_executable("npm")
+    npm = str(nodejs.npm_path())
     if not npm:
         raise HTTPException(
             status_code=500,
@@ -8701,7 +8701,7 @@ def _ensure_whatsapp_bridge_dependencies(bridge_dir: Path) -> None:
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
-            env=with_hermes_node_path(),
+            env=runtime_env.with_managed_runtimes(),
             creationflags=windows_hide_flags(),
         )
     except subprocess.TimeoutExpired as exc:
@@ -8727,7 +8727,7 @@ def _ensure_whatsapp_bridge_dependencies(bridge_dir: Path) -> None:
 
 def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess.Popen:
     from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
-    from hermes_constants import find_node_executable, with_hermes_node_path
+    from installation import env as runtime_env, nodejs
 
     bridge_dir = resolve_whatsapp_bridge_dir()
     bridge_script = bridge_dir / "bridge.js"
@@ -8736,7 +8736,7 @@ def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess
             status_code=500,
             detail=f"WhatsApp bridge script was not found at {bridge_script}.",
         )
-    node = find_node_executable("node")
+    node = str(nodejs.node_path())
     if not node:
         raise HTTPException(
             status_code=500,
@@ -8746,7 +8746,7 @@ def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess
     _ensure_whatsapp_bridge_dependencies(bridge_dir)
     session_path.mkdir(parents=True, exist_ok=True)
 
-    env = with_hermes_node_path()
+    env = runtime_env.with_managed_runtimes()
     env["WHATSAPP_MODE"] = mode
     env["WHATSAPP_DM_POLICY"] = "pairing"
     return subprocess.Popen(
