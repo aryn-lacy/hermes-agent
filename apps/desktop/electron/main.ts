@@ -41,7 +41,8 @@ import {
   gitOnPathSkippingShim,
   managedRuntimePathEntries,
   normalizeHermesHomeRoot,
-  readRuntimeFacts
+  readRuntimeFacts,
+  toolStoreDir
 } from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import {
@@ -580,15 +581,18 @@ function resolveHermesHome() {
 
 const HERMES_HOME = resolveHermesHome()
 
-// Managed runtime tools (node, uv, git, gh, ripgrep) live in the INSTALL's
-// runtime dir, not in HERMES_HOME — profile state and install artifacts have
-// different lifetimes, and two installs sharing a home must not share
-// binaries. The registry's facts file says which tools exist and where;
-// backend-env reads it (same data installation/env.py serves Python).
+// Managed runtime tools (node, uv, git, gh, ripgrep) are recorded by the
+// INSTALL's runtime dir and stored machine-wide — profile state, install
+// artifacts and tool bytes all have different lifetimes. Two installs
+// sharing a home must not share a facts file; two installs pinning the
+// same node version SHOULD share the bytes. The registry's facts file
+// says which tools exist and which store entry each one is; backend-env
+// reads it (same data installation/env.py serves Python).
 const ACTIVE_RUNTIME_DIR = path.join(HERMES_HOME, 'hermes-agent', '.hermes-runtime')
+const TOOL_STORE_DIR = toolStoreDir(HERMES_HOME)
 
 function pathWithHermesManagedNode(...entries) {
-  const managed = managedRuntimePathEntries(ACTIVE_RUNTIME_DIR)
+  const managed = managedRuntimePathEntries(ACTIVE_RUNTIME_DIR, { storeDir: TOOL_STORE_DIR })
 
   return [...managed, ...entries, process.env.PATH].filter(Boolean).join(path.delimiter)
 }
@@ -2279,20 +2283,26 @@ let _gitBinaryCache = null
  * A managed tool's binary, from the registry facts of every runtime dir
  * this app might be running against — the bundled payload first, then the
  * source install's. One reader; no per-tool candidate lists.
+ *
+ * The payload is its own store (everything it holds was staged into it at
+ * build time); the source install's facts name entries in the
+ * machine-wide store.
  */
 function managedToolBinary(tool: string): string | null {
-  const roots: string[] = []
+  const roots: { facts: string; store: string }[] = []
 
   if (process.resourcesPath) {
-    roots.push(path.join(process.resourcesPath, 'agent-payload'))
+    const payload = path.join(process.resourcesPath, 'agent-payload')
+
+    roots.push({ facts: payload, store: payload })
   }
-  roots.push(ACTIVE_RUNTIME_DIR)
+  roots.push({ facts: ACTIVE_RUNTIME_DIR, store: TOOL_STORE_DIR })
 
   for (const root of roots) {
-    const fact = readRuntimeFacts(root)[tool]
+    const fact = readRuntimeFacts(root.facts)[tool]
 
     if (fact?.path) {
-      const binary = path.join(root, fact.path)
+      const binary = path.join(root.store, fact.path)
 
       if (fileExists(binary)) {
         return binary
@@ -4252,6 +4262,7 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
     env: buildDesktopBackendEnv({
       hermesHome: HERMES_HOME,
       runtimeDir: ACTIVE_RUNTIME_DIR,
+      storeDir: TOOL_STORE_DIR,
       pythonPathEntries: [root, ...getVenvSitePackagesEntries(venvRoot)],
       venvRoot
     }),
@@ -4278,6 +4289,7 @@ function createActiveBackend(backendArgs) {
     env: buildDesktopBackendEnv({
       hermesHome: HERMES_HOME,
       runtimeDir: ACTIVE_RUNTIME_DIR,
+      storeDir: TOOL_STORE_DIR,
       pythonPathEntries: [ACTIVE_HERMES_ROOT, ...getVenvSitePackagesEntries(VENV_ROOT)],
       venvRoot: VENV_ROOT
     }),

@@ -44,15 +44,28 @@ def provisioned_git(tmp_path_factory) -> Path:
     return runtime_dir
 
 
+@pytest.fixture(scope="module")
+def git_entry(provisioned_git) -> Path:
+    """The git tree's root inside the store, read from the facts.
+
+    Derived rather than spelled out: the entry name carries the pinned
+    version, so restating it here would make these tests fail on every
+    pin bump for no behavioural reason.
+    """
+    binary = runtime_env.managed_tool_binary("git", provisioned_git)
+    assert binary is not None, "git provisioned but not resolvable from its facts"
+    return binary.parent.parent
+
+
 class TestManagedGitStandsAlone:
-    def test_the_pinned_archive_matched_its_digest(self, provisioned_git):
+    def test_the_pinned_archive_matched_its_digest(self, provisioned_git, git_entry):
         """Provisioning at all proves it: the provisioner aborts on a
         digest mismatch before extracting anything."""
-        assert (provisioned_git / "git" / "bin" / "git").is_file()
+        assert (git_entry / "bin" / "git").is_file()
         assert load_facts(provisioned_git)["git"].version == load_pins()["git"]["version"]
 
-    def test_git_runs_with_an_empty_environment(self, provisioned_git):
-        git = provisioned_git / "git" / "bin" / "git"
+    def test_git_runs_with_an_empty_environment(self, provisioned_git, git_entry):
+        git = git_entry / "bin" / "git"
         env = runtime_env.managed_tool_env(provisioned_git)
 
         proc = subprocess.run(
@@ -62,11 +75,11 @@ class TestManagedGitStandsAlone:
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout.startswith("git version")
 
-    def test_the_portable_git_contract_is_exported(self, provisioned_git):
+    def test_the_portable_git_contract_is_exported(self, provisioned_git, git_entry):
         env = runtime_env.managed_tool_env(provisioned_git)
 
-        # Every one of these must point INSIDE the runtime dir: the whole
-        # idea is that nothing resolves against the host.
+        # Every one of these must point INSIDE git's own store entry: the
+        # whole idea is that nothing resolves against the host.
         for key in (
             "GIT_EXEC_PATH",
             "GIT_TEMPLATE_DIR",
@@ -74,11 +87,13 @@ class TestManagedGitStandsAlone:
             "GIT_SSL_CAINFO",
         ):
             assert key in env, f"{key} missing from the managed git env"
-            assert str(provisioned_git) in env[key], f"{key} escapes the runtime dir"
+            assert str(git_entry) in env[key], f"{key} escapes git's store entry"
 
-    def test_a_real_clone_needs_no_system_git(self, provisioned_git, tmp_path):
+    def test_a_real_clone_needs_no_system_git(
+        self, provisioned_git, git_entry, tmp_path
+    ):
         """The end-to-end claim. Empty env + the managed git only."""
-        git = provisioned_git / "git" / "bin" / "git"
+        git = git_entry / "bin" / "git"
         env = runtime_env.managed_tool_env(provisioned_git)
         env["HOME"] = str(tmp_path)  # git wants somewhere to look for ~/.gitconfig
 
@@ -104,7 +119,7 @@ class TestManagedGitStandsAlone:
         assert proc.returncode == 0, proc.stderr
         assert (target / ".git").is_dir()
 
-    def test_managed_git_leads_the_assembled_path(self, provisioned_git):
+    def test_managed_git_leads_the_assembled_path(self, provisioned_git, git_entry):
         dirs = runtime_env.managed_path_dirs(provisioned_git)
         assert dirs, "the provisioned git should contribute a PATH entry"
 
@@ -113,7 +128,7 @@ class TestManagedGitStandsAlone:
         )
         entries = merged["PATH"].split(os.pathsep)
 
-        git_dir = str(provisioned_git / "git" / "bin")
+        git_dir = str(git_entry / "bin")
         assert git_dir in entries
         # /usr/bin holds the xcode-select shim on macOS: ours must win.
         assert entries.index(git_dir) < entries.index("/usr/bin")

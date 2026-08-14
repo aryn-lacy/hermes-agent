@@ -13,7 +13,8 @@ import {
   normalizeHermesHomeRoot,
   pathEnvKey,
   POSIX_SANE_PATH_ENTRIES,
-  readRuntimeFacts
+  readRuntimeFacts,
+  toolStoreDir
 } from './backend-env'
 
 /**
@@ -41,12 +42,17 @@ function fakeFs(files: Record<string, string>, dirsWithBinaries: string[] = []) 
   } as never
 }
 
-function factsFile(tools: Record<string, unknown>, schemaVersion = 1, pathOrder?: string[]) {
+function factsFile(tools: Record<string, unknown>, schemaVersion = 2, pathOrder?: string[]) {
   return JSON.stringify({ schemaVersion, pathOrder, tools })
 }
 
 const RUNTIME = '/install/.hermes-runtime'
 const FACTS_PATH = '/install/.hermes-runtime/runtimes.json'
+// A source install's facts name entries in the machine-wide store; the
+// runtime dir holds only runtimes.json. Passing no storeDir (as the
+// self-contained payload does) makes the runtime dir its own store,
+// which is why most tests below can still join against RUNTIME.
+const STORE = '/home/u/.hermes/tools'
 
 test('managed runtime dirs come from the registry facts, in the recorded order', () => {
   // Recorded out of order on purpose: pathOrder decides, not the tools map.
@@ -58,7 +64,7 @@ test('managed runtime dirs come from the registry facts, in the recorded order',
           node: { version: '26.5.1', path: 'node/bin/node' },
           uv: { version: '0.12.1', path: 'uv/uv' }
         },
-        1,
+        2,
         ['node', 'uv', 'ripgrep']
       )
     },
@@ -83,7 +89,7 @@ test('an extender is assembled ahead of what it extends', () => {
           node: { version: '26.7.0', path: 'node/bin/node' },
           npm: { version: '12.0.2', path: 'npm/bin/npm' }
         },
-        1,
+        2,
         ['npm', 'node']
       )
     },
@@ -136,6 +142,91 @@ test('pathDirs spreads a multi-directory tool across every entry', () => {
     '/install/.hermes-runtime/git/bin',
     '/install/.hermes-runtime/git/usr/bin'
   ])
+})
+
+test('a source install joins its facts onto the shared store, not the runtime dir', () => {
+  // The store split: runtimes.json lives with the install, the bytes live
+  // in ~/.hermes/tools under a <tool>-<version>-<target> entry. Joining a
+  // fact onto the wrong base yields a PATH of directories that do not
+  // exist, which degrades silently to system tools.
+  const fsImpl = fakeFs(
+    {
+      [FACTS_PATH]: factsFile({
+        node: { version: '26.7.0', path: 'node-26.7.0-linux-x64/bin/node' }
+      })
+    },
+    [`${STORE}/node-26.7.0-linux-x64/bin/node`]
+  )
+
+  assert.deepEqual(managedRuntimePathEntries(RUNTIME, { fsImpl, pathModule: path.posix, storeDir: STORE }), [
+    `${STORE}/node-26.7.0-linux-x64/bin`
+  ])
+})
+
+test('two installs sharing one store resolve to the same bytes', () => {
+  // 44 worktrees cost 44 facts files and ONE copy of node — that is the
+  // entire reason the store exists.
+  const relative = 'node-26.7.0-linux-x64/bin/node'
+  const entries = ['/a/.hermes-runtime', '/b/.hermes-runtime'].map(runtimeDir => {
+    const fsImpl = fakeFs(
+      { [`${runtimeDir}/runtimes.json`]: factsFile({ node: { version: '26.7.0', path: relative } }) },
+      [`${STORE}/${relative}`]
+    )
+
+    return managedRuntimePathEntries(runtimeDir, { fsImpl, pathModule: path.posix, storeDir: STORE })
+  })
+
+  assert.deepEqual(entries[0], entries[1])
+  assert.deepEqual(entries[0], [`${STORE}/node-26.7.0-linux-x64/bin`])
+})
+
+test('store-relative pathDirs spread against the store too', () => {
+  // A PATH dir must resolve against the same base as the binary, or
+  // PortableGit contributes three directories that are not there.
+  const entry = 'git-2.53.0.3-win32-x64'
+  const fsImpl = fakeFs(
+    {
+      [FACTS_PATH]: factsFile({
+        git: {
+          version: '2.53.0.3',
+          path: `${entry}/cmd/git.exe`,
+          pathDirs: [`${entry}/cmd`, `${entry}/bin`, `${entry}/usr/bin`]
+        }
+      })
+    },
+    [`${STORE}/${entry}/cmd/git.exe`]
+  )
+
+  assert.deepEqual(managedRuntimePathEntries(RUNTIME, { fsImpl, pathModule: path.posix, storeDir: STORE }), [
+    `${STORE}/${entry}/cmd`,
+    `${STORE}/${entry}/bin`,
+    `${STORE}/${entry}/usr/bin`
+  ])
+})
+
+test('a self-contained payload is its own store when no storeDir is given', () => {
+  // The embedded desktop payload and the Nix bundle stage everything into
+  // one directory and cannot write to the machine-wide store. Omitting
+  // storeDir has to keep those working unchanged.
+  const payload = '/Applications/Hermes.app/Contents/Resources/agent-payload'
+  const fsImpl = fakeFs(
+    { [`${payload}/runtimes.json`]: factsFile({ node: { version: '26.7.0', path: 'node/bin/node' } }) },
+    [`${payload}/node/bin/node`]
+  )
+
+  assert.deepEqual(managedRuntimePathEntries(payload, { fsImpl, pathModule: path.posix }), [`${payload}/node/bin`])
+})
+
+test('toolStoreDir puts the store beside the Hermes home root', () => {
+  assert.equal(toolStoreDir('/home/u/.hermes', { pathModule: path.posix }), '/home/u/.hermes/tools')
+})
+
+test('toolStoreDir resolves a profile home to the ROOT store', () => {
+  // Tool bytes are a machine fact, not a profile one: two profiles on one
+  // machine must share the entry rather than each holding a copy. Mirrors
+  // installation.paths.get_tool_store() going through the same
+  // normalization.
+  assert.equal(toolStoreDir('/home/u/.hermes/profiles/work', { pathModule: path.posix }), '/home/u/.hermes/tools')
 })
 
 test('a recorded but vanished binary contributes no PATH entry', () => {

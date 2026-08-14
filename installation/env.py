@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 from typing import Mapping, Optional
 
-from installation.paths import get_runtime_dir
+from installation.paths import get_runtime_dir, resolve_bases
 from installation.registry import RuntimeFact, load_facts, load_path_order
 
 __all__ = [
@@ -43,7 +43,9 @@ def _dirs_for(fact: RuntimeFact, base: Path) -> list[Path]:
     return [(base / fact.path).parent]
 
 
-def managed_path_dirs(runtime_dir: Path | None = None) -> list[Path]:
+def managed_path_dirs(
+    runtime_dir: Path | None = None, store_dir: Path | None = None
+) -> list[Path]:
     """Existing bin dirs of every provisioned tool, in assembly order.
 
     The order is DATA, recorded in the facts file by the provisioner from
@@ -54,15 +56,18 @@ def managed_path_dirs(runtime_dir: Path | None = None) -> list[Path]:
     Tools absent from facts (or recorded but vanished) contribute nothing:
     an unprovisioned install degrades to system tools instead of shipping
     dead PATH entries.
+
+    Facts come from the install, bytes from the store — the fact's path is
+    store-relative, so the dirs this emits point INTO the shared store.
     """
-    base = runtime_dir if runtime_dir is not None else get_runtime_dir()
-    facts = load_facts(base)
+    facts_dir, store = resolve_bases(runtime_dir, store_dir)
+    facts = load_facts(facts_dir)
     dirs: list[Path] = []
-    for tool in load_path_order(base):
+    for tool in load_path_order(facts_dir):
         fact = facts.get(tool)
-        if fact is None or not (base / fact.path).is_file():
+        if fact is None or not (store / fact.path).is_file():
             continue
-        for d in _dirs_for(fact, base):
+        for d in _dirs_for(fact, store):
             if d.is_dir() and d not in dirs:
                 dirs.append(d)
     return dirs
@@ -83,7 +88,9 @@ def is_macos_xcode_shim(binary: str | Path | None) -> bool:
 
 
 def managed_tool_binary(
-    tool: str, runtime_dir: Path | None = None
+    tool: str,
+    runtime_dir: Path | None = None,
+    store_dir: Path | None = None,
 ) -> Optional[Path]:
     """The managed binary for *tool*, or None when it is not provisioned.
 
@@ -91,15 +98,17 @@ def managed_tool_binary(
     system copy — resolves from the registry facts, so it knows about a
     tool the moment the provisioner records it.
     """
-    base = runtime_dir if runtime_dir is not None else get_runtime_dir()
-    fact = load_facts(base).get(tool)
+    facts_dir, store = resolve_bases(runtime_dir, store_dir)
+    fact = load_facts(facts_dir).get(tool)
     if fact is None:
         return None
-    binary = base / fact.path
+    binary = store / fact.path
     return binary if binary.is_file() else None
 
 
-def managed_tool_env(runtime_dir: Path | None = None) -> dict[str, str]:
+def managed_tool_env(
+    runtime_dir: Path | None = None, store_dir: Path | None = None
+) -> dict[str, str]:
     """Tool-specific env for managed runtimes.
 
     - npm_config_cache: npm's package cache → install-keyed cache dir,
@@ -119,16 +128,18 @@ def managed_tool_env(runtime_dir: Path | None = None) -> dict[str, str]:
       left entirely alone, because exporting GIT_EXEC_PATH at a git we do
       not own breaks it.
     """
-    base = runtime_dir if runtime_dir is not None else get_runtime_dir()
-    facts = load_facts(base)
+    facts_dir, store = resolve_bases(runtime_dir, store_dir)
+    facts = load_facts(facts_dir)
     env: dict[str, str] = {}
     node = facts.get("node")
-    if node is not None and (base / node.path).is_file():
-        env["npm_config_cache"] = str(runtime_cache_dir(base) / "npm")
+    if node is not None and (store / node.path).is_file():
+        # The cache is install-scoped even though the bytes are shared:
+        # it is mutable state this install writes, not an artifact.
+        env["npm_config_cache"] = str(runtime_cache_dir(facts_dir) / "npm")
 
     git = facts.get("git")
-    if git is not None and (base / git.path).is_file():
-        root = (base / git.path).parent.parent
+    if git is not None and (store / git.path).is_file():
+        root = (store / git.path).parent.parent
         for key, relative in (
             ("GIT_EXEC_PATH", Path("libexec") / "git-core"),
             ("GIT_TEMPLATE_DIR", Path("share") / "git-core" / "templates"),
@@ -151,18 +162,19 @@ def managed_tool_env(runtime_dir: Path | None = None) -> dict[str, str]:
 def with_managed_runtimes(
     env: Optional[Mapping[str, str]] = None,
     runtime_dir: Path | None = None,
+    store_dir: Path | None = None,
 ) -> dict[str, str]:
     """Return a copy of *env* (default: os.environ) with managed tool dirs
     prepended to PATH and tool env applied. The single entry point —
     callers never assemble PATH fragments themselves."""
     result = dict(os.environ if env is None else env)
-    dirs = managed_path_dirs(runtime_dir)
+    dirs = managed_path_dirs(runtime_dir, store_dir)
     if dirs:
         path_key = next((k for k in result if k.upper() == "PATH"), "PATH")
         existing = result.get(path_key, "")
         prefix = os.pathsep.join(str(d) for d in dirs)
         result[path_key] = f"{prefix}{os.pathsep}{existing}" if existing else prefix
     # Tool env never clobbers explicit caller settings.
-    for key, value in managed_tool_env(runtime_dir).items():
+    for key, value in managed_tool_env(runtime_dir, store_dir).items():
         result.setdefault(key, value)
     return result

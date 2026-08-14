@@ -116,7 +116,15 @@ export function gitOnPathSkippingShim(
 /** One managed tool as recorded in `<runtime dir>/runtimes.json`. */
 export type RuntimeFact = {
   version: string
-  /** Binary path, RELATIVE to the runtime dir. */
+  /**
+   * Binary path, RELATIVE to the tool STORE.
+   *
+   * For a source install the store is the machine-wide `~/.hermes/tools`
+   * and the path starts with a `<tool>-<version>-<target>` entry name.
+   * For a sealed payload the payload dir is its own store, so the path is
+   * relative to the payload. Either way the reader joins it onto the
+   * store it was handed — there are no symlinks between facts and bytes.
+   */
   path: string
   installedAt?: string
   /** Optional multi-dir PATH surface (PortableGit: cmd, bin, usr/bin). */
@@ -132,7 +140,7 @@ export type RuntimeFacts = {
 
 /** The facts file the provisioner writes; the ONLY writer. */
 export const RUNTIME_FACTS_FILENAME = 'runtimes.json'
-export const RUNTIME_FACTS_SCHEMA_VERSION = 1
+export const RUNTIME_FACTS_SCHEMA_VERSION = 2
 
 /**
  * Read the runtime registry's facts. Missing/foreign-schema/malformed all
@@ -185,20 +193,28 @@ function readRuntimeFactsFile(
  * reading this file's source text. Both are data now; the provisioner
  * derives the order from the pin table's `extends` edges and records it.
  *
+ * `runtimeDir` holds the FACTS; `storeDir` holds the BYTES, and defaults
+ * to the runtime dir for a self-contained artifact (the desktop payload,
+ * the Nix bundle). A source install passes the machine-wide store, where
+ * several installs share one copy of each tool. Same split as
+ * `installation.paths.resolve_bases` on the Python side.
+ *
  * `main.ts` imports this rather than keeping its own copy.
  */
 export function managedRuntimePathEntries(
   runtimeDir: string,
   {
     fsImpl = fs,
-    pathModule = path
-  }: { fsImpl?: typeof fs; pathModule?: typeof path } = {}
+    pathModule = path,
+    storeDir
+  }: { fsImpl?: typeof fs; pathModule?: typeof path; storeDir?: string } = {}
 ): string[] {
   const parsed = readRuntimeFactsFile(runtimeDir, { fsImpl, pathModule })
   const facts = parsed?.tools || {}
   // A hand-edited facts file may predate pathOrder; its own key order is
   // the only remaining signal, and matches what Python falls back to.
   const order = parsed?.pathOrder || Object.keys(facts)
+  const store = storeDir || runtimeDir
   const dirs: string[] = []
 
   for (const tool of order) {
@@ -208,7 +224,7 @@ export function managedRuntimePathEntries(
       continue
     }
 
-    const binary = pathModule.join(runtimeDir, fact.path)
+    const binary = pathModule.join(store, fact.path)
 
     // A recorded-but-vanished binary reads as unprovisioned: never emit a
     // PATH entry for a tool that is not actually there.
@@ -221,7 +237,7 @@ export function managedRuntimePathEntries(
     }
 
     const entries = fact.pathDirs
-      ? fact.pathDirs.map(dir => pathModule.join(runtimeDir, dir))
+      ? fact.pathDirs.map(dir => pathModule.join(store, dir))
       : [pathModule.dirname(binary)]
 
     for (const entry of entries) {
@@ -234,8 +250,26 @@ export function managedRuntimePathEntries(
   return dirs
 }
 
+/**
+ * The machine-wide tool store for a given Hermes home.
+ *
+ * `~/.hermes/tools` — where the provisioner publishes tool bytes so
+ * several installs share one copy. Mirrors
+ * `installation.paths.get_tool_store()`, including the profile
+ * normalization: a profile home (`<root>/profiles/<name>`) resolves to
+ * the ROOT's store, because the bytes are a machine fact, not a profile
+ * one.
+ */
+export function toolStoreDir(
+  hermesHome: string,
+  { pathModule = pathModuleForPlatform(process.platform) }: { pathModule?: typeof path } = {}
+): string {
+  return pathModule.join(normalizeHermesHomeRoot(hermesHome, { pathModule }), 'tools')
+}
+
 function buildDesktopBackendPath({
   runtimeDir,
+  storeDir,
   venvRoot,
   currentPath = '',
   platform = process.platform,
@@ -243,7 +277,9 @@ function buildDesktopBackendPath({
   fsImpl = fs
 }: any = {}) {
   const delimiter = delimiterForPlatform(platform)
-  const managedDirs = runtimeDir ? managedRuntimePathEntries(runtimeDir, { fsImpl, pathModule }) : []
+  const managedDirs = runtimeDir
+    ? managedRuntimePathEntries(runtimeDir, { fsImpl, pathModule, storeDir })
+    : []
   const venvBin = venvRoot ? pathModule.join(venvRoot, platform === 'win32' ? 'Scripts' : 'bin') : null
   const saneEntries = platform === 'win32' ? [] : POSIX_SANE_PATH_ENTRIES
 
@@ -268,6 +304,7 @@ function normalizeHermesHomeRoot(hermesHome, { pathModule = pathModuleForPlatfor
 function buildDesktopBackendEnv({
   hermesHome,
   runtimeDir,
+  storeDir,
   pythonPathEntries = [],
   venvRoot,
   currentEnv = process.env,
@@ -290,6 +327,7 @@ function buildDesktopBackendEnv({
     PYTHONUTF8: currentEnv?.PYTHONUTF8 ?? '1',
     [key]: buildDesktopBackendPath({
       runtimeDir,
+      storeDir,
       venvRoot,
       currentPath: currentPathValue(currentEnv, platform),
       platform,

@@ -92,8 +92,10 @@ class TestProvisionOneTool:
         assert [(r.tool, r.action, r.version) for r in results] == [
             ("gh", "downloaded", "2.97.0")
         ]
-        assert (rt / "gh" / "bin" / "gh").is_file()
-        assert rr.load_facts(rt)["gh"].path == "gh/bin/gh"
+        # runtime_dir with no store means the runtime dir IS the store, so
+        # the entry lands beside the facts file that names it.
+        assert (rt / f"gh-2.97.0-{target}" / "bin" / "gh").is_file()
+        assert rr.load_facts(rt)["gh"].path == f"gh-2.97.0-{target}/bin/gh"
 
     def test_second_run_keeps_an_exact_match(self, served, tmp_path, target):
         """Exact pins make this an equality check, not a range check."""
@@ -145,7 +147,7 @@ class TestProvisionOneTool:
         rt = tmp_path / "rt"
         rp.provision_runtimes(runtime_dir=rt, install_root=pins)
 
-        assert (rt / "gh" / "bin" / "gh").is_file()
+        assert (rt / f"gh-2.97.0-{target}" / "bin" / "gh").is_file()
 
 
 class TestDigestIsTheGate:
@@ -235,7 +237,7 @@ class TestScratchCleanupIsNotAFailure:
                 tmp.chmod(0o700)
 
         assert [(r.tool, r.action) for r in results] == [("gh", "downloaded")]
-        assert (rt / "gh" / "bin" / "gh").is_file()
+        assert (rt / f"gh-2.97.0-{target}" / "bin" / "gh").is_file()
         assert rr.load_facts(rt)["gh"].version == "2.97.0"
 
 
@@ -274,14 +276,19 @@ class TestNoSalvage:
         self, served, tmp_path, target
     ):
         """There is no salvage: adopting bytes nobody verified would
-        defeat pinning digests at all."""
+        defeat pinning digests at all.
+
+        A squatter at the entry path with no published marker is not an
+        entry — it is junk from an interrupted run — so the provisioner
+        overwrites it rather than trusting it.
+        """
         root, base = served
         sha = _make_tar(root, "gh-fresh.tar.gz", {"bin/gh": _script()})
         pins = _pins_file(tmp_path / "repo", {"gh": {"version": "2.97.0", "files": {
             target: {"url": f"{base}/gh-fresh.tar.gz", "sha256": sha}}}})
 
         rt = tmp_path / "rt"
-        squatter = rt / "gh" / "bin" / "gh"
+        squatter = rt / f"gh-2.97.0-{target}" / "bin" / "gh"
         squatter.parent.mkdir(parents=True)
         squatter.write_text("#!/bin/sh\necho 'impostor 9.9.9'\n")
         squatter.chmod(0o755)
@@ -294,6 +301,178 @@ class TestNoSalvage:
     def test_the_provisioner_exposes_no_salvage_surface(self):
         for name in dir(rp):
             assert "salvage" not in name.lower()
+
+
+class TestTheStoreIsShared:
+    """Bytes are machine-wide; facts are per-install. That is the whole
+    reason the store exists — 44 worktrees cost 44 JSON files and ONE
+    copy of node, not 44 copies at ~495MB each."""
+
+    def _gh_pins(self, served, tmp_path, target, name="gh-shared.tar.gz"):
+        root, base = served
+        sha = _make_tar(root, name, {"bin/gh": _script()})
+        return _pins_file(tmp_path / f"repo-{name}", {"gh": {
+            "version": "2.97.0",
+            "files": {target: {"url": f"{base}/{name}", "sha256": sha}}}})
+
+    def test_a_second_install_reuses_the_bytes_without_downloading(
+        self, served, tmp_path, target, monkeypatch
+    ):
+        """The sharing, proven by cutting the network after install one."""
+        pins = self._gh_pins(served, tmp_path, target)
+        store = tmp_path / "store"
+
+        first = rp.provision_runtimes(
+            runtime_dir=tmp_path / "install-a", install_root=pins, store_dir=store
+        )
+        assert [r.action for r in first] == ["downloaded"]
+
+        def no_downloads(*args, **kwargs):
+            raise AssertionError("a shared store entry must not be re-downloaded")
+
+        monkeypatch.setattr(rp, "_download", no_downloads)
+
+        second = rp.provision_runtimes(
+            runtime_dir=tmp_path / "install-b", install_root=pins, store_dir=store
+        )
+
+        assert [r.action for r in second] == ["downloaded"]  # recorded, not fetched
+        # One copy of the bytes, two facts files naming it.
+        assert len(list(store.glob("gh-*"))) == 1
+        for install in ("install-a", "install-b"):
+            facts = rr.load_facts(tmp_path / install)
+            assert facts["gh"].path == f"gh-2.97.0-{target}/bin/gh"
+            assert (store / facts["gh"].path).is_file()
+
+    def test_facts_stay_per_install(self, served, tmp_path, target):
+        """One install recording a tool must not make it appear in
+        another install that never provisioned it."""
+        pins = self._gh_pins(served, tmp_path, target, "gh-facts.tar.gz")
+        store = tmp_path / "store"
+
+        rp.provision_runtimes(
+            runtime_dir=tmp_path / "install-a", install_root=pins, store_dir=store
+        )
+
+        assert rr.load_facts(tmp_path / "install-b") == {}
+
+    def test_a_version_bump_leaves_the_old_entry_alone(
+        self, served, tmp_path, target
+    ):
+        """Immutability: another install may be RUNNING the old entry, so
+        the bump writes a new one and repoints only this install's fact."""
+        root, base = served
+        sha_old = _make_tar(root, "gh-v1.tar.gz", {"bin/gh": _script()})
+        sha_new = _make_tar(root, "gh-v2.tar.gz", {"bin/gh": _script()})
+        repo = tmp_path / "repo"
+        store = tmp_path / "store"
+        rt = tmp_path / "rt"
+
+        _pins_file(repo, {"gh": {"version": "2.97.0", "files": {
+            target: {"url": f"{base}/gh-v1.tar.gz", "sha256": sha_old}}}})
+        rp.provision_runtimes(runtime_dir=rt, install_root=repo, store_dir=store)
+        old_entry = store / f"gh-2.97.0-{target}"
+        old_stat = (old_entry / "bin" / "gh").stat()
+
+        _pins_file(repo, {"gh": {"version": "2.98.0", "files": {
+            target: {"url": f"{base}/gh-v2.tar.gz", "sha256": sha_new}}}})
+        rp.provision_runtimes(runtime_dir=rt, install_root=repo, store_dir=store)
+
+        assert (store / f"gh-2.98.0-{target}" / "bin" / "gh").is_file()
+        assert (old_entry / "bin" / "gh").is_file(), "the old entry was destroyed"
+        assert (old_entry / "bin" / "gh").stat().st_mtime == old_stat.st_mtime
+        assert rr.load_facts(rt)["gh"].path == f"gh-2.98.0-{target}/bin/gh"
+
+    def test_an_entry_published_mid_stage_is_not_overwritten(
+        self, served, tmp_path, target, monkeypatch
+    ):
+        """The publish race, driven for real: another process finishes
+        first while we are still extracting. Its entry carries the
+        published marker, so ours is dropped and its bytes are untouched."""
+        pins = self._gh_pins(served, tmp_path, target, "gh-race.tar.gz")
+        store = tmp_path / "store"
+        entry = store / f"gh-2.97.0-{target}"
+
+        real_stage = rp._stage
+
+        def stage_then_race(tool, pin, dest, tmp, tgt, ctx):
+            real_stage(tool, pin, dest, tmp, tgt, ctx)
+            # The "other process" publishes a complete entry — marker and
+            # all — while we still hold a staged tree.
+            (entry / "bin").mkdir(parents=True)
+            (entry / "bin" / "gh").write_text("#!/bin/sh\necho 'winner 2.97.0'\n")
+            (entry / "bin" / "gh").chmod(0o755)
+            (entry / rp.ENTRY_MARKER_NAME).write_text(
+                json.dumps(rp._entry_marker(pin, tool, tgt))
+            )
+
+        monkeypatch.setattr(rp, "_stage", stage_then_race)
+
+        results = rp.provision_runtimes(
+            runtime_dir=tmp_path / "rt", install_root=pins, store_dir=store
+        )
+
+        assert [r.action for r in results] == ["downloaded"]
+        assert "winner" in (entry / "bin" / "gh").read_text()
+        # And no staging directory is left behind.
+        assert list(store.glob(".staging-*")) == []
+
+    def test_an_unmarked_directory_at_an_entry_name_is_replaced(
+        self, served, tmp_path, target
+    ):
+        """No-salvage, in the store: only an entry THIS code published is
+        trusted. Junk from an interrupted run has no marker, so nothing
+        can be relying on it and it is overwritten rather than adopted."""
+        pins = self._gh_pins(served, tmp_path, target, "gh-junk.tar.gz")
+        store = tmp_path / "store"
+        junk = store / f"gh-2.97.0-{target}" / "bin" / "gh"
+        junk.parent.mkdir(parents=True)
+        junk.write_text("#!/bin/sh\necho 'impostor 9.9.9'\n")
+        junk.chmod(0o755)
+
+        results = rp.provision_runtimes(
+            runtime_dir=tmp_path / "rt", install_root=pins, store_dir=store
+        )
+
+        assert results[0].action == "downloaded"
+        assert "impostor" not in junk.read_text()
+        assert (junk.parent.parent / rp.ENTRY_MARKER_NAME).is_file()
+
+    def test_a_published_entry_is_reused_even_with_no_fact(
+        self, served, tmp_path, target, monkeypatch
+    ):
+        """A fresh install landing on a store another install filled: the
+        marker is what lets it record the fact without downloading."""
+        pins = self._gh_pins(served, tmp_path, target, "gh-nofact.tar.gz")
+        store = tmp_path / "store"
+
+        rp.provision_runtimes(
+            runtime_dir=tmp_path / "install-a", install_root=pins, store_dir=store
+        )
+
+        def no_downloads(*args, **kwargs):
+            raise AssertionError("a published entry must not be re-downloaded")
+
+        monkeypatch.setattr(rp, "_download", no_downloads)
+
+        results = rp.provision_runtimes(
+            runtime_dir=tmp_path / "install-b", install_root=pins, store_dir=store
+        )
+
+        assert [r.action for r in results] == ["downloaded"]
+        assert rr.load_facts(tmp_path / "install-b")["gh"].version == "2.97.0"
+
+    def test_staging_dirs_do_not_survive_a_successful_publish(
+        self, served, tmp_path, target
+    ):
+        pins = self._gh_pins(served, tmp_path, target, "gh-clean.tar.gz")
+        store = tmp_path / "store"
+
+        rp.provision_runtimes(
+            runtime_dir=tmp_path / "rt", install_root=pins, store_dir=store
+        )
+
+        assert list(store.glob(".staging-*")) == []
 
 
 class TestSelectiveProvisioning:
@@ -498,26 +677,54 @@ class TestPackagedInstallsLocateTheirRuntimeDir:
 
 class TestLayout:
     def test_windows_and_posix_binaries_land_where_readers_expect(self):
-        assert rp._binary_rel("node", "win32-x64") == "node/node.exe"
-        assert rp._binary_rel("node", "linux-x64") == "node/bin/node"
+        """Inside a tool's own store entry — the entry dir already carries
+        the tool name, version and target."""
+        assert rp._binary_rel("node", "win32-x64") == "node.exe"
+        assert rp._binary_rel("node", "linux-x64") == "bin/node"
         # Two git suppliers, two layouts.
-        assert rp._binary_rel("git", "win32-x64") == "git/cmd/git.exe"
-        assert rp._binary_rel("git", "darwin-arm64") == "git/bin/git"
+        assert rp._binary_rel("git", "win32-x64") == "cmd/git.exe"
+        assert rp._binary_rel("git", "darwin-arm64") == "bin/git"
         # npm is installed by npm, which writes .cmd shims in the prefix
         # root on Windows and POSIX shims in bin/.
-        assert rp._binary_rel("npm", "win32-x64") == "npm/npm.cmd"
-        assert rp._binary_rel("npm", "darwin-arm64") == "npm/bin/npm"
+        assert rp._binary_rel("npm", "win32-x64") == "npm.cmd"
+        assert rp._binary_rel("npm", "darwin-arm64") == "bin/npm"
+
+    def test_a_recorded_path_names_the_store_entry(self):
+        """What lands in runtimes.json is store-relative, so a reader
+        joins it onto the store and lands in the right VERSION's entry."""
+        assert (
+            rp._fact_rel("node", "26.7.0", "linux-x64") == "node-26.7.0-linux-x64/bin/node"
+        )
+        assert (
+            rp._fact_rel("git", "2.53.0.3", "win32-x64")
+            == "git-2.53.0.3-win32-x64/cmd/git.exe"
+        )
+
+    def test_two_versions_of_one_tool_are_different_entries(self):
+        """The whole point of the store: a branch pinning an older node
+        does not overwrite the newer one another install is running."""
+        old = rp._fact_rel("node", "22.1.0", "linux-x64")
+        new = rp._fact_rel("node", "26.7.0", "linux-x64")
+
+        assert old != new
+        assert old.split("/")[0] != new.split("/")[0]
 
     def test_only_portablegit_needs_extra_path_dirs(self):
         """bash.exe and the coreutils live outside cmd/; every other tool
         is covered by its binary's own directory."""
-        assert rp._path_dirs("git", "win32-x64") == [
-            "git/cmd",
-            "git/bin",
-            "git/usr/bin",
-        ]
+        assert rp._path_dirs("git", "win32-x64") == ["cmd", "bin", "usr/bin"]
         assert rp._path_dirs("git", "darwin-arm64") is None
         assert rp._path_dirs("node", "win32-x64") is None
+
+    def test_recorded_path_dirs_are_store_relative_too(self):
+        """A PATH dir must resolve against the same base as the binary,
+        or the assembler emits three dirs that do not exist."""
+        assert rp._fact_path_dirs("git", "2.53.0.3", "win32-x64") == [
+            "git-2.53.0.3-win32-x64/cmd",
+            "git-2.53.0.3-win32-x64/bin",
+            "git-2.53.0.3-win32-x64/usr/bin",
+        ]
+        assert rp._fact_path_dirs("node", "26.7.0", "win32-x64") is None
 
 
 class TestExtendsOrdering:
@@ -787,12 +994,12 @@ class TestCamoufoxPin:
         assert files["win32-arm64"]["url"] == files["win32-x64"]["url"]
 
     def test_binary_layout_matches_the_launcher_camoufox_js_expects(self):
-        """camoufox-js's LAUNCH_FILE map, per platform."""
-        assert rp._binary_rel("camoufox", "linux-x64") == "camoufox/camoufox-bin"
-        assert rp._binary_rel("camoufox", "win32-x64") == "camoufox/camoufox.exe"
+        """camoufox-js's LAUNCH_FILE map, per platform — inside the entry."""
+        assert rp._binary_rel("camoufox", "linux-x64") == "camoufox-bin"
+        assert rp._binary_rel("camoufox", "win32-x64") == "camoufox.exe"
         assert (
             rp._binary_rel("camoufox", "darwin-arm64")
-            == "camoufox/Camoufox.app/Contents/MacOS/camoufox"
+            == "Camoufox.app/Contents/MacOS/camoufox"
         )
 
     def test_version_json_is_split_the_way_camoufox_js_reads_it(self):

@@ -813,8 +813,14 @@ function stageNode(target, outDir) {
 /**
  * The runtime-registry facts for a staged payload. Same schema
  * installation/registry.py writes for a source install, so the
- * desktop's backend-env reads BOTH artifact kinds through one code path
- * (paths are relative to the payload dir, keeping it relocatable).
+ * desktop's backend-env reads BOTH artifact kinds through one code path.
+ *
+ * Paths are relative to the payload dir, which is BOTH the facts dir and
+ * the byte store for this artifact — a sealed payload cannot use the
+ * machine-wide `~/.hermes/tools` store and does not need to, since every
+ * tool it will ever hold is staged here at build time. That is the same
+ * arrangement `installation.paths.resolve_bases` gives any caller that
+ * names a runtime dir and no store.
  *
  * Versions come from the staged binaries themselves where cheap, and are
  * omitted otherwise: the desktop only uses path/pathDirs, and a lie about
@@ -833,7 +839,7 @@ export function payloadRuntimeFacts(target, { nodeVersion = "0", uvVersion = "0"
       pathDirs: ["git/cmd", "git/bin", "git/usr/bin"],
     }
   }
-  return { schemaVersion: 1, tools }
+  return { schemaVersion: 2, tools }
 }
 
 function writeRuntimeFacts(target, outDir) {

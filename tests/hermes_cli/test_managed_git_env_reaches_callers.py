@@ -34,6 +34,19 @@ def provisioned_git(tmp_path_factory) -> Path:
     return runtime_dir
 
 
+@pytest.fixture(scope="module")
+def git_entry(provisioned_git) -> Path:
+    """git's tree inside the store, resolved through its own facts.
+
+    Derived rather than spelled out: the store entry name carries the
+    pinned version, and hardcoding it here would break these tests on
+    every pin bump without any behaviour changing.
+    """
+    binary = runtime_env.managed_tool_binary("git", provisioned_git)
+    assert binary is not None, "git provisioned but not resolvable from its facts"
+    return binary.parent.parent
+
+
 def _clone_stderr(env: dict) -> str:
     """Stderr of a clone against a closed port.
 
@@ -54,9 +67,9 @@ def _clone_stderr(env: dict) -> str:
 
 
 class TestTheHelperContractReachesGit:
-    def test_path_alone_cannot_find_the_remote_helper(self, provisioned_git):
+    def test_path_alone_cannot_find_the_remote_helper(self, git_entry):
         """The bug, pinned: this is what PATH-only used to produce."""
-        git_bin = provisioned_git / "git" / "bin"
+        git_bin = git_entry / "bin"
         stderr = _clone_stderr({"PATH": f"{git_bin}:/usr/bin:/bin", "HOME": "/tmp"})
 
         assert "remote-http" in stderr, (
@@ -65,9 +78,9 @@ class TestTheHelperContractReachesGit:
         )
 
     def test_the_tool_env_makes_the_same_clone_reach_the_network(
-        self, provisioned_git
+        self, provisioned_git, git_entry
     ):
-        git_bin = provisioned_git / "git" / "bin"
+        git_bin = git_entry / "bin"
         env = {"PATH": f"{git_bin}:/usr/bin:/bin", "HOME": "/tmp"}
         env.update(runtime_env.managed_tool_env(provisioned_git))
 
@@ -76,20 +89,20 @@ class TestTheHelperContractReachesGit:
         assert "remote-http" not in stderr
         assert "unable to access" in stderr or "Could not connect" in stderr
 
-    def test_prefix_is_exported_for_a_relocated_git(self, provisioned_git):
+    def test_prefix_is_exported_for_a_relocated_git(self, provisioned_git, git_entry):
         """Dugite sets PREFIX on linux so a git running from an arbitrary
         location can resolve things; we were missing it."""
         env = runtime_env.managed_tool_env(provisioned_git)
 
         if sys.platform.startswith("linux"):
-            assert env["PREFIX"] == str(provisioned_git / "git")
+            assert env["PREFIX"] == str(git_entry)
         else:
             assert "PREFIX" not in env
 
 
 class TestInternalGitCallersGetIt:
     def test_noninteractive_git_env_carries_the_tool_env(
-        self, provisioned_git, monkeypatch
+        self, provisioned_git, git_entry, monkeypatch
     ):
         """Every internal caller (MCP installs, plugin updates, worktree
         fetches) goes through this one helper."""
@@ -97,9 +110,7 @@ class TestInternalGitCallersGetIt:
 
         env = noninteractive_git_env(base={"PATH": "/usr/bin:/bin"})
 
-        assert env["GIT_EXEC_PATH"] == str(
-            provisioned_git / "git" / "libexec" / "git-core"
-        )
+        assert env["GIT_EXEC_PATH"] == str(git_entry / "libexec" / "git-core")
         # ...without losing what it already did.
         assert env["GIT_TERMINAL_PROMPT"] == "0"
 
@@ -124,7 +135,7 @@ class TestInternalGitCallersGetIt:
 
 class TestTheTerminalToolGetsIt:
     def test_the_subshell_env_carries_the_tool_env(
-        self, provisioned_git, monkeypatch
+        self, provisioned_git, git_entry, monkeypatch
     ):
         """The agent's own `git clone` runs here."""
         from tools.environments import local
@@ -134,9 +145,7 @@ class TestTheTerminalToolGetsIt:
 
         local._apply_managed_runtime_tool_env(env)
 
-        assert env["GIT_EXEC_PATH"] == str(
-            provisioned_git / "git" / "libexec" / "git-core"
-        )
+        assert env["GIT_EXEC_PATH"] == str(git_entry / "libexec" / "git-core")
 
     def test_it_does_not_overwrite_an_existing_value(
         self, provisioned_git, monkeypatch

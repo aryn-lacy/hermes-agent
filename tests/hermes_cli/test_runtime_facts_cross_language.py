@@ -41,17 +41,22 @@ def _provision(runtime_dir: Path, name: str, rel: str, version="1.0.0", path_dir
     rr.save_facts(facts, runtime_dir, path_order=path_order)
 
 
-def _ts_path_entries(tmp_path: Path, runtime_dir: Path) -> list[str]:
+def _ts_path_entries(
+    tmp_path: Path, runtime_dir: Path, store_dir: Path | None = None
+) -> list[str]:
     """Run the TypeScript reader over a Python-written facts file."""
     # Strip the TS types with a throwaway transpile via node's own stripping
     # (node >= 22.6 --experimental-strip-types); fall back to a skip when the
     # runtime is too old, rather than silently testing nothing.
     driver = tmp_path / "driver.mts"
+    options = (
+        "{}" if store_dir is None else f"{{ storeDir: {json.dumps(str(store_dir))} }}"
+    )
     driver.write_text(
         textwrap.dedent(
             f"""
             import {{ managedRuntimePathEntries }} from {json.dumps(str(BACKEND_ENV_TS))}
-            const dirs = managedRuntimePathEntries({json.dumps(str(runtime_dir))})
+            const dirs = managedRuntimePathEntries({json.dumps(str(runtime_dir))}, {options})
             process.stdout.write(JSON.stringify(dirs))
             """
         ).strip()
@@ -150,6 +155,92 @@ class TestCrossLanguageFactsContract:
 
         assert runtime_env.managed_path_dirs(runtime_dir) == []
         assert _ts_path_entries(tmp_path, runtime_dir) == []
+
+
+class TestTheStoreSplitCrossesTheLanguageBoundary:
+    """Facts live with the install, bytes live in a shared store. Both
+    readers have to join a fact's path onto the SAME base, or the desktop
+    builds a PATH of directories that do not exist while Python builds a
+    working one (or the reverse)."""
+
+    def _provision_into_store(self, facts_dir: Path, store: Path, entry: str, rel: str):
+        binary = store / entry / rel
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text("#!/bin/sh\n")
+        facts = rr.load_facts(facts_dir)
+        facts["node"] = rr.RuntimeFact(version="26.7.0", path=f"{entry}/{rel}")
+        rr.save_facts(facts, facts_dir)
+
+    def test_both_languages_join_the_fact_onto_the_store(self, tmp_path):
+        facts_dir = tmp_path / "install" / ".hermes-runtime"
+        store = tmp_path / "tools"
+        self._provision_into_store(
+            facts_dir, store, "node-26.7.0-linux-x64", "bin/node"
+        )
+
+        python_dirs = [
+            str(d) for d in runtime_env.managed_path_dirs(facts_dir, store_dir=store)
+        ]
+
+        assert python_dirs == [str(store / "node-26.7.0-linux-x64" / "bin")]
+        assert python_dirs == _ts_path_entries(tmp_path, facts_dir, store)
+
+    def test_two_installs_sharing_one_store_agree_in_both_languages(self, tmp_path):
+        """The point of the store: separate facts, one copy of the bytes."""
+        store = tmp_path / "tools"
+        dirs_per_install = []
+        for name in ("install-a", "install-b"):
+            facts_dir = tmp_path / name / ".hermes-runtime"
+            self._provision_into_store(
+                facts_dir, store, "node-26.7.0-linux-x64", "bin/node"
+            )
+            python_dirs = [
+                str(d)
+                for d in runtime_env.managed_path_dirs(facts_dir, store_dir=store)
+            ]
+            assert python_dirs == _ts_path_entries(tmp_path, facts_dir, store)
+            dirs_per_install.append(python_dirs)
+
+        assert dirs_per_install[0] == dirs_per_install[1]
+        assert len(list(store.iterdir())) == 1
+
+    def test_both_languages_spread_store_relative_pathDirs(self, tmp_path):
+        """PortableGit's three dirs must resolve against the store too."""
+        facts_dir = tmp_path / "install" / ".hermes-runtime"
+        store = tmp_path / "tools"
+        entry = "git-2.53.0.3-win32-x64"
+        for sub in ("cmd", "bin", "usr/bin"):
+            (store / entry / sub).mkdir(parents=True)
+        (store / entry / "cmd" / "git.exe").write_text("#!/bin/sh\n")
+        rr.save_facts(
+            {
+                "git": rr.RuntimeFact(
+                    version="2.53.0.3",
+                    path=f"{entry}/cmd/git.exe",
+                    path_dirs=[f"{entry}/cmd", f"{entry}/bin", f"{entry}/usr/bin"],
+                )
+            },
+            facts_dir,
+        )
+
+        python_dirs = [
+            str(d) for d in runtime_env.managed_path_dirs(facts_dir, store_dir=store)
+        ]
+
+        assert len(python_dirs) == 3
+        assert all(d.startswith(str(store / entry)) for d in python_dirs)
+        assert python_dirs == _ts_path_entries(tmp_path, facts_dir, store)
+
+    def test_a_self_contained_artifact_needs_no_store_argument(self, tmp_path):
+        """The Nix bundle and the desktop payload ARE their own store, and
+        both readers must default to that without being told."""
+        payload = tmp_path / "agent-payload"
+        self._provision_into_store(payload, payload, "node-26.7.0-linux-x64", "bin/node")
+
+        python_dirs = [str(d) for d in runtime_env.managed_path_dirs(payload)]
+
+        assert python_dirs == [str(payload / "node-26.7.0-linux-x64" / "bin")]
+        assert python_dirs == _ts_path_entries(tmp_path, payload)
 
 
 class TestSchemaConstantsMatch:

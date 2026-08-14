@@ -119,7 +119,7 @@ class TestEveryPublicFunctionRunsBare:
         result = run_bare(
             """
             from installation.paths import (
-                get_install_root, get_runtime_dir,
+                get_install_root, get_runtime_dir, get_tool_store, resolve_bases,
                 set_install_root_override, reset_install_root_override,
             )
             root = get_install_root()
@@ -132,6 +132,60 @@ class TestEveryPublicFunctionRunsBare:
             assert get_install_root() == root
             print("ok")
             """
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_the_tool_store_resolves_with_nothing_installed(self, tmp_path):
+        """The store is where the provisioner PUTS the first tool, so it
+        has to resolve on a machine that has none of them yet — and
+        without importing anything a fresh box does not have."""
+        result = run_bare(
+            f"""
+            from pathlib import Path
+            from installation.paths import get_tool_store, resolve_bases
+
+            store = get_tool_store()
+            assert store.name == "tools", store
+            assert str(store).startswith({str(tmp_path)!r}), store
+
+            # An explicit runtime dir with no store means a self-contained
+            # artifact: one directory holds both facts and bytes.
+            facts, bytes_ = resolve_bases(Path("/tmp/rt"))
+            assert facts == bytes_ == Path("/tmp/rt"), (facts, bytes_)
+
+            # Naming both keeps them apart.
+            facts, bytes_ = resolve_bases(Path("/tmp/rt"), Path("/tmp/store"))
+            assert (facts, bytes_) == (Path("/tmp/rt"), Path("/tmp/store"))
+
+            # Neither: this install's facts, the machine's store.
+            facts, bytes_ = resolve_bases()
+            assert bytes_ == store and facts != store, (facts, bytes_)
+            print("ok")
+            """,
+            env={"HOME": str(tmp_path), "HERMES_HOME": str(tmp_path / ".hermes")},
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_a_packager_runtime_dir_override_wins_for_both(self, tmp_path):
+        """HERMES_RUNTIME_DIR is how Nix and the desktop payload say "this
+        one directory is the whole runtime" — it must move the bytes too,
+        or a sealed install would look for tools in a store it cannot
+        write and does not own."""
+        result = run_bare(
+            f"""
+            from pathlib import Path
+            from installation.paths import get_tool_store, get_runtime_dir, resolve_bases
+
+            sealed = Path({str(tmp_path / "sealed")!r})
+            assert get_runtime_dir() == sealed
+            assert get_tool_store() == sealed
+            assert resolve_bases() == (sealed, sealed)
+            print("ok")
+            """,
+            env={
+                "HOME": str(tmp_path),
+                "HERMES_RUNTIME_DIR": str(tmp_path / "sealed"),
+            },
         )
         assert result.returncode == 0, result.stderr
 

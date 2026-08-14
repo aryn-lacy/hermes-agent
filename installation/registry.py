@@ -10,9 +10,19 @@ manages and where they live. Two files, one owner each:
   into; ORDER is derived from those edges rather than restated as a list
   in each reader (see ``install_order`` / ``path_order``).
 - ``<install>/.hermes-runtime/runtimes.json`` — the FACTS. What is
-  actually installed: version, path relative to the runtime dir, install
+  actually installed: version, path relative to the TOOL STORE, install
   timestamp, and the derived PATH order. Written ONLY by the
   provisioner; everything else reads.
+- ``~/.hermes/tools/<tool>-<version>-<target>/`` — the BYTES. One entry
+  per pinned tuple, shared by every install on the machine. Entries are
+  immutable: a version bump writes a NEW entry and repoints the fact,
+  because another install may be running the old one right now.
+
+Facts and bytes are separate so that N installs cost N small JSON files
+and ONE copy of node. Nothing on disk links the two — a fact names a
+store-relative path, so the facts file IS the indirection layer.
+``installation.paths.resolve_bases`` answers "which facts dir, which
+store" for every reader, so none of them can disagree.
 
 Readers (locators, the PATH assembler, doctor, uninstall) consume facts
 through this module instead of probing paths. No path literals anywhere
@@ -43,11 +53,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from installation.paths import get_runtime_dir
+from installation.paths import get_runtime_dir, resolve_bases
 
 PINS_FILENAME = "runtime-pins.json"
 FACTS_FILENAME = "runtimes.json"
-FACTS_SCHEMA_VERSION = 1
+FACTS_SCHEMA_VERSION = 2
 PINS_SCHEMA_VERSION = 2
 
 __all__ = [
@@ -67,6 +77,7 @@ __all__ = [
     "pins_path",
     "record_fact",
     "save_facts",
+    "store_entry_name",
     "tool_bin_dir",
     "tool_path",
 ]
@@ -345,11 +356,15 @@ class RuntimeFact:
     """One installed tool as recorded in runtimes.json."""
 
     version: str
-    path: str  # RELATIVE to the runtime dir (relocatable artifact)
+    # RELATIVE to the tool store: ``<tool>-<version>-<target>/<binary>``.
+    # Relative rather than absolute so one facts file stays valid when the
+    # store moves (a different HOME, a packaged bundle that IS its own
+    # store), and so nothing has to rewrite N installs' facts to relocate.
+    path: str
     installed_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
-    # Optional override: PATH dirs (relative to the runtime dir) for tools
+    # Optional override: PATH dirs (relative to the store) for tools
     # whose surface spans several bin dirs (PortableGit: cmd, bin,
     # usr/bin). When None, the assembler derives the single dir containing
     # `path`.
@@ -471,25 +486,53 @@ def record_fact(
     return facts
 
 
+# ─── the tool store (machine-wide bytes) ────────────────────────────────────
+
+
+def store_entry_name(tool: str, version: str, target: str) -> str:
+    """The store directory name for one pinned tuple.
+
+    ``<tool>-<version>-<target>`` is exactly what the pin table keys on,
+    so two installs agreeing on a pin land on the same name and share the
+    bytes, and two disagreeing get one entry each. The name is also what
+    makes an entry safe to treat as immutable: same name means the same
+    verified artifact, so a publisher that finds one already there can
+    keep it instead of rewriting bytes another install is running.
+    """
+    return f"{tool}-{version}-{target}"
+
+
 # ─── lookups (what locators/assemblers consume) ─────────────────────────────
 
 
-def tool_path(name: str, runtime_dir: Path | None = None) -> Optional[Path]:
+def tool_path(
+    name: str,
+    runtime_dir: Path | None = None,
+    store_dir: Path | None = None,
+) -> Optional[Path]:
     """Absolute path to a managed tool's binary, or None when not
     provisioned (or recorded but vanished — treat as unprovisioned; the
-    provisioner heals on next update)."""
-    base = runtime_dir if runtime_dir is not None else get_runtime_dir()
-    fact = load_facts(base).get(name)
+    provisioner heals on next update).
+
+    The fact says WHICH entry; the store says WHERE the entries are. That
+    split is the whole indirection layer — there are no symlinks.
+    """
+    facts_dir, store = resolve_bases(runtime_dir, store_dir)
+    fact = load_facts(facts_dir).get(name)
     if fact is None:
         return None
-    candidate = base / fact.path
+    candidate = store / fact.path
     if not candidate.is_file():
         return None
     return candidate
 
 
-def tool_bin_dir(name: str, runtime_dir: Path | None = None) -> Optional[Path]:
+def tool_bin_dir(
+    name: str,
+    runtime_dir: Path | None = None,
+    store_dir: Path | None = None,
+) -> Optional[Path]:
     """Directory containing a managed tool's binary — the PATH-assembler
     unit. None when the tool is not provisioned."""
-    resolved = tool_path(name, runtime_dir)
+    resolved = tool_path(name, runtime_dir, store_dir)
     return resolved.parent if resolved is not None else None

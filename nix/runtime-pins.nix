@@ -224,17 +224,21 @@ let
         lib.hasSuffix ".py" base || lib.hasSuffix ".json" base;
   };
 
-  # The bundle IS a runtime dir: `<dir>/<tool>/...` per the registry's
-  # layout, plus the `runtimes.json` facts manifest. Symlinks, so the
+  # The bundle IS a tool store: one entry per pinned tuple, named
+  # `<tool>-<version>-<target>` exactly as `registry.store_entry_name`
+  # spells it, plus the `runtimes.json` facts manifest beside them. It is
+  # therefore its own facts dir AND its own store — a sealed store path
+  # cannot write into the machine-wide `~/.hermes/tools`, and does not
+  # need to: everything it will ever hold is built here. Symlinks, so the
   # tools stay separately built and separately cached.
   #
-  # Facts are written by runtime_registry.py itself, and the PATH dirs
-  # are then read back out with runtime_env.managed_path_dirs — the same
-  # call every Hermes subprocess makes. Nix consumers take that list
-  # instead of guessing, which matters because the layout is per-tool:
-  # node/git/gh/npm expose `<tool>/bin`, uv and ripgrep put the binary at
-  # `<tool>/` directly, and lib.makeBinPath (which only ever appends
-  # /bin) silently drops the second kind.
+  # Facts are written by installation/registry.py itself, and the PATH
+  # dirs are then read back out with installation.env.managed_path_dirs —
+  # the same call every Hermes subprocess makes. Nix consumers take that
+  # list instead of guessing, which matters because the layout is
+  # per-tool: node/git/gh/npm expose `<entry>/bin`, uv and ripgrep put
+  # the binary at `<entry>/` directly, and lib.makeBinPath (which only
+  # ever appends /bin) silently drops the second kind.
   bundle =
     runCommand "hermes-runtime-dir"
       {
@@ -245,7 +249,11 @@ let
       }
       ''
         mkdir -p "$out"
-        ${lib.concatStringsSep "\n" (lib.mapAttrsToList (name: drv: ''ln -s ${drv} "$out/${name}"'') tools)}
+        ${lib.concatStringsSep "\n" (
+          lib.mapAttrsToList (
+            name: drv: ''ln -s ${drv} "$out/${name}-${requiredPins.${name}.version}-${target}"''
+          ) tools
+        )}
 
         mkdir -p "$TMPDIR/pypath"
         ln -s ${installationSrc} "$TMPDIR/pypath/installation"
@@ -257,7 +265,7 @@ let
         from installation.registry import (
             RuntimeFact, install_order, is_optional, load_pins, path_order, save_facts,
         )
-        from installation.provisioner import _binary_rel, _path_dirs
+        from installation.provisioner import _fact_path_dirs, _fact_rel
 
         runtime_dir, target = Path(sys.argv[1]), sys.argv[2]
         pins = load_pins()
@@ -270,13 +278,14 @@ let
             # one here would promise a binary that was never built.
             if is_optional(tool, pins):
                 continue
-            rel = _binary_rel(tool, target)
+            version = pins[tool]["version"]
+            rel = _fact_rel(tool, version, target)
             if not (runtime_dir / rel).exists():
                 raise SystemExit(f"runtime-pins: {tool} is missing {rel}")
             facts[tool] = RuntimeFact(
-                version=pins[tool]["version"],
+                version=version,
                 path=rel,
-                path_dirs=_path_dirs(tool, target),
+                path_dirs=_fact_path_dirs(tool, version, target),
             )
 
         save_facts(facts, runtime_dir, path_order=path_order(pins))

@@ -1,14 +1,27 @@
-"""Provision managed runtime tools into <install>/.hermes-runtime/.
+"""Provision managed runtime tools into the machine-wide tool store.
 
 THE one dep engine: `hermes update` (post-update MACHINE_STEPS), the
 installers (`python -m installation.provisioner`, after the pinned-uv
 bootstrap), and the desktop payload staging all run this same code.
 
 Per tool: read the EXACT pin for this target (url + sha256) → download →
-verify the digest BEFORE extracting → stage into the tool's directory →
-verify by RUNNING the binary → record the fact. A tool that cannot be
-verified is not recorded: readers see it as unprovisioned and fall back
-to system PATH, and the next run retries.
+verify the digest BEFORE extracting → stage into a scratch directory →
+PUBLISH it into the store under ``<tool>-<version>-<target>`` with one
+atomic rename → verify by RUNNING the binary → record the fact. A tool
+that cannot be verified is not recorded: readers see it as unprovisioned
+and fall back to system PATH, and the next run retries.
+
+Bytes are shared, facts are not. The store is machine-wide, so several
+installs (44 git worktrees, on the machine this was measured on) share
+one copy of node rather than holding ~495MB each. Two rules make that
+safe, and they are the whole concurrency story:
+
+* **Publish atomically.** Staging happens in a scratch dir and lands with
+  ``os.replace``, so a reader never sees a half-extracted entry.
+* **Never mutate a published entry.** The name carries the version and
+  the target, so an entry that exists already IS the pinned artifact —
+  and another install may be executing it right now. A pin bump creates a
+  NEW entry and repoints this install's fact at it.
 
 Tools are visited in the pin table's dependency order, so a tool that
 declares ``extends`` is staged after what it extends — npm is unpacked by
@@ -36,12 +49,14 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+import uuid
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from installation.paths import get_install_root, get_runtime_dir
+from installation.paths import get_install_root, resolve_bases
 from installation.tree import Sealed, runtime_tree
 from installation.registry import (
     PinnedFile,
@@ -55,6 +70,7 @@ from installation.registry import (
     path_order,
     pinned_file,
     save_facts,
+    store_entry_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -200,7 +216,9 @@ def _probe_version(
     return m.group(0) if m else None
 
 
-def _probe_env(entry: dict, rt: Path) -> Optional[dict[str, str]]:
+def _probe_env(
+    entry: dict, facts_dir: Path, store: Path
+) -> Optional[dict[str, str]]:
     """Environment for the run-the-binary check.
 
     Most tools are self-contained executables and need nothing. A tool
@@ -213,7 +231,7 @@ def _probe_env(entry: dict, rt: Path) -> Optional[dict[str, str]]:
         return None
     from installation.env import with_managed_runtimes
 
-    return with_managed_runtimes(runtime_dir=rt)
+    return with_managed_runtimes(runtime_dir=facts_dir, store_dir=store)
 
 
 # ─── per-tool layout + staging ──────────────────────────────────────────────
@@ -232,43 +250,65 @@ class ToolResult:
 
 
 def _binary_rel(tool: str, target: str) -> str:
-    """Where each tool's binary lands, relative to the runtime dir."""
+    """Where each tool's binary lands, relative to its own STORE ENTRY.
+
+    The entry directory carries the tool name, version and target
+    (``node-26.7.0-linux-x64/``), so this is the layout INSIDE it —
+    ``bin/node``, not ``node/bin/node``.
+    """
     win = target.startswith("win32")
     ext = ".exe" if win else ""
     return {
         # The Windows node zip has node.exe at the root; POSIX has bin/node.
-        "node": "node/node.exe" if win else "node/bin/node",
+        "node": "node.exe" if win else "bin/node",
         # `npm -g --prefix` drops .cmd shims in the prefix root on Windows
         # and POSIX shims in bin/ (same split dep_ensure documents).
-        "npm": "npm/npm.cmd" if win else "npm/bin/npm",
-        "uv": f"uv/uv{ext}",
+        "npm": "npm.cmd" if win else "bin/npm",
+        "uv": f"uv{ext}",
         # PortableGit exposes cmd/git.exe; dugite-native uses bin/git.
-        "git": "git/cmd/git.exe" if win else "git/bin/git",
-        "gh": f"gh/bin/gh{ext}",
-        "ripgrep": f"ripgrep/rg{ext}",
+        "git": "cmd/git.exe" if win else "bin/git",
+        "gh": f"bin/gh{ext}",
+        "ripgrep": f"rg{ext}",
         # camoufox-js's own LAUNCH_FILE map: the zip unpacks flat and the
         # launcher sits at its root (mac keeps the .app bundle layout).
         "camoufox": (
-            "camoufox/camoufox.exe"
+            "camoufox.exe"
             if win
             else (
-                "camoufox/Camoufox.app/Contents/MacOS/camoufox"
+                "Camoufox.app/Contents/MacOS/camoufox"
                 if target.startswith("darwin")
-                else "camoufox/camoufox-bin"
+                else "camoufox-bin"
             )
         ),
     }[tool]
 
 
 def _path_dirs(tool: str, target: str) -> Optional[list[str]]:
-    """PATH dirs for tools whose surface is more than the binary's dir.
+    """PATH dirs for tools whose surface is more than the binary's dir,
+    relative to the tool's own store entry.
 
     PortableGit needs three: bash.exe and the coreutils live outside
     cmd/. Everything else is covered by the binary's own directory.
     """
     if tool == "git" and target.startswith("win32"):
-        return ["git/cmd", "git/bin", "git/usr/bin"]
+        return ["cmd", "bin", "usr/bin"]
     return None
+
+
+def _fact_rel(tool: str, version: str, target: str) -> str:
+    """The binary path recorded in the facts, relative to the STORE."""
+    return f"{store_entry_name(tool, version, target)}/{_binary_rel(tool, target)}"
+
+
+def _fact_path_dirs(
+    tool: str, version: str, target: str
+) -> Optional[list[str]]:
+    """``path_dirs`` recorded in the facts, relative to the STORE."""
+    dirs = _path_dirs(tool, target)
+    if dirs is None:
+        return None
+    entry = store_entry_name(tool, version, target)
+    return [f"{entry}/{d}" for d in dirs]
 
 
 def _stage_archive(pin: PinnedFile, dest: Path, tmp: Path) -> None:
@@ -304,7 +344,9 @@ def _stage_portable_git(pin: PinnedFile, dest: Path, tmp: Path) -> None:
         raise RuntimeError(f"PortableGit self-extractor exited {proc.returncode}")
 
 
-def _stage_npm(pin: PinnedFile, dest: Path, tmp: Path, rt: Path, target: str) -> None:
+def _stage_npm(
+    pin: PinnedFile, dest: Path, tmp: Path, ctx: "_StageContext", target: str
+) -> None:
     """npm installs itself, using the node it extends.
 
     npm is not a relocatable archive: its own ``bin/npm`` resolves the cli
@@ -319,8 +361,8 @@ def _stage_npm(pin: PinnedFile, dest: Path, tmp: Path, rt: Path, target: str) ->
     installs exactly what the pin table says and nothing else.
     """
     tarball = _fetch_verified(pin, tmp)
-    node = rt / _binary_rel("node", target)
-    if not node.is_file():
+    node = ctx.node
+    if node is None or not node.is_file():
         raise RuntimeError("npm extends node, which is not provisioned")
 
     # node's BUNDLED npm performs the install; the pinned npm replaces it
@@ -354,7 +396,7 @@ def _stage_npm(pin: PinnedFile, dest: Path, tmp: Path, rt: Path, target: str) ->
         timeout=900,
         # Keep the install off the user's ~/.npm: an install-scoped tool
         # writes install-scoped state.
-        env={**os.environ, "npm_config_cache": str(rt / "cache" / "npm")},
+        env={**os.environ, "npm_config_cache": str(ctx.npm_cache)},
     )
     if proc.returncode != 0:
         raise RuntimeError(f"npm install exited {proc.returncode}: {proc.stderr[-400:]}")
@@ -396,20 +438,39 @@ def _stage_camoufox(pin: PinnedFile, dest: Path, tmp: Path) -> None:
     )
 
 
+@dataclass(frozen=True)
+class _StageContext:
+    """What a staging routine may need beyond its own archive.
+
+    Only npm needs either today (it is unpacked BY the node it extends),
+    but passing them explicitly is what lets every other routine stay a
+    pure archive → directory function with no idea where the store is.
+    """
+
+    node: Optional[Path]  # the provisioned node binary, resolved from facts
+    npm_cache: Path  # install-scoped npm cache (mutable state, not bytes)
+
+
 def _stage(
-    tool: str, pin: PinnedFile, dest: Path, tmp: Path, target: str, rt: Path
+    tool: str,
+    pin: PinnedFile,
+    dest: Path,
+    tmp: Path,
+    target: str,
+    ctx: _StageContext,
 ) -> None:
-    """Unpack one tool into its runtime-dir home.
+    """Unpack one tool into *dest* — a scratch dir, not its final home.
 
     Branching lives here and nowhere else: every tool arrives through the
     same fetch-and-verify, and differs only in how its artifact unpacks.
+    The caller publishes *dest* into the store with one atomic rename.
     """
     if tool == "git" and target.startswith("win32"):
         _stage_portable_git(pin, dest, tmp)
         return
 
     if tool == "npm":
-        _stage_npm(pin, dest, tmp, rt, target)
+        _stage_npm(pin, dest, tmp, ctx, target)
         return
 
     if tool == "camoufox":
@@ -418,11 +479,10 @@ def _stage(
 
     _stage_archive(pin, dest, tmp)
     if tool == "git" and not target.startswith("win32"):
-        # delete useless DLLs
-        dlls_dir = dest / "libexec" / "git-core"
-
-        for dll_file in dlls_dir.rglob("*.dll"):
-            print(f"deleted unused git dll: {dll_file}")
+        # dugite ships Windows remote-helper DLLs in every build. They
+        # are dead weight on POSIX (~40MB) and now cost store space that
+        # several installs share.
+        for dll_file in (dest / "libexec" / "git-core").rglob("*.dll"):
             dll_file.unlink()
 
 
@@ -449,22 +509,105 @@ def _discard_scratch(scratch: Path) -> None:
         logger.debug("scratch dir %s could not be removed — leaving it", scratch)
 
 
+# Written INSIDE a store entry, in the staged tree, immediately before the
+# entry is published. Its presence is what makes "this entry is the pinned,
+# digest-verified artifact" a fact a later run can CHECK rather than assume.
+#
+# It has to be inside the tree, not beside it: the publish is a single
+# rename, so a marker that lands with the tree cannot be separated from it
+# by a crash. A marker written after the rename would leave a window where
+# a complete entry looks like junk.
+ENTRY_MARKER_NAME = ".hermes-store-entry.json"
+
+
+def _entry_marker(pin: PinnedFile, tool: str, target: str) -> dict:
+    return {
+        "tool": tool,
+        "version": pin.version,
+        "target": target,
+        "sha256": pin.sha256,
+        "publishedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _is_published_entry(entry: Path, tool: str, version: str, target: str) -> bool:
+    """True when *entry* is an entry THIS code published for this tuple.
+
+    Anything else — a hand-made directory, a tree left by an interrupted
+    delete, an unpacked copy someone dropped in — is not trusted. That is
+    the no-salvage rule surviving the move to a shared store: adopting
+    bytes nobody verified would defeat pinning digests at all.
+    """
+    try:
+        marker = json.loads((entry / ENTRY_MARKER_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        marker.get("tool") == tool
+        and marker.get("version") == version
+        and marker.get("target") == target
+    )
+
+
+def _publish(staged: Path, entry: Path, tool: str, version: str, target: str) -> bool:
+    """Move a staged tree into the store under its final name.
+
+    Returns True when this call published the entry, False when a
+    published entry was already there. Both are success: the marker
+    proves the existing entry is the same verified artifact, so keeping
+    it is correct AND required — another install may be executing it
+    right now, and a published entry is never rewritten.
+
+    An UNPUBLISHED directory at the same name is junk (no marker, so no
+    process can be relying on it) and is replaced.
+
+    The rename is the whole concurrency story. Extraction happens in a
+    scratch dir, so a reader of the store never sees a partial tree.
+    """
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    if entry.exists():
+        if _is_published_entry(entry, tool, version, target):
+            return False
+        shutil.rmtree(entry, ignore_errors=True)
+    try:
+        os.replace(staged, entry)
+    except OSError:
+        # Lost the race between the check and the rename, or the platform
+        # refuses to replace a directory (Windows raises for a non-empty
+        # target). A published entry there now is the outcome we wanted.
+        if _is_published_entry(entry, tool, version, target):
+            return False
+        raise
+    return True
+
+
 def _provision_one(
     tool: str,
     entry: dict,
-    rt: Path,
+    facts_dir: Path,
+    store: Path,
     facts: dict[str, RuntimeFact],
     target: str,
     path_order: list[str] | None = None,
 ) -> ToolResult:
     """Bring ONE tool to the pinned state. Never raises."""
-    rel = _binary_rel(tool, target)
+    version = entry["version"]
+    rel = _fact_rel(tool, version, target)
+    store_entry = store / store_entry_name(tool, version, target)
+    published = _is_published_entry(store_entry, tool, version, target)
 
     # Already exactly right? The pin is exact, so this is an equality
-    # check, not a range check.
+    # check, not a range check. The store may also hold the entry from
+    # ANOTHER install, in which case this install only needs the fact —
+    # that is the sharing this store exists for, and it costs no download.
     fact = facts.get(tool)
-    if fact is not None and fact.version == entry["version"] and (rt / rel).is_file():
-        return ToolResult(tool, "kept", version=fact.version)
+    if (
+        fact is not None
+        and fact.version == version
+        and published
+        and (store / rel).is_file()
+    ):
+        return ToolResult(tool, "kept", version=version)
 
     try:
         pin = pinned_file(tool, target, pins={tool: entry})
@@ -472,27 +615,57 @@ def _provision_one(
         return ToolResult(tool, "failed", detail=str(exc))
 
     try:
-        td = Path(tempfile.mkdtemp(prefix="hermes-provision-"))
-        try:
-            _stage(tool, pin, rt / tool, Path(td), target, rt)
-        finally:
-            _discard_scratch(td)
+        if not (published and (store / rel).is_file()):
+            ctx = _StageContext(
+                node=(
+                    store / _fact_rel("node", facts["node"].version, target)
+                    if "node" in facts
+                    else None
+                ),
+                npm_cache=facts_dir / "cache" / "npm",
+            )
+            td = Path(tempfile.mkdtemp(prefix="hermes-provision-"))
+            try:
+                # Stage into the STORE's own scratch area, not the OS temp
+                # dir: publishing is an os.replace, which fails across
+                # filesystems, and /tmp is very often a different one.
+                staging = store / f".staging-{uuid.uuid4().hex}"
+                _stage(tool, pin, staging, Path(td), target, ctx)
+                if not (staging / _binary_rel(tool, target)).is_file():
+                    shutil.rmtree(staging, ignore_errors=True)
+                    return ToolResult(
+                        tool, "failed", detail=f"{rel} missing after staging"
+                    )
+                # The marker goes in BEFORE the rename, so it lands with
+                # the tree in one atomic step (see ENTRY_MARKER_NAME).
+                (staging / ENTRY_MARKER_NAME).write_text(
+                    json.dumps(_entry_marker(pin, tool, target)), encoding="utf-8"
+                )
+                if not _publish(staging, store_entry, tool, version, target):
+                    # Someone else published the same entry while we
+                    # staged. Their bytes pass the same digest check, so
+                    # drop ours rather than touching a live entry.
+                    shutil.rmtree(staging, ignore_errors=True)
+            finally:
+                _discard_scratch(td)
 
-        binary = rt / rel
+        binary = store / rel
         if not binary.is_file():
             return ToolResult(tool, "failed", detail=f"{rel} missing after staging")
         binary.chmod(binary.stat().st_mode | 0o755)
 
         # Verify by RUNNING it, not by trusting the archive: a cross-arch
         # or half-extracted binary fails here rather than at first use.
-        if _probe_version(binary, env=_probe_env(entry, rt)) is None:
+        if _probe_version(binary, env=_probe_env(entry, facts_dir, store)) is None:
             return ToolResult(tool, "failed", detail="provisioned binary does not run")
 
         facts[tool] = RuntimeFact(
-            version=pin.version, path=rel, path_dirs=_path_dirs(tool, target)
+            version=version,
+            path=rel,
+            path_dirs=_fact_path_dirs(tool, version, target),
         )
-        save_facts(facts, rt, path_order=path_order)
-        return ToolResult(tool, "downloaded", version=pin.version)
+        save_facts(facts, facts_dir, path_order=path_order)
+        return ToolResult(tool, "downloaded", version=version)
     except Exception as exc:  # noqa: BLE001 — per-tool isolation is the contract
         logger.warning("provisioning %s failed: %s", tool, exc)
         return ToolResult(tool, "failed", detail=str(exc))
@@ -502,6 +675,7 @@ def provision_tool(
     tool: str,
     runtime_dir: Path | None = None,
     install_root: Path | None = None,
+    store_dir: Path | None = None,
 ) -> ToolResult:
     """Provision a single pinned tool, and whatever it extends.
 
@@ -515,14 +689,15 @@ def provision_tool(
     dependency goes through the same ``kept`` fast path, so this is a
     no-op when they are already at their pins.
     """
-    rt = runtime_dir if runtime_dir is not None else get_runtime_dir()
-    rt.mkdir(parents=True, exist_ok=True)
+    facts_dir, store = resolve_bases(runtime_dir, store_dir)
+    facts_dir.mkdir(parents=True, exist_ok=True)
+    store.mkdir(parents=True, exist_ok=True)
     pins = load_pins(install_root)
     entry = pins.get(tool)
     if entry is None:
         return ToolResult(tool, "failed", detail=f"{tool} is not pinned")
 
-    facts = load_facts(rt)
+    facts = load_facts(facts_dir)
     target = current_target()
     order = path_order(pins)
     # install_order is the full dependency-respecting order; keep the
@@ -534,7 +709,7 @@ def provision_tool(
     result = ToolResult(tool, "failed", detail=f"{tool} was not provisioned")
     for name in chain:
         result = _provision_one(
-            name, pins[name], rt, facts, target, path_order=order
+            name, pins[name], facts_dir, store, facts, target, path_order=order
         )
         if not result.ok:
             # A dependency that cannot be staged makes the request
@@ -548,6 +723,7 @@ def provision_runtimes(
     install_root: Path | None = None,
     emit: Callable[[dict], None] | None = None,
     only: list[str] | None = None,
+    store_dir: Path | None = None,
 ) -> list[ToolResult]:
     """Bring every pinned tool to its pinned version.
 
@@ -562,11 +738,12 @@ def provision_runtimes(
     the staged binary has answered a version probe here, so a pin that
     downloads but cannot run is a failure rather than a fact.
     """
-    rt = runtime_dir if runtime_dir is not None else get_runtime_dir()
-    rt.mkdir(parents=True, exist_ok=True)
+    facts_dir, store = resolve_bases(runtime_dir, store_dir)
+    facts_dir.mkdir(parents=True, exist_ok=True)
+    store.mkdir(parents=True, exist_ok=True)
     target = current_target()
     pins = load_pins(install_root)
-    facts = load_facts(rt)
+    facts = load_facts(facts_dir)
     results: list[ToolResult] = []
     order = path_order(pins)
 
@@ -582,7 +759,8 @@ def provision_runtimes(
         result = _provision_one(
             tool,
             pins[tool],
-            rt,
+            facts_dir,
+            store,
             facts,
             target,
             path_order=order,
@@ -605,6 +783,7 @@ def provision_runtimes(
 def stale_tools(
     runtime_dir: Path | None = None,
     install_root: Path | None = None,
+    store_dir: Path | None = None,
 ) -> dict[str, tuple[str, Optional[str]]]:
     """Pinned tools whose installed state does not match the pin table.
 
@@ -618,16 +797,18 @@ def stale_tools(
     every install that does not browse look broken. Once it IS installed
     the pin governs it like any other tool, so a bump shows up here.
     """
-    rt = runtime_dir if runtime_dir is not None else get_runtime_dir()
-    target = current_target()
-    facts = load_facts(rt)
+    facts_dir, store = resolve_bases(runtime_dir, store_dir)
+    facts = load_facts(facts_dir)
     drift: dict[str, tuple[str, Optional[str]]] = {}
 
     pins = load_pins(install_root)
     for tool, entry in pins.items():
         fact = facts.get(tool)
         installed = fact.version if fact is not None else None
-        if fact is not None and not (rt / _binary_rel(tool, target)).is_file():
+        # The FACT's own path, not a recomputed one: a fact recorded at an
+        # older pin names an older store entry, and asking whether THAT
+        # is on disk is the question ("is what we recorded still there?").
+        if fact is not None and not (store / fact.path).is_file():
             # Recorded but vanished reads as unprovisioned everywhere
             # else; say so here too rather than reporting it as current.
             installed = None
@@ -646,6 +827,7 @@ def require_current_runtimes(
     project_root: Path | None = None,
     runtime_dir: Path | None = None,
     install_root: Path | None = None,
+    store_dir: Path | None = None,
 ) -> None:
     """Fail fast when a SEALED install ships out-of-date runtime tools.
 
@@ -665,7 +847,9 @@ def require_current_runtimes(
     if not isinstance(tree, Sealed):
         return
 
-    drift = stale_tools(runtime_dir=runtime_dir, install_root=install_root)
+    drift = stale_tools(
+        runtime_dir=runtime_dir, install_root=install_root, store_dir=store_dir
+    )
     if not drift:
         return
 
@@ -710,7 +894,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--runtime-dir",
         type=Path,
-        help="Where to install (default: this install's .hermes-runtime).",
+        help="Where the FACTS go (default: this install's .hermes-runtime). "
+        "Naming it without --store-dir also makes it the byte store, which "
+        "is what a packager building one self-contained runtime dir wants.",
+    )
+    parser.add_argument(
+        "--store-dir",
+        type=Path,
+        help="Where the tool BYTES go (default: ~/.hermes/tools, shared by "
+        "every install on this machine).",
     )
     parser.add_argument(
         "--target",
@@ -746,7 +938,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {event['tool']}: {event['action']}{version}{detail}", flush=True)
 
     results = provision_runtimes(
-        runtime_dir=ns.runtime_dir, emit=emit, only=ns.only
+        runtime_dir=ns.runtime_dir, store_dir=ns.store_dir, emit=emit, only=ns.only
     )
     return 0 if all(r.ok for r in results) else 1
 
