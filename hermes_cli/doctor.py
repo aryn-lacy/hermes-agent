@@ -213,17 +213,35 @@ def _check_managed_runtimes() -> None:
     them rather than re-deriving existence by probing paths (hermes-home
     lifetime split, phase 3.10). Tools the registry does not know about
     are still reported from PATH so a system copy is visible.
+
+    Drift is a WARNING in a git checkout and an ERROR in a sealed tree.
+    A checkout heals itself on the next `hermes update`; a sealed tree
+    cannot provision anything, so a mismatch there means the artifact was
+    built against a different pin table than the code it ships, and only
+    its steward can fix it.
     """
     try:
         from hermes_cli.runtime_registry import load_facts, load_pins, satisfies
-        from hermes_constants import get_runtime_dir
+        from hermes_cli.runtime_tree import Sealed, runtime_tree
+        from hermes_constants import get_install_root, get_runtime_dir
 
         runtime_dir = get_runtime_dir()
         pins = load_pins()
         facts = load_facts(runtime_dir)
+        tree = runtime_tree(get_install_root())
     except Exception as exc:
         check_warn("Managed runtimes unreadable", f"({exc})")
         return
+
+    sealed = isinstance(tree, Sealed)
+    # What a user can actually do about it differs per install kind:
+    # a checkout runs an update, a sealed tree rebuilds with its steward.
+    remedy = (
+        f"(rebuild this {tree.steward} artifact — a sealed install cannot provision)"
+        if sealed
+        else "(reprovisioned on the next 'hermes update')"
+    )
+    report_drift = check_fail if sealed else check_warn
 
     for tool, pin in pins.items():
         fact = facts.get(tool)
@@ -232,21 +250,18 @@ def _check_managed_runtimes() -> None:
             if system:
                 check_ok(f"{tool} (system)", f"at {system}")
             else:
-                check_warn(
-                    f"{tool} not provisioned",
-                    "(installed on the next 'hermes update')",
-                )
+                report_drift(f"{tool} not provisioned", remedy)
             continue
         if not (runtime_dir / fact.path).is_file():
-            check_warn(
+            report_drift(
                 f"{tool} recorded but missing",
-                "(runtime dir was modified; 'hermes update' reinstalls it)",
+                "(runtime dir was modified) " + remedy if not sealed else remedy,
             )
             continue
         if not satisfies(fact.version, pin["version"]):
-            check_warn(
+            report_drift(
                 f"{tool} {fact.version} is below the pin {pin['version']}",
-                "(upgraded on the next 'hermes update')",
+                remedy,
             )
             continue
         check_ok(f"{tool} {fact.version}", "(managed)")

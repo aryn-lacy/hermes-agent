@@ -111,10 +111,27 @@ let
     filter = path: _type: !(lib.hasInfix "/__pycache__/" path);
   };
 
+  # The managed runtime tools, built from runtime-pins.json. This is the
+  # SAME table a source install and `hermes update` provision from, so a
+  # nix install ships the versions the code was written against instead
+  # of whatever nixpkgs happens to carry this week.
+  runtimeDir = callPackage ./runtime-pins.nix { };
+
+  # Runtime PATH. The pinned tools come first, in the dirs the bundle's
+  # own `path-dirs` file names — written by runtime_env.managed_path_dirs,
+  # the same assembler every Hermes subprocess uses.
+  #
+  # It is read in the BUILD, not here: `builtins.readFile` on a
+  # derivation is import-from-derivation, which forces a full build of
+  # the runtime dir during evaluation and breaks `nix flake check
+  # --no-build` and cross-system eval. Nothing else in this repo does
+  # IFD; a shell read in installPhase costs nothing and keeps eval pure.
+  #
+  # NOT lib.makeBinPath either: that appends /bin to each store path, and
+  # only some of these tools keep their binary there (uv and ripgrep put
+  # it at the tree root). makeBinPath silently produced dead entries for
+  # those two, which is how `uv: command not found` reached the devshell.
   runtimeDeps = [
-    hermesNpmLib.nodejs
-    ripgrep
-    git
     openssh
     ffmpeg
     tirith
@@ -198,25 +215,56 @@ stdenv.mkDerivation (finalAttrs: {
     ln -s ${hermesWeb} $out/share/hermes-agent/web_dist
     ln -s ${hermesTui}/lib/hermes-tui $out/ui-tui
 
+    # The managed runtime dir, BUILT from runtime-pins.json rather than
+    # provisioned into the install root — a store path is immutable, so
+    # the provisioner could never write there. Same bare-data-dir
+    # treatment as the skills/locales above: symlink it in, point the
+    # wrapper at it, and the Python readers consume it unchanged.
+    ln -s ${runtimeDir} $out/share/hermes-agent/runtime
+    ln -s ${../runtime-pins.json} $out/share/hermes-agent/runtime-pins.json
+
+    # The pinned tools' PATH dirs and tool env, as the bundle's own
+    # assembler recorded them. Read here rather than in Nix so evaluation
+    # stays free of import-from-derivation (see the runtimePath note
+    # above). The env matters as much as PATH: dugite's git resolves its
+    # helpers relative to a build-time prefix, so an unwrapped `git clone
+    # https://...` fails with "'remote-http' is not a git command".
+    pinnedPath=$(tr '\n' ':' < ${runtimeDir}/path-dirs)
+    pinnedPath=''${pinnedPath%:}
+
+    # Sourced, not parsed: the file is already shell (one shlex-quoted
+    # `export K=V` per line), and letting the shell read it avoids a
+    # hand-rolled parser for quoting the writer already handled.
+    pinnedEnvArgs=()
+    while IFS= read -r line; do
+      key=''${line#export }
+      key=''${key%%=*}
+      [ -n "$key" ] || continue
+      ( . ${runtimeDir}/tool-env; printf '%s' "''${!key}" ) > "$TMPDIR/envval"
+      pinnedEnvArgs+=(--set-default "$key" "$(cat "$TMPDIR/envval")")
+    done < ${runtimeDir}/tool-env
+
     # Write the canonical install stamp. version_info.py reads this at
     # runtime instead of probing env vars or .git — one file, one source
     # of truth for the Python runtime (CLI, TUI).
     cat > $out/share/hermes-agent/install-stamp.json <<STAMP
-    {"schemaVersion":2,"commit":${builtins.toJSON rev},"commitDate":${builtins.toJSON lastModified},"branch":${builtins.toJSON branch},"baseVersion":"${version}","displayVersion":"${stampDisplayVersion}","distance":${builtins.toJSON stampDistance},"dirty":${if dirty then "true" else "false"},"source":"nix"}
+    {"schemaVersion":2,"commit":${builtins.toJSON rev},"commitDate":${builtins.toJSON lastModified},"branch":${builtins.toJSON branch},"baseVersion":"${version}","displayVersion":"${stampDisplayVersion}","distance":${builtins.toJSON stampDistance},"dirty":${if dirty then "true" else "false"},"source":"nix","distribution":"nix"}
     STAMP
 
     ${lib.concatMapStringsSep "\n"
       (name: ''
         makeWrapper ${hermesVenv}/bin/${name} $out/bin/${name} \
-          --suffix PATH : "${runtimePath}" \
+          --suffix PATH : "$pinnedPath:${runtimePath}" \
+          "''${pinnedEnvArgs[@]}" \
           --set HERMES_BUNDLED_SKILLS $out/share/hermes-agent/skills \
           --set HERMES_OPTIONAL_SKILLS $out/share/hermes-agent/optional-skills \
           --set HERMES_BUNDLED_PLUGINS $out/share/hermes-agent/plugins \
           --set HERMES_BUNDLED_LOCALES $out/share/hermes-agent/locales \
           --set HERMES_OPTIONAL_MCPS $out/share/hermes-agent/optional-mcps \
+          --set HERMES_RUNTIME_DIR $out/share/hermes-agent/runtime \
+          --set HERMES_RUNTIME_PINS $out/share/hermes-agent/runtime-pins.json \
           --set HERMES_WEB_DIST $out/share/hermes-agent/web_dist \
           --set HERMES_TUI_DIR $out/ui-tui \
-          --set-default HERMES_BIN $out/bin/hermes \
           --set HERMES_PYTHON ${hermesVenv}/bin/python3 \
           --set HERMES_NODE ${lib.getExe hermesNpmLib.nodejs} \
           --set HERMES_BUILD_INFO $out/share/hermes-agent/install-stamp.json${lib.optionalString (extraPythonPackages != [ ]) " \\

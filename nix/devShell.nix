@@ -27,11 +27,17 @@
             mkdir -p $out/bin
             install -Dm755 ${../hermes} $out/bin/hermes
           '')
-          self'.packages.sandbox
           uv
           # hermes egress setup (iron-proxy) shells out to openssl for CA
           # generation; tests/test_iron_proxy_cli.py exercises that wizard.
           openssl
+          # Validate GitHub Actions workflows before pushing CI changes.
+          actionlint
+        ]
+        # The sandbox (bubblewrap) and the Wayland E2E stack only exist on
+        # Linux. The macOS devshell carries the build toolchain alone.
+        ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+          self'.packages.sandbox
           # Headless Wayland compositor for E2E tests (test:e2e:visual).
           # cage renders a single client with no window management, so
           # the Electron window opens at a fixed size without tiling.
