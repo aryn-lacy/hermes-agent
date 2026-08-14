@@ -532,6 +532,54 @@ detect_os() {
 # Dependency checks
 # ============================================================================
 
+# --- BEGIN GENERATED: uv bootstrap pins (scripts/gen-uv-bootstrap-pins.py) ---
+# Derived from installation/runtime-pins.json. DO NOT EDIT BY HAND:
+# run scripts/gen-uv-bootstrap-pins.py after a pin bump.
+UV_PIN_VERSION="0.12.3"
+
+# Sets UV_PIN_URL + UV_PIN_SHA256 for a <os>-<arch> target key.
+uv_bootstrap_pin() {
+    case "$1" in
+        linux-x64)
+            UV_PIN_URL="https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-unknown-linux-gnu.tar.gz"
+            UV_PIN_SHA256="600cf9a742aca00d292673b16b5acffaa7b8c269a364ad0c2e79498dcb1fe101"
+            ;;
+        linux-arm64)
+            UV_PIN_URL="https://github.com/astral-sh/uv/releases/download/0.12.3/uv-aarch64-unknown-linux-gnu.tar.gz"
+            UV_PIN_SHA256="bb66cb52e7b1823aed1183630d8d8e5c958840d584a4c55ec10a4cfc168dcca2"
+            ;;
+        darwin-x64)
+            UV_PIN_URL="https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-apple-darwin.tar.gz"
+            UV_PIN_SHA256="4c9f52262a14da336e4a42ed24992d12d0c956acde87619e4611d321dffa602b"
+            ;;
+        darwin-arm64)
+            UV_PIN_URL="https://github.com/astral-sh/uv/releases/download/0.12.3/uv-aarch64-apple-darwin.tar.gz"
+            UV_PIN_SHA256="546f7f8a6c70ff13a3a9d2bc958db3427298cebf3e0cb756f9177133b7068843"
+            ;;
+        *)
+            UV_PIN_URL=""
+            UV_PIN_SHA256=""
+            return 1
+            ;;
+    esac
+}
+# --- END GENERATED: uv bootstrap pins ---
+
+# Map this host to a pin-table target key (<os>-<arch>, Node spellings).
+uv_bootstrap_target() {
+    local _arch
+    case "$(uname -m)" in
+        arm64|aarch64) _arch="arm64" ;;
+        x86_64|amd64)  _arch="x64" ;;
+        *) return 1 ;;
+    esac
+    case "$OS" in
+        linux)  echo "linux-$_arch" ;;
+        macos)  echo "darwin-$_arch" ;;
+        *) return 1 ;;
+    esac
+}
+
 install_uv() {
     if [ "$DISTRO" = "termux" ]; then
         log_info "Termux detected — using Python's stdlib venv + pip instead of uv"
@@ -541,58 +589,93 @@ install_uv() {
 
     # Hermes owns its own uv at $HERMES_HOME/bin/uv.  Always install there —
     # no PATH probing, no conda guards, no multi-location resolution chains.
-    # The runtime update path (hermes_cli/managed_uv.py) looks in the same
-    # place, so install.sh and `hermes update` stay in sync.
+    # The binary is the EXACT artifact pinned in installation/runtime-pins.json
+    # (URL + sha256 via the generated fragment above): the same authority the
+    # provisioner uses for every other managed tool. No astral-latest.
     local _managed_uv="$HERMES_HOME/bin/uv"
 
     if [ -x "$_managed_uv" ]; then
-        UV_CMD="$_managed_uv"
-        UV_VERSION=$($UV_CMD --version 2>/dev/null)
-        log_success "Managed uv found ($UV_VERSION)"
-        return 0
+        UV_VERSION=$($_managed_uv --version 2>/dev/null)
+        # Keep it only when it IS the pinned version — a pin bump must
+        # propagate, and a stale binary predating the pin is unverified.
+        case "$UV_VERSION" in
+            *" $UV_PIN_VERSION"*|"uv $UV_PIN_VERSION")
+                UV_CMD="$_managed_uv"
+                log_success "Managed uv found ($UV_VERSION)"
+                return 0
+                ;;
+            *)
+                log_info "Managed uv is ${UV_VERSION:-unreadable}, pin is $UV_PIN_VERSION — replacing"
+                ;;
+        esac
     fi
 
-    log_info "Installing managed uv into $HERMES_HOME/bin ..."
+    local _target
+    if ! _target="$(uv_bootstrap_target)"; then
+        log_error "No pinned uv build for this platform ($(uname -s) $(uname -m))"
+        log_info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
+        exit 1
+    fi
+    uv_bootstrap_pin "$_target"
+
+    log_info "Installing pinned uv $UV_PIN_VERSION into $HERMES_HOME/bin ..."
     mkdir -p "$HERMES_HOME/bin"
 
-    # Two-stage: download the installer, then run it.  Piping
-    # `curl | sh` masks curl failures (sh exits 0 on empty stdin)
-    # and conflates network errors with installer errors.
-    local _uv_install_log _uv_installer
-    _uv_install_log="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-install.$$.log")"
-    _uv_installer="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-installer.$$.sh")"
-    if ! curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>"$_uv_install_log"; then
-        log_error "Failed to download uv installer from https://astral.sh/uv/install.sh"
-        log_info "curl output:"
-        sed 's/^/    /' "$_uv_install_log" >&2
+    local _uv_tmp
+    _uv_tmp="$(mktemp -d 2>/dev/null || echo "/tmp/hermes-uv-bootstrap.$$")"
+    mkdir -p "$_uv_tmp"
+
+    if ! curl -LsSf "$UV_PIN_URL" -o "$_uv_tmp/uv.tar.gz"; then
+        log_error "Failed to download pinned uv from $UV_PIN_URL"
         log_info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
-        rm -f "$_uv_install_log" "$_uv_installer"
+        rm -rf "$_uv_tmp"
         exit 1
     fi
-    # UV_UNMANAGED_INSTALL tells the astral installer to place the binary
-    # directly into $HERMES_HOME/bin instead of ~/.local/bin.
-    if UV_UNMANAGED_INSTALL="$HERMES_HOME/bin" sh "$_uv_installer" >>"$_uv_install_log" 2>&1; then
-        rm -f "$_uv_installer"
-        if [ -x "$_managed_uv" ]; then
-            UV_CMD="$_managed_uv"
-        else
-            log_error "uv installer reported success but binary not found at $_managed_uv"
-            log_info "Installer output:"
-            sed 's/^/    /' "$_uv_install_log" >&2
-            rm -f "$_uv_install_log"
-            exit 1
-        fi
-        rm -f "$_uv_install_log"
-        UV_VERSION=$($UV_CMD --version 2>/dev/null)
-        log_success "Managed uv installed ($UV_VERSION)"
+
+    # Digest check BEFORE extraction — a mismatched archive is deleted,
+    # never unpacked. sha256sum on Linux, shasum -a 256 on macOS.
+    local _digest
+    if command -v sha256sum >/dev/null 2>&1; then
+        _digest="$(sha256sum "$_uv_tmp/uv.tar.gz" | cut -d' ' -f1)"
     else
-        log_error "Failed to install uv"
-        log_info "Installer output:"
-        sed 's/^/    /' "$_uv_install_log" >&2
-        log_info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
-        rm -f "$_uv_install_log" "$_uv_installer"
+        _digest="$(shasum -a 256 "$_uv_tmp/uv.tar.gz" | cut -d' ' -f1)"
+    fi
+    if [ "$_digest" != "$UV_PIN_SHA256" ]; then
+        log_error "uv download digest mismatch (expected $UV_PIN_SHA256, got $_digest)"
+        log_info "The download may be corrupted or tampered with. Re-run the installer."
+        rm -rf "$_uv_tmp"
         exit 1
     fi
+
+    # The tarball nests everything under one versioned dir (uv-<triple>/).
+    # Move uv AND uvx — browser tooling resolves uvx from the same bin dir.
+    if ! tar -xzf "$_uv_tmp/uv.tar.gz" -C "$_uv_tmp"; then
+        log_error "Failed to extract uv archive"
+        rm -rf "$_uv_tmp"
+        exit 1
+    fi
+    local _unpacked
+    _unpacked="$(find "$_uv_tmp" -mindepth 1 -maxdepth 2 -name uv -type f | head -n1)"
+    if [ -z "$_unpacked" ]; then
+        log_error "uv binary not found inside the downloaded archive"
+        rm -rf "$_uv_tmp"
+        exit 1
+    fi
+    mv "$_unpacked" "$_managed_uv"
+    if [ -f "$(dirname "$_unpacked")/uvx" ]; then
+        mv "$(dirname "$_unpacked")/uvx" "$HERMES_HOME/bin/uvx"
+        chmod +x "$HERMES_HOME/bin/uvx"
+    fi
+    chmod +x "$_managed_uv"
+    rm -rf "$_uv_tmp"
+
+    UV_CMD="$_managed_uv"
+    UV_VERSION=$($UV_CMD --version 2>/dev/null)
+    if [ -z "$UV_VERSION" ]; then
+        log_error "Pinned uv staged but does not run on this host"
+        exit 1
+    fi
+    log_success "Managed uv installed ($UV_VERSION)"
 }
 
 check_python() {

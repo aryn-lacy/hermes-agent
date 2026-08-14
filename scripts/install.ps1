@@ -702,81 +702,101 @@ function Install-AgentBrowser {
 # Dependency checks
 # ============================================================================
 
-# Resolve the PowerShell host executable used to spawn child PowerShell
-# processes (the astral uv installer below).  We must NOT hardcode the bare
-# name `powershell`: it names *Windows PowerShell* and only resolves when its
-# System32 directory is on PATH.  When install.ps1 is run under PowerShell 7+
-# (`pwsh`) -- or any session where `powershell` isn't on PATH -- a bare
-# `powershell` spawn dies with "The term 'powershell' is not recognized",
-# aborting uv installation (field report: Windows install stuck, uv install
-# failed with exactly that message).  Prefer the absolute path of the host we
-# are already running in (PATH-independent), then fall back to whichever of
-# powershell/pwsh is resolvable, and only then to the bare name.
-function Get-PowerShellHostExe {
-    try {
-        $hostExe = (Get-Process -Id $PID).Path
-        if ($hostExe -and (Test-Path $hostExe)) {
-            $leaf = Split-Path $hostExe -Leaf
-            # Only trust the current host when it is a real PowerShell CLI
-            # (not e.g. powershell_ise.exe or an embedded host that can't take
-            # `-ExecutionPolicy`/`-Command`).
-            if ($leaf -match '^(?i:powershell|pwsh)\.exe$') { return $hostExe }
-        }
-    } catch { }
-    foreach ($candidate in @("powershell", "pwsh")) {
-        $cmd = Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($cmd -and $cmd.Source) { return $cmd.Source }
+# --- BEGIN GENERATED: uv bootstrap pins (scripts/gen-uv-bootstrap-pins.py) ---
+# Derived from installation/runtime-pins.json. DO NOT EDIT BY HAND:
+# run scripts/gen-uv-bootstrap-pins.py after a pin bump.
+$script:UvPinVersion = "0.12.3"
+$script:UvPinFiles = @{
+    "win32-x64" = @{
+        Url    = "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-pc-windows-msvc.zip"
+        Sha256 = "b23350c79e8ad0192b8124af13a0f17e8d4e4549524785e1aef389ae5a06990e"
     }
-    # Last-ditch: hand back the bare name so the spawn surfaces its own error.
-    return "powershell"
+    "win32-arm64" = @{
+        Url    = "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-aarch64-pc-windows-msvc.zip"
+        Sha256 = "4343217d668727b8a8eb5cad92389a1d2eeead93c89940d1b955ba1bb15462eb"
+    }
 }
+# --- END GENERATED: uv bootstrap pins ---
 
 function Install-Uv {
     # Hermes owns its own uv at $HermesHome\bin\uv.exe.  Always install there --
     # no PATH probing, no conda guards, no multi-location resolution chains.
-    # The runtime update path (hermes_cli/managed_uv.py) looks in the same
-    # place, so install.ps1 and `hermes update` stay in sync.
+    # The binary is the EXACT artifact pinned in installation/runtime-pins.json
+    # (URL + sha256 via the generated fragment above): the same authority the
+    # provisioner uses for every other managed tool. No astral-latest.
     $managedUv = Join-Path $HermesHome "bin\uv.exe"
 
     if (Test-Path $managedUv) {
-        $script:UvCmd = $managedUv
         $version = & $managedUv --version
-        Write-Success "Managed uv found ($version)"
-        return $true
-    }
-
-    Write-Info "Installing managed uv into $HermesHome\bin ..."
-    New-Item -ItemType Directory -Path (Join-Path $HermesHome "bin") -Force | Out-Null
-
-    # UV_INSTALL_DIR tells the astral installer to place the binary
-    # directly into $HermesHome\bin instead of ~/.local/bin.
-    $prevEAP = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $env:UV_INSTALL_DIR = Join-Path $HermesHome "bin"
-        # Spawn via the resolved host exe (see Get-PowerShellHostExe) rather
-        # than a bare `powershell`, which isn't guaranteed to be on PATH under
-        # PowerShell 7 / pwsh-only setups.
-        $psHostExe = Get-PowerShellHostExe
-        & $psHostExe -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex" 2>&1 | Out-Null
-        $ErrorActionPreference = $prevEAP
-
-        if (Test-Path $managedUv) {
+        # Keep it only when it IS the pinned version -- a pin bump must
+        # propagate, and a stale binary predating the pin is unverified.
+        if ($version -match [regex]::Escape($script:UvPinVersion)) {
             $script:UvCmd = $managedUv
-            $version = & $managedUv --version
-            Write-Success "Managed uv installed ($version)"
+            Write-Success "Managed uv found ($version)"
             return $true
         }
+        Write-Info "Managed uv is '$version', pin is $($script:UvPinVersion) -- replacing"
+    }
 
-        Write-Err "uv installed but not found at $managedUv"
+    $target = "win32-$(Get-WindowsArch)"
+    $pin = $script:UvPinFiles[$target]
+    if (-not $pin) {
+        Write-Err "No pinned uv build for this platform ($target)"
         Write-Info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
         return $false
+    }
+
+    Write-Info "Installing pinned uv $($script:UvPinVersion) into $HermesHome\bin ..."
+    $binDir = Join-Path $HermesHome "bin"
+    New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+
+    $tmpDir = Join-Path ([IO.Path]::GetTempPath()) "hermes-uv-bootstrap-$PID"
+    $zipPath = Join-Path $tmpDir "uv.zip"
+    try {
+        New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+        Invoke-WebRequest -Uri $pin.Url -OutFile $zipPath -UseBasicParsing
+
+        # Digest check BEFORE extraction -- a mismatched archive is deleted,
+        # never unpacked.
+        $digest = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($digest -ne $pin.Sha256.ToLowerInvariant()) {
+            Write-Err "uv download digest mismatch (expected $($pin.Sha256), got $digest)"
+            Write-Info "The download may be corrupted or tampered with. Re-run the installer."
+            return $false
+        }
+
+        $extractDir = Join-Path $tmpDir "unpacked"
+        Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+        # The zip carries uv.exe (+ uvx.exe) at the root or under one
+        # versioned wrapper dir -- take whichever layout arrived.
+        $uvExe = Get-ChildItem -Path $extractDir -Filter "uv.exe" -Recurse |
+            Select-Object -First 1
+        if (-not $uvExe) {
+            Write-Err "uv.exe not found inside the downloaded archive"
+            return $false
+        }
+        Move-Item -Path $uvExe.FullName -Destination $managedUv -Force
+        $uvxExe = Get-ChildItem -Path $extractDir -Filter "uvx.exe" -Recurse |
+            Select-Object -First 1
+        if ($uvxExe) {
+            Move-Item -Path $uvxExe.FullName -Destination (Join-Path $binDir "uvx.exe") -Force
+        }
+
+        $version = & $managedUv --version
+        if (-not $version) {
+            Write-Err "Pinned uv staged but does not run on this host"
+            return $false
+        }
+        $script:UvCmd = $managedUv
+        Write-Success "Managed uv installed ($version)"
+        return $true
     } catch {
-        if ($prevEAP) { $ErrorActionPreference = $prevEAP }
-        Write-Err "Failed to install uv: $_"
+        Write-Err "Failed to install pinned uv: $_"
         Write-Info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
         return $false
+    } finally {
+        Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 

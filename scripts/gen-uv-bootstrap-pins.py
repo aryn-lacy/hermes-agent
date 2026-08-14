@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Generate the uv bootstrap pin fragments inside install.sh and install.ps1.
+
+The installers bootstrap uv BEFORE any checkout exists (uv builds the venv
+that runs everything else), so they cannot read installation/runtime-pins.json
+at run time: they are fetched standalone (`curl | sh`, `irm | iex`) and there
+is no JSON parser they can rely on that early (no jq guarantee; python is
+what uv installs on Windows). Instead, this script derives a plain-data
+fragment from the pin table and splices it between markers in each installer.
+The bytes are stored, the truth is derived, and the drift test
+(tests/test_uv_bootstrap_pins_fragment.py) fails when they disagree.
+
+Run after bumping the uv entry in installation/runtime-pins.json:
+
+    python3 scripts/gen-uv-bootstrap-pins.py          # rewrite fragments
+    python3 scripts/gen-uv-bootstrap-pins.py --check  # exit 1 on drift
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PINS_PATH = REPO_ROOT / "installation" / "runtime-pins.json"
+
+BEGIN_MARK = "# --- BEGIN GENERATED: uv bootstrap pins (scripts/gen-uv-bootstrap-pins.py) ---"
+END_MARK = "# --- END GENERATED: uv bootstrap pins ---"
+
+_POSIX_TARGETS = ("linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64")
+_WINDOWS_TARGETS = ("win32-x64", "win32-arm64")
+
+
+def _load_uv_pin() -> dict:
+    data = json.loads(PINS_PATH.read_text(encoding="utf-8"))
+    uv = data["tools"]["uv"]
+    for target in _POSIX_TARGETS + _WINDOWS_TARGETS:
+        entry = uv["files"][target]  # KeyError on a missing target is the point
+        if not entry["url"].startswith("https://"):
+            raise ValueError(f"uv pin for {target}: url must be https")
+        if len(entry["sha256"]) != 64:
+            raise ValueError(f"uv pin for {target}: sha256 must be 64 hex chars")
+    return uv
+
+
+def _sh_fragment(uv: dict) -> str:
+    lines = [
+        BEGIN_MARK,
+        "# Derived from installation/runtime-pins.json. DO NOT EDIT BY HAND:",
+        "# run scripts/gen-uv-bootstrap-pins.py after a pin bump.",
+        f'UV_PIN_VERSION="{uv["version"]}"',
+        "",
+        "# Sets UV_PIN_URL + UV_PIN_SHA256 for a <os>-<arch> target key.",
+        "uv_bootstrap_pin() {",
+        '    case "$1" in',
+    ]
+    for target in _POSIX_TARGETS:
+        entry = uv["files"][target]
+        lines += [
+            f"        {target})",
+            f'            UV_PIN_URL="{entry["url"]}"',
+            f'            UV_PIN_SHA256="{entry["sha256"]}"',
+            "            ;;",
+        ]
+    lines += [
+        "        *)",
+        '            UV_PIN_URL=""',
+        '            UV_PIN_SHA256=""',
+        "            return 1",
+        "            ;;",
+        "    esac",
+        "}",
+        END_MARK,
+    ]
+    return "\n".join(lines)
+
+
+def _ps1_fragment(uv: dict) -> str:
+    lines = [
+        BEGIN_MARK,
+        "# Derived from installation/runtime-pins.json. DO NOT EDIT BY HAND:",
+        "# run scripts/gen-uv-bootstrap-pins.py after a pin bump.",
+        f'$script:UvPinVersion = "{uv["version"]}"',
+        "$script:UvPinFiles = @{",
+    ]
+    for target in _WINDOWS_TARGETS:
+        entry = uv["files"][target]
+        lines += [
+            f'    "{target}" = @{{',
+            f'        Url    = "{entry["url"]}"',
+            f'        Sha256 = "{entry["sha256"]}"',
+            "    }",
+        ]
+    lines += [
+        "}",
+        END_MARK,
+    ]
+    return "\n".join(lines)
+
+
+def _splice(path: Path, fragment: str, check: bool) -> bool:
+    """Replace the marked block in *path*. Returns True when up to date."""
+    text = path.read_text(encoding="utf-8")
+    begin = text.index(BEGIN_MARK)  # ValueError on missing marker is the point
+    end = text.index(END_MARK) + len(END_MARK)
+    updated = text[:begin] + fragment + text[end:]
+    if updated == text:
+        return True
+    if not check:
+        path.write_text(updated, encoding="utf-8")
+    return False
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 when the committed fragments drift from the pin table",
+    )
+    args = parser.parse_args()
+
+    uv = _load_uv_pin()
+    results = {
+        "scripts/install.sh": _splice(
+            REPO_ROOT / "scripts" / "install.sh", _sh_fragment(uv), args.check
+        ),
+        "scripts/install.ps1": _splice(
+            REPO_ROOT / "scripts" / "install.ps1", _ps1_fragment(uv), args.check
+        ),
+    }
+    stale = [name for name, fresh in results.items() if not fresh]
+    if args.check and stale:
+        print(
+            "uv bootstrap pin fragments drifted from installation/runtime-pins.json "
+            f"in: {', '.join(stale)}\nrun: python3 scripts/gen-uv-bootstrap-pins.py",
+            file=sys.stderr,
+        )
+        return 1
+    for name in stale:
+        print(f"updated {name}")
+    if not stale:
+        print("fragments up to date")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
