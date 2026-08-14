@@ -1115,3 +1115,35 @@ def partial_update_hint(exc: BaseException) -> list[str]:
         "    hermes update",
         "If that also fails, reinstall: https://hermes-agent.nousresearch.com",
     ]
+
+
+# ─── compat surface for updaters that are already in the wild ───────────
+#
+# `hermes update` runs in the PRE-update process against the POST-update
+# files: every lazy import it performs after the tree swap reads the new
+# tree. A name an old updater imports there cannot be deleted without
+# breaking that update, mid-flight, on a half-new checkout.
+#
+# `scripts/audit-old-updater-imports.py` derives the full list from every
+# shipped commit, and `tests/test_old_updater_compat_surface.py` fails if
+# one of these disappears. Do not delete anything below without checking
+# that no released updater still imports it.
+
+
+def with_hermes_node_path(env: "dict[str, str] | None" = None) -> "dict[str, str]":
+    """Return *env* with the managed runtime dirs prepended to PATH.
+
+    COMPAT ONLY. Current code calls
+    ``installation.env.with_managed_runtimes`` directly; this name stays
+    because 48 shipped versions of ``hermes update`` import it lazily
+    while updating (``update_cmd`` uses it for the NixOS build env and
+    the Node dependency step), so deleting it breaks those updates at
+    the moment the tree is half-replaced.
+
+    It now forwards to the runtime registry rather than keeping its own
+    copy of the PATH rules: the old body walked a hardcoded
+    ``$HERMES_HOME/node`` layout that no longer exists.
+    """
+    from installation.env import with_managed_runtimes
+
+    return with_managed_runtimes(env)
