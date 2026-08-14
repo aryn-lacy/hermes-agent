@@ -753,3 +753,35 @@ class TestInstallRootAndRuntimeDir:
         # ...and changing HERMES_HOME alone must not move it.
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-home"))
         assert hermes_constants.get_runtime_dir() == runtime
+
+class TestNodeTargetMajorFollowsThePins:
+    """The pinned Node major is read from the pin table, not guessed.
+
+    This function has a bare ``except`` around the pin read, so any error
+    inside it degrades to the historical fallback instead of raising. That
+    is deliberate — a broken pin file must not crash a resolver — but it
+    also means a typo in here is INVISIBLE: the managed-Node upgrade check
+    silently compares against the wrong major and existing trees stop
+    healing. Assert against the pin file so the fallback cannot pass for
+    the real answer.
+    """
+
+    def _pinned_major(self) -> int:
+        import json
+        from pathlib import Path
+
+        pins = json.loads(
+            (Path(hermes_constants.__file__).resolve().parent / "runtime-pins.json")
+            .read_text(encoding="utf-8")
+        )
+        return int(str(pins["tools"]["node"]["version"]).lstrip("v").split(".")[0])
+
+    def test_it_returns_the_pinned_major(self):
+        assert hermes_constants._node_target_major() == self._pinned_major()
+
+    def test_it_is_not_the_silent_fallback(self):
+        """Guards the specific regression: a dangling import returned 22."""
+        pinned = self._pinned_major()
+        if pinned == 22:
+            pytest.skip("pins are at the fallback value; this cannot discriminate")
+        assert hermes_constants._node_target_major() != 22

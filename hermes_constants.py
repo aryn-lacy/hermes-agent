@@ -421,22 +421,24 @@ def _node_target_major() -> int:
 
     One source of truth: the pin file the provisioner installs from. The
     constant this replaced said 22 while the pins said 26 — exactly the
-    drift a second source invites. HERMES_NODE_TARGET_MAJOR still wins for
-    ad-hoc overrides; a broken/absent pin file falls back to the historical
-    floor rather than crashing a resolver.
+    drift a second source invites. A broken/absent pin file falls back to
+    the historical floor rather than crashing a resolver.
+
+    Pins are EXACT versions (the range grammar is gone), so the major is
+    the first component. Reading it through a range parser is what made
+    this silently return the fallback: that parser no longer exists, the
+    ImportError was swallowed here, and the drift this function was
+    written to prevent came back.
     """
-    override = os.environ.get("HERMES_NODE_TARGET_MAJOR", "").strip()
-    if override:
-        return int(override)
     try:
-        from hermes_cli.runtime_registry import load_pins, parse_spec
+        from hermes_cli.runtime_registry import load_pins
 
         # Pins ship WITH the code, so they are read relative to this module
         # — not from get_install_root(), which callers can point elsewhere
         # (desktop resourcesPath, tests) and which would then silently lose
         # the pin file and fall back.
         pins = load_pins(Path(__file__).resolve().parent)
-        return parse_spec(pins["node"]["version"]).floor[0]
+        return int(str(pins["node"]["version"]).lstrip("v").split(".")[0])
     except Exception:
         return 22
 

@@ -43,7 +43,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from hermes_constants import get_runtime_dir
+# hermes_constants is imported lazily, inside the two functions that need it.
+# The pin/fact tables are the bottom of the runtime layer — the provisioner
+# imports THIS module before a venv exists — and hermes_constants imports
+# back into here for the pinned Node major. A module-level import either way
+# makes that a real cycle instead of a deferred one.
+
+
+def _default_runtime_dir() -> Path:
+    from hermes_constants import get_runtime_dir
+
+    return get_runtime_dir()
 
 PINS_FILENAME = "runtime-pins.json"
 FACTS_FILENAME = "runtimes.json"
@@ -345,7 +355,7 @@ class RuntimeFact:
 
 
 def facts_path(runtime_dir: Path | None = None) -> Path:
-    base = runtime_dir if runtime_dir is not None else get_runtime_dir()
+    base = runtime_dir if runtime_dir is not None else _default_runtime_dir()
     return base / FACTS_FILENAME
 
 
@@ -447,7 +457,7 @@ def tool_path(name: str, runtime_dir: Path | None = None) -> Optional[Path]:
     """Absolute path to a managed tool's binary, or None when not
     provisioned (or recorded but vanished — treat as unprovisioned; the
     provisioner heals on next update)."""
-    base = runtime_dir if runtime_dir is not None else get_runtime_dir()
+    base = runtime_dir if runtime_dir is not None else _default_runtime_dir()
     fact = load_facts(base).get(name)
     if fact is None:
         return None
