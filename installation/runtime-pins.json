@@ -45,6 +45,7 @@
     },
     "uv": {
       "version": "0.12.3",
+      "python": "3.11.15",
       "files": {
         "darwin-arm64": {
           "url": "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-aarch64-apple-darwin.tar.gz",

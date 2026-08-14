@@ -196,6 +196,23 @@ def load_pins(install_root: Path | None = None) -> dict[str, dict]:
         optional = entry.get("optional", False)
         if not isinstance(optional, bool):
             raise ValueError(f"{path}: tool {name!r} 'optional' must be true or false")
+        python = entry.get("python")
+        if python is not None:
+            # Decision 3: the interpreter pin rides the uv entry
+            # (extends-style — uv is what installs it). Exact X.Y.Z, no
+            # sha256 of our own: uv's python-build-standalone pins carry
+            # their checksums, and duplicating them here would drift.
+            if name != "uv":
+                raise ValueError(
+                    f"{path}: tool {name!r} carries a 'python' pin; only 'uv' "
+                    f"may (uv is the installer the pin configures)"
+                )
+            if not isinstance(python, str) or len(python.split(".")) != 3 or not all(
+                part.isdigit() for part in python.split(".")
+            ):
+                raise ValueError(
+                    f"{path}: python pin must be exact X.Y.Z, got {python!r}"
+                )
         for dep in extends:
             if dep not in tools:
                 raise ValueError(
@@ -231,6 +248,22 @@ def load_pins(install_root: Path | None = None) -> dict[str, dict]:
 
 def _extends(tool: str, pins: dict[str, dict]) -> list[str]:
     return list(pins.get(tool, {}).get("extends", []))
+
+
+def pinned_python(install_root: Path | None = None) -> Optional[str]:
+    """The exact interpreter version this install standardizes on.
+
+    Rides the uv pin entry (decision 3): uv is what installs it, via
+    ``uv python install`` with ``UV_PYTHON_INSTALL_DIR`` pointed at the
+    managed runtime dir. None when the table predates the pin — callers
+    fall back to their historical version literals.
+
+    Staleness for the interpreter is a VERSION probe, not a digest:
+    uv's python-build-standalone pins carry their own checksums.
+    """
+    pins = load_pins(install_root)
+    python = pins.get("uv", {}).get("python")
+    return python if isinstance(python, str) else None
 
 
 def is_optional(tool: str, pins: dict[str, dict]) -> bool:

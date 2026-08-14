@@ -61,6 +61,7 @@ echo ""
 # run scripts/gen-bootstrap-pins.py after a pin bump.
 UV_PIN_VERSION="0.12.3"
 GIT_PIN_VERSION="2.53.0"
+PYTHON_PIN_VERSION="3.11.15"
 
 # Sets UV_PIN_URL + UV_PIN_SHA256 for a <os>-<arch> target key.
 uv_bootstrap_pin() {
@@ -203,7 +204,7 @@ MARKER
     # ========================================================================
     if [ ! -d venv ]; then
         log_info "Creating venv..."
-        "$UV_CMD" venv venv --python 3.11 >/dev/null
+        "$UV_CMD" venv venv --python "$PYTHON_PIN_VERSION" >/dev/null
         log_success "venv created"
     fi
 

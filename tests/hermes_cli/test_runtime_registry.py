@@ -357,3 +357,87 @@ class TestRealPinTable:
             url = rr.load_pins()["git"]["files"][target]["url"]
             assert "PortableGit" in url
             assert "MinGit" not in url
+
+
+class TestPythonPin:
+    """Decision 3: the interpreter pin rides the uv entry."""
+
+    def test_the_real_table_pins_an_exact_python(self):
+        python = rr.pinned_python()
+        assert python is not None
+        assert len(python.split(".")) == 3
+
+    def test_the_pin_satisfies_requires_python(self):
+        """Engines-style lint, symmetric with the node check: a python
+        pin outside pyproject's requires-python window would install an
+        interpreter the project itself refuses to run on."""
+        import re
+        import tomllib
+        from pathlib import Path
+
+        pyproject = tomllib.loads(
+            (Path(rr.__file__).resolve().parents[1] / "pyproject.toml").read_text()
+        )
+        spec = pyproject["project"]["requires-python"]
+        python = rr.pinned_python()
+        assert python is not None
+        pinned = tuple(int(p) for p in python.split("."))
+
+        for clause in (c.strip() for c in spec.split(",")):
+            m = re.fullmatch(r"(>=|<=|<|>|==)\s*(\d+(?:\.\d+)*)", clause)
+            assert m, f"unhandled requires-python clause {clause!r}"
+            op, bound_s = m.groups()
+            bound = tuple(int(p) for p in bound_s.split("."))
+            key = pinned[: len(bound)]
+            satisfied = {
+                ">=": key >= bound,
+                "<=": key <= bound,
+                "<": key < bound,
+                ">": key > bound,
+                "==": key == bound,
+            }[op]
+            assert satisfied, (
+                f"python pin {python} violates requires-python clause "
+                f"{clause!r} — the pinned interpreter could not run the code"
+            )
+
+    def test_only_uv_may_carry_the_python_pin(self, tmp_path):
+        bad = {
+            "schemaVersion": rr.PINS_SCHEMA_VERSION,
+            "tools": {
+                "node": {
+                    "version": "1.0.0",
+                    "python": "3.11.15",
+                    "files": {"any": {
+                        "url": "https://example.com/x.tar.gz",
+                        "sha256": "0" * 64,
+                    }},
+                },
+            },
+        }
+        (tmp_path / rr.PINS_FILENAME).write_text(json.dumps(bad))
+
+        with pytest.raises(ValueError, match="only 'uv' may"):
+            rr.load_pins(tmp_path)
+
+    def test_a_range_python_pin_is_rejected(self, tmp_path):
+        """Strict exact X.Y.Z: a range would reintroduce the drift the
+        pin exists to end (two installs resolving 3.11 to different
+        patch releases)."""
+        bad = {
+            "schemaVersion": rr.PINS_SCHEMA_VERSION,
+            "tools": {
+                "uv": {
+                    "version": "0.12.3",
+                    "python": "3.11",
+                    "files": {"any": {
+                        "url": "https://example.com/x.tar.gz",
+                        "sha256": "0" * 64,
+                    }},
+                },
+            },
+        }
+        (tmp_path / rr.PINS_FILENAME).write_text(json.dumps(bad))
+
+        with pytest.raises(ValueError, match="exact X.Y.Z"):
+            rr.load_pins(tmp_path)

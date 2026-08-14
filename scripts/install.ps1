@@ -653,6 +653,7 @@ function Write-BrowserEnv {
 # Derived from installation/runtime-pins.json. DO NOT EDIT BY HAND:
 # run scripts/gen-bootstrap-pins.py after a pin bump.
 $script:UvPinVersion = "0.12.3"
+$script:PythonPinVersion = "3.11.15"
 $script:UvPinFiles = @{
     "win32-x64" = @{
         Url    = "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-pc-windows-msvc.zip"
@@ -904,8 +905,14 @@ function Resolve-AvailablePythonVersion {
 }
 
 function Test-Python {
+    # Decision 3: the exact interpreter comes from the generated pin
+    # fragment, unconditionally. The fragment is generated from the same
+    # commit's pin table (gen-bootstrap-pins.py fails if the python pin
+    # is absent), so there is no "script without a pin" state to fall
+    # back from.
+    $PythonVersion = $script:PythonPinVersion
     Write-Info "Checking Python $PythonVersion..."
-    
+
     # Let uv find or install Python
     try {
         $pythonPath = & $UvCmd python find $PythonVersion 2>$null
