@@ -402,7 +402,6 @@ def _provision_one(
     rt: Path,
     facts: dict[str, RuntimeFact],
     target: str,
-    verify_runs: bool = True,
     path_order: list[str] | None = None,
 ) -> ToolResult:
     """Bring ONE tool to the pinned state. Never raises."""
@@ -433,9 +432,7 @@ def _provision_one(
 
         # Verify by RUNNING it, not by trusting the archive: a cross-arch
         # or half-extracted binary fails here rather than at first use.
-        # Skipped when staging FOR another target, where the binary
-        # cannot run on this host by definition.
-        if verify_runs and _probe_version(binary, env=_probe_env(entry, rt)) is None:
+        if _probe_version(binary, env=_probe_env(entry, rt)) is None:
             return ToolResult(tool, "failed", detail="provisioned binary does not run")
 
         facts[tool] = RuntimeFact(
@@ -452,7 +449,6 @@ def provision_tool(
     tool: str,
     runtime_dir: Path | None = None,
     install_root: Path | None = None,
-    target: str | None = None,
 ) -> ToolResult:
     """Provision a single pinned tool.
 
@@ -470,7 +466,7 @@ def provision_tool(
         entry,
         rt,
         load_facts(rt),
-        target or current_target(),
+        current_target(),
         path_order=path_order(pins),
     )
 
@@ -479,7 +475,6 @@ def provision_runtimes(
     runtime_dir: Path | None = None,
     install_root: Path | None = None,
     emit: Callable[[dict], None] | None = None,
-    target: str | None = None,
     only: list[str] | None = None,
 ) -> list[ToolResult]:
     """Bring every pinned tool to its pinned version.
@@ -491,14 +486,13 @@ def provision_runtimes(
     that extends another is staged after it — npm is unpacked by running
     the node it extends, which has to exist first.
 
-    When *target* names a platform other than this host, the staged
-    binaries cannot be executed here, so the run-the-binary check is
-    skipped. That is the desktop cross-build path.
+    Provisioning is always for THIS host. A tool is never recorded until
+    the staged binary has answered a version probe here, so a pin that
+    downloads but cannot run is a failure rather than a fact.
     """
     rt = runtime_dir if runtime_dir is not None else get_runtime_dir()
     rt.mkdir(parents=True, exist_ok=True)
-    host = current_target()
-    resolved_target = target or host
+    target = current_target()
     pins = load_pins(install_root)
     facts = load_facts(rt)
     results: list[ToolResult] = []
@@ -512,8 +506,7 @@ def provision_runtimes(
             pins[tool],
             rt,
             facts,
-            resolved_target,
-            verify_runs=resolved_target == host,
+            target,
             path_order=order,
         )
         results.append(result)
@@ -534,7 +527,6 @@ def provision_runtimes(
 def stale_tools(
     runtime_dir: Path | None = None,
     install_root: Path | None = None,
-    target: str | None = None,
 ) -> dict[str, tuple[str, Optional[str]]]:
     """Pinned tools whose installed state does not match the pin table.
 
@@ -544,14 +536,14 @@ def stale_tools(
     make it an equality check, not a range check.
     """
     rt = runtime_dir if runtime_dir is not None else get_runtime_dir()
-    resolved_target = target or current_target()
+    target = current_target()
     facts = load_facts(rt)
     drift: dict[str, tuple[str, Optional[str]]] = {}
 
     for tool, entry in load_pins(install_root).items():
         fact = facts.get(tool)
         installed = fact.version if fact is not None else None
-        if fact is not None and not (rt / _binary_rel(tool, resolved_target)).is_file():
+        if fact is not None and not (rt / _binary_rel(tool, target)).is_file():
             # Recorded but vanished reads as unprovisioned everywhere
             # else; say so here too rather than reporting it as current.
             installed = None
@@ -636,14 +628,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--target",
-        help="Pin target to provision, e.g. darwin-arm64 (default: this host). "
-        "Cross-target staging skips the run-the-binary check.",
+        help="Assert this host IS this pin target, e.g. darwin-arm64. "
+        "Provisioning is always for this host; the flag lets a caller "
+        "state the target it believes it is on instead of inferring it. "
+        "A mismatch exits 2.",
     )
     parser.add_argument(
         "--only", action="append", help="Provision just this tool (repeatable)."
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON lines.")
     ns = parser.parse_args(argv)
+
+    # An asserted target that is not this host means the caller is wrong about
+    # the machine it is on. Staging pins for another platform would write
+    # binaries that cannot be probed here, so refuse rather than record facts
+    # no one verified.
+    host = current_target()
+    if ns.target and ns.target != host:
+        print(
+            f"runtime_provisioner: --target {ns.target} is not this host ({host})",
+            file=sys.stderr,
+        )
+        return 2
 
     def emit(event: dict) -> None:
         if ns.json:
@@ -654,7 +660,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {event['tool']}: {event['action']}{version}{detail}", flush=True)
 
     results = provision_runtimes(
-        runtime_dir=ns.runtime_dir, emit=emit, target=ns.target, only=ns.only
+        runtime_dir=ns.runtime_dir, emit=emit, only=ns.only
     )
     return 0 if all(r.ok for r in results) else 1
 

@@ -587,3 +587,36 @@ class TestExtendsOrdering:
 
         assert results == {"node": "failed", "npm": "failed"}
         assert rr.load_facts(rt) == {}
+
+
+class TestTargetIsAnAssertionNotAChoice:
+    """``--target`` states the host; it never selects a different one.
+
+    Provisioning stages binaries and then RUNS them to record a fact. A
+    target other than this host could not be probed here, so the flag
+    refuses instead of writing facts nobody verified.
+    """
+
+    def test_a_matching_target_is_accepted(self, tmp_path, monkeypatch):
+        rt = tmp_path / "rt"
+        # No pins to fetch: this asserts the gate lets the host through,
+        # not that provisioning succeeds.
+        monkeypatch.setattr(rp, "load_pins", lambda install_root=None: {})
+        code = rp.main(["--runtime-dir", str(rt), "--target", rr.current_target()])
+        assert code == 0
+
+    def test_a_mismatched_target_exits_2(self, tmp_path, capsys):
+        rt = tmp_path / "rt"
+        wrong = "sunos-vax" if rr.current_target() != "sunos-vax" else "linux-x64"
+        code = rp.main(["--runtime-dir", str(rt), "--target", wrong])
+        assert code == 2
+        assert wrong in capsys.readouterr().err
+
+    def test_the_gate_runs_before_any_download(self, tmp_path, monkeypatch):
+        """A refused target must not touch the network or the disk."""
+        called = []
+        monkeypatch.setattr(rp, "load_pins", lambda install_root=None: called.append("pins") or {})
+        rt = tmp_path / "rt"
+        assert rp.main(["--runtime-dir", str(rt), "--target", "sunos-vax"]) == 2
+        assert called == []
+        assert not rt.exists()
