@@ -336,13 +336,58 @@ class TestTheStoreIsShared:
             runtime_dir=tmp_path / "install-b", install_root=pins, store_dir=store
         )
 
-        assert [r.action for r in second] == ["downloaded"]  # recorded, not fetched
+        assert [r.action for r in second] == ["adopted"]  # fact written, no fetch
         # One copy of the bytes, two facts files naming it.
         assert len(list(store.glob("gh-*"))) == 1
         for install in ("install-a", "install-b"):
             facts = rr.load_facts(tmp_path / install)
             assert facts["gh"].path == f"gh-2.97.0-{target}/bin/gh"
             assert (store / facts["gh"].path).is_file()
+
+    def test_an_installer_published_entry_is_adopted_not_refetched(
+        self, served, tmp_path, target, monkeypatch
+    ):
+        """The install.sh/install.ps1 handshake, frozen.
+
+        The installers stage the bootstrap git into the store BEFORE the
+        repo exists, speaking the store's protocol by hand: entry named
+        <tool>-<version>-<target>, marker file inside, staged-then-moved.
+        The provisioner must treat such an entry exactly like one of its
+        own — adopt it, write the fact, download nothing — or every fresh
+        install fetches its first tool twice.
+        """
+        pins = self._gh_pins(served, tmp_path, target, name="gh-boot.tar.gz")
+        store = tmp_path / "store"
+
+        # Publish the way the installers do: bytes + marker, no facts.
+        entry = store / f"gh-2.97.0-{target}"
+        (entry / "bin").mkdir(parents=True)
+        (entry / "bin" / "gh").write_bytes(_script())
+        (entry / "bin" / "gh").chmod(0o755)
+        (entry / rp.ENTRY_MARKER_NAME).write_text(
+            json.dumps(
+                {
+                    "tool": "gh",
+                    "version": "2.97.0",
+                    "target": target,
+                    "sha256": "0" * 64,  # installers record the archive digest
+                    "publishedAt": "2026-08-14T00:00:00+00:00",
+                }
+            )
+        )
+
+        def no_downloads(*args, **kwargs):
+            raise AssertionError("an installer-published entry must be adopted")
+
+        monkeypatch.setattr(rp, "_download", no_downloads)
+
+        results = rp.provision_runtimes(
+            runtime_dir=tmp_path / "install", install_root=pins, store_dir=store
+        )
+
+        assert [(r.action, r.version) for r in results] == [("adopted", "2.97.0")]
+        facts = rr.load_facts(tmp_path / "install")
+        assert facts["gh"].path == f"gh-2.97.0-{target}/bin/gh"
 
     def test_facts_stay_per_install(self, served, tmp_path, target):
         """One install recording a tool must not make it appear in
@@ -459,7 +504,7 @@ class TestTheStoreIsShared:
             runtime_dir=tmp_path / "install-b", install_root=pins, store_dir=store
         )
 
-        assert [r.action for r in results] == ["downloaded"]
+        assert [r.action for r in results] == ["adopted"]
         assert rr.load_facts(tmp_path / "install-b")["gh"].version == "2.97.0"
 
     def test_staging_dirs_do_not_survive_a_successful_publish(

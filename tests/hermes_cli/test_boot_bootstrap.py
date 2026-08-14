@@ -81,6 +81,31 @@ def test_read_git_head_worktree_gitfile(repo, tmp_path):
     assert read_git_head(wt) == _head_sha(wt)
 
 
+def test_read_git_head_reftable(tmp_path):
+    """The repo format that killed the hand-rolled parser.
+
+    A reftable repo stores refs in neither loose files nor packed-refs,
+    and its HEAD is a decoy (``ref: refs/heads/.invalid``) kept only so
+    pre-reftable tools fail loudly instead of misreading. The old file
+    parser returned None on every such repo; asking git answers. If git
+    here is too old for reftable, there is nothing to test.
+    """
+    root = tmp_path / "rt"
+    root.mkdir()
+    try:
+        _git(["init", "--ref-format=reftable", "-b", "main", "."], root)
+    except subprocess.CalledProcessError:
+        pytest.skip("git too old for --ref-format=reftable")
+    (root / "f.txt").write_text("1", encoding="utf-8")
+    _git(["add", "."], root)
+    _git(["commit", "-m", "one"], root)
+
+    head = (root / ".git" / "HEAD").read_text(encoding="utf-8")
+    assert ".invalid" in head, "reftable decoy HEAD is the point of this test"
+
+    assert read_git_head(root) == _head_sha(root)
+
+
 def test_read_git_head_missing_and_garbage(tmp_path):
     assert read_git_head(tmp_path) is None
     (tmp_path / ".git").write_text("not a gitdir pointer", encoding="utf-8")

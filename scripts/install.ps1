@@ -1118,10 +1118,13 @@ function Install-Git {
     package manager):
       1. Existing ``git`` on PATH -- use it as-is (the common fast path).
       2. Download **PortableGit** from the official git-for-windows GitHub
-         release (self-extracting 7z.exe) and unpack it to
-         ``%LOCALAPPDATA%\hermes\git`` -- never touches system Git, never
-         requires admin, works even on locked-down machines and machines
-         with a broken system Git install.
+         release (self-extracting 7z.exe) and publish it into the Hermes
+         tool store (``%LOCALAPPDATA%\hermes\tools\git-<ver>-<target>``,
+         the provisioner's own layout, marker file and all) -- never
+         touches system Git, never requires admin, works even on
+         locked-down machines and machines with a broken system Git
+         install. The provisioner later finds the marker and reuses the
+         entry instead of downloading the same bytes a second time.
 
     **Why PortableGit, not MinGit:**  MinGit is the minimal-automation
     distribution and ships ONLY ``git.exe`` -- no bash, no POSIX utilities.
@@ -1133,8 +1136,9 @@ function Install-Git {
     We deliberately skip winget because it fails badly when the system Git
     install is in a half-installed state (partially registered, or uninstall-
     blocked).  Owning the Hermes copy of Git ourselves is predictable and
-    recoverable: if it ever breaks, ``Remove-Item %LOCALAPPDATA%\hermes\git``
-    and re-running this installer fully recovers.
+    recoverable: if it ever breaks, delete its store entry under
+    ``%LOCALAPPDATA%\hermes\tools`` and re-running this installer fully
+    recovers.
 
     After install we locate ``bash.exe`` and persist the path in
     ``HERMES_GIT_BASH_PATH`` (User scope) so Hermes can find it in a fresh
@@ -1167,21 +1171,19 @@ function Install-Git {
         Write-Info "Trying a Hermes-managed PortableGit install instead..."
     }
 
-    # Download PortableGit into $HermesHome\git.  Always works as long as
-    # we can reach github.com -- no admin, no winget, no reliance on the
-    # user's possibly-broken system Git install.
+    # Download PortableGit into the machine-wide tool store -- the SAME
+    # entry the provisioner publishes (`installation/paths.py
+    # get_tool_store`, `provisioner.py _publish`): one directory per
+    # <tool>-<version>-<target>, a marker file inside, staged next to its
+    # final name and moved in with one rename.
     #
     # This is the BOOTSTRAP git: it must exist before the repo is cloned,
     # so it cannot come from the provisioner (which lives in the repo).
-    # It lands in the legacy $HermesHome location on purpose: `git clone`
-    # refuses a non-empty target, so git cannot be staged into the install
-    # dir's own .hermes-runtime\git before the clone that creates it.
-    # Invoke-RuntimeProvisioning stages the managed copy separately; both
-    # come from the same pinned URL and digest below, so they are at least
-    # the same VERSION even though the bytes are fetched twice. Collapsing
-    # that second fetch needs the clone itself reworked (init + fetch into
-    # an existing dir), which is its own change.
-    Write-Info "Git not found -- downloading PortableGit to $HermesHome\git\ ..."
+    # Speaking the store's own protocol is what retires the old double
+    # fetch: the provisioner finds the marker, verifies the tuple, and
+    # `kept`-fast-paths it instead of downloading the same bytes again
+    # into a second location.
+    Write-Info "Git not found -- staging PortableGit into the Hermes tool store..."
     Write-Info "(no admin rights required; isolated from any system Git install)"
 
     try {
@@ -1205,45 +1207,114 @@ function Install-Git {
         $downloadUrl = $gitPin.Url
         $assetName = Split-Path $downloadUrl -Leaf
         $tmpFile = "$env:TEMP\$assetName"
-        $gitDir = "$HermesHome\git"
 
-        Write-Info "Downloading $assetName (Git for Windows $script:GitPinVersion)..."
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -UseBasicParsing
+        # The store entry, spelled exactly the way the provisioner spells
+        # it (registry.store_entry_name): <tool>-<version>-<target>.
+        # $HermesHome may be a profile home; the store is machine-wide by
+        # definition, so anchor it at the base home the way
+        # installation.paths.get_tool_store does.
+        $storeRoot = if ($HermesHome -match '\\profiles\\[^\\]+$') {
+            Split-Path (Split-Path $HermesHome -Parent) -Parent
+        } else { $HermesHome }
+        $storeDir = Join-Path $storeRoot "tools"
+        $entryName = "git-$($script:GitPinVersion)-$pinTarget"
+        $gitDir = Join-Path $storeDir $entryName
+        $markerPath = Join-Path $gitDir ".hermes-store-entry.json"
 
-        # Verify BEFORE extracting: this artifact is a self-extracting
-        # executable, so an unverified download is arbitrary code that the
-        # next line runs. Same reason installation/provisioner.py checks the
-        # digest before handing the file to itself.
-        $actualHash = (Get-FileHash -Path $tmpFile -Algorithm SHA256).Hash.ToLower()
-        if ($actualHash -ne $gitPin.Sha256.ToLower()) {
+        # kept fast path, same rule as the provisioner: a marker whose
+        # tuple matches means this exact verified artifact is already
+        # published -- possibly by a previous install run, possibly by
+        # another Hermes install on this machine. Never re-download it,
+        # and NEVER rewrite it: another install may be running it now.
+        $alreadyPublished = $false
+        if (Test-Path $markerPath) {
+            try {
+                $marker = Get-Content $markerPath -Raw | ConvertFrom-Json
+                if ($marker.tool -eq "git" -and
+                    $marker.version -eq $script:GitPinVersion -and
+                    $marker.target -eq $pinTarget) {
+                    $alreadyPublished = $true
+                }
+            } catch {
+                $alreadyPublished = $false
+            }
+        }
+
+        if (-not $alreadyPublished) {
+            Write-Info "Downloading $assetName (Git for Windows $script:GitPinVersion)..."
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -UseBasicParsing
+
+            # Verify BEFORE extracting: this artifact is a self-extracting
+            # executable, so an unverified download is arbitrary code that the
+            # next line runs. Same reason installation/provisioner.py checks the
+            # digest before handing the file to itself.
+            $actualHash = (Get-FileHash -Path $tmpFile -Algorithm SHA256).Hash.ToLower()
+            if ($actualHash -ne $gitPin.Sha256.ToLower()) {
+                Remove-Item -Force $tmpFile -ErrorAction SilentlyContinue
+                throw "PortableGit digest mismatch: expected $($gitPin.Sha256), got $actualHash"
+            }
+
+            # Stage beside the final name, then one rename. The staging
+            # dir lives INSIDE the store because a rename across
+            # filesystems is a copy, not an atomic move -- same reason the
+            # provisioner's _publish stages in <store>/.staging-<uuid>.
+            $staging = Join-Path $storeDir ".staging-$([guid]::NewGuid().ToString('N'))"
+            New-Item -ItemType Directory -Path $staging -Force | Out-Null
+
+            # PortableGit is a self-extracting 7z archive.  Invoke it with
+            # `-o<target> -y` (silent) to extract.  No 7z install required;
+            # it's fully self-contained. Both pinned targets are .7z.exe,
+            # so there is no archive branch to choose between.
+            Write-Info "Extracting PortableGit..."
+            $extractProc = Start-Process -FilePath $tmpFile `
+                -ArgumentList "-o`"$staging`"", "-y" `
+                -NoNewWindow -Wait -PassThru
+            if ($extractProc.ExitCode -ne 0) {
+                Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
+                throw "PortableGit extraction failed (exit code $($extractProc.ExitCode))"
+            }
             Remove-Item -Force $tmpFile -ErrorAction SilentlyContinue
-            throw "PortableGit digest mismatch: expected $($gitPin.Sha256), got $actualHash"
-        }
 
-        if (Test-Path $gitDir) {
-            Write-Info "Removing previous Git install at $gitDir ..."
-            Remove-Item -Recurse -Force $gitDir
-        }
-        New-Item -ItemType Directory -Path $gitDir -Force | Out-Null
+            if (-not (Test-Path "$staging\cmd\git.exe")) {
+                Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
+                throw "Git extraction did not produce git.exe in the staged tree"
+            }
 
-        # PortableGit is a self-extracting 7z archive.  Invoke it with
-        # `-o<target> -y` (silent) to extract to $gitDir.  No 7z install
-        # required; it's fully self-contained. Both pinned targets are
-        # .7z.exe, so there is no archive branch to choose between.
-        Write-Info "Extracting PortableGit to $gitDir ..."
-        $extractProc = Start-Process -FilePath $tmpFile `
-            -ArgumentList "-o`"$gitDir`"", "-y" `
-            -NoNewWindow -Wait -PassThru
-        if ($extractProc.ExitCode -ne 0) {
-            throw "PortableGit extraction failed (exit code $($extractProc.ExitCode))"
+            # Marker BEFORE the rename, so it lands with the tree in one
+            # atomic step; an entry without a marker is junk from an
+            # interrupted run and the provisioner will replace it.
+            # WriteAllText, not Set-Content: PS 5.1's -Encoding UTF8 adds
+            # a BOM, and Python's json.loads refuses BOM'd input -- the
+            # provisioner would junk the entry and re-download.
+            $markerJson = @{
+                tool        = "git"
+                version     = $script:GitPinVersion
+                target      = $pinTarget
+                sha256      = $gitPin.Sha256.ToLower()
+                publishedAt = (Get-Date).ToUniversalTime().ToString("o")
+            } | ConvertTo-Json
+            [System.IO.File]::WriteAllText(
+                (Join-Path $staging ".hermes-store-entry.json"),
+                $markerJson,
+                (New-Object System.Text.UTF8Encoding $false)
+            )
+
+            try {
+                Move-Item -Path $staging -Destination $gitDir -ErrorAction Stop
+            } catch {
+                # Lost the publish race to a concurrent install run. The
+                # winner's bytes passed the same digest check; use theirs.
+                Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
+                if (-not (Test-Path "$gitDir\cmd\git.exe")) { throw }
+            }
+        } else {
+            Write-Info "PortableGit $script:GitPinVersion already in the tool store -- reusing it"
         }
-        Remove-Item -Force $tmpFile -ErrorAction SilentlyContinue
 
         # PortableGit layout: cmd\git.exe + bin\bash.exe + usr\bin\ (coreutils)
-        # MinGit layout:      cmd\git.exe + usr\bin\bash.exe (if present)
         $gitExe = "$gitDir\cmd\git.exe"
         if (-not (Test-Path $gitExe)) {
-            throw "Git extraction did not produce git.exe at $gitExe"
+            throw "Git store entry did not produce git.exe at $gitExe"
         }
 
         # Add to session PATH so the rest of this install run can use git.
@@ -1317,10 +1388,21 @@ function Set-GitBashEnvVar {
     # this with a system-Git-only installation anyway.
     #
     # Layouts:
-    #   PortableGit (what we install): $HermesHome\git\bin\bash.exe
+    #   Tool store (what we stage now): <store>\git-<ver>-<target>\bin\bash.exe
+    #   Legacy pre-store installs:      $HermesHome\git\bin\bash.exe
     #   A system Git for Windows may instead keep it under usr\bin.
-    $candidates += "$HermesHome\git\bin\bash.exe"       # PortableGit layout (primary)
-    $candidates += "$HermesHome\git\usr\bin\bash.exe"   # usr\bin fallback
+    $bashStoreRoot = if ($HermesHome -match '\\profiles\\[^\\]+$') {
+        Split-Path (Split-Path $HermesHome -Parent) -Parent
+    } else { $HermesHome }
+    $storeGitEntries = Get-ChildItem -Path (Join-Path $bashStoreRoot "tools") `
+        -Directory -Filter "git-*" -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending
+    foreach ($entry in $storeGitEntries) {
+        $candidates += "$($entry.FullName)\bin\bash.exe"
+        $candidates += "$($entry.FullName)\usr\bin\bash.exe"
+    }
+    $candidates += "$HermesHome\git\bin\bash.exe"       # legacy layout
+    $candidates += "$HermesHome\git\usr\bin\bash.exe"   # legacy usr\bin fallback
 
     # git.exe on PATH can tell us where the install root is
     $gitCmd = Get-Command git -ErrorAction SilentlyContinue

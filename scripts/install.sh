@@ -536,6 +536,7 @@ detect_os() {
 # Derived from installation/runtime-pins.json. DO NOT EDIT BY HAND:
 # run scripts/gen-bootstrap-pins.py after a pin bump.
 UV_PIN_VERSION="0.12.3"
+GIT_PIN_VERSION="2.53.0"
 
 # Sets UV_PIN_URL + UV_PIN_SHA256 for a <os>-<arch> target key.
 uv_bootstrap_pin() {
@@ -559,6 +560,33 @@ uv_bootstrap_pin() {
         *)
             UV_PIN_URL=""
             UV_PIN_SHA256=""
+            return 1
+            ;;
+    esac
+}
+
+# Sets GIT_PIN_URL + GIT_PIN_SHA256 for a <os>-<arch> target key.
+git_bootstrap_pin() {
+    case "$1" in
+        linux-x64)
+            GIT_PIN_URL="https://github.com/desktop/dugite-native/releases/download/v2.53.0-4/dugite-native-v2.53.0-4098283-ubuntu-x64.tar.gz"
+            GIT_PIN_SHA256="cca76aa31ad9e835e771ee7f55b73934777fbd8d16757a10d307ba06de860901"
+            ;;
+        linux-arm64)
+            GIT_PIN_URL="https://github.com/desktop/dugite-native/releases/download/v2.53.0-4/dugite-native-v2.53.0-4098283-ubuntu-arm64.tar.gz"
+            GIT_PIN_SHA256="a161f45af4626bb7e0c688854bd4a9aee47cc514bca404cff0a5e3536ef1c0af"
+            ;;
+        darwin-x64)
+            GIT_PIN_URL="https://github.com/desktop/dugite-native/releases/download/v2.53.0-4/dugite-native-v2.53.0-4098283-macOS-x64.tar.gz"
+            GIT_PIN_SHA256="ae6686718aa34f4140424db16b92a47dcffd6d1f312eb8b5f3b267f7404e2680"
+            ;;
+        darwin-arm64)
+            GIT_PIN_URL="https://github.com/desktop/dugite-native/releases/download/v2.53.0-4/dugite-native-v2.53.0-4098283-macOS-arm64.tar.gz"
+            GIT_PIN_SHA256="f9dc64635a5b62fbd7ad95db73268bbb8912255ac516d65d37bf7af22fcb8ffe"
+            ;;
+        *)
+            GIT_PIN_URL=""
+            GIT_PIN_SHA256=""
             return 1
             ;;
     esac
@@ -727,86 +755,31 @@ check_python() {
     fi
 }
 
-# Best-effort automatic git provisioning, mirroring install.ps1's Install-Git
-# (which downloads PortableGit on Windows). git is required to clone the repo,
-# and a fresh "normie" machine with no developer tools won't have it. Returns 0
-# if git is available afterwards, non-zero otherwise (caller prints manual
-# instructions and aborts).
-attempt_install_git() {
-    case "$OS" in
-        macos)
-            # Prefer Homebrew — fully headless when present.
-            if command -v brew >/dev/null 2>&1; then
-                log_info "Installing Git via Homebrew..."
-                brew install git >/dev/null 2>&1 || true
-                command -v git >/dev/null 2>&1 && return 0
-            fi
-            # Fall back to Apple Command Line Tools, which provide git AND the
-            # compiler some Python wheels need. `xcode-select --install` pops a
-            # system dialog (Apple gates CLT behind it — it cannot be fully
-            # silent without MDM), so we trigger it and poll for git to appear.
-            if command -v xcode-select >/dev/null 2>&1; then
-                log_info "Requesting Apple Command Line Tools (provides git + compiler)..."
-                log_info "If a macOS dialog appears, click \"Install\" and accept the license."
-                xcode-select --install >/dev/null 2>&1 || true
-                local waited=0
-                local timeout=900
-                while [ "$waited" -lt "$timeout" ]; do
-                    if command -v git >/dev/null 2>&1 && git --version >/dev/null 2>&1; then
-                        return 0
-                    fi
-                    sleep 5
-                    waited=$((waited + 5))
-                    if [ $((waited % 60)) -eq 0 ]; then
-                        log_info "Still waiting for Command Line Tools install ($((waited / 60))m)..."
-                    fi
-                done
-            fi
-            return 1
-            ;;
-        linux)
-            local sudo_cmd=""
-            if [ "$(id -u 2>/dev/null || echo 1000)" -ne 0 ]; then
-                command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
-            fi
-            case "$DISTRO" in
-                ubuntu|debian)
-                    log_info "Installing Git via apt..."
-                    $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
-                    $sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git >/dev/null 2>&1 || true
-                    ;;
-                fedora)
-                    log_info "Installing Git via dnf..."
-                    $sudo_cmd dnf install -y git >/dev/null 2>&1 || true
-                    ;;
-                arch)
-                    log_info "Installing Git via pacman..."
-                    $sudo_cmd pacman -S --noconfirm git >/dev/null 2>&1 || true
-                    ;;
-                *)
-                    return 1
-                    ;;
-            esac
-            command -v git >/dev/null 2>&1 && return 0
-            return 1
-            ;;
-    esac
-    return 1
-}
-
+# git is required to clone the repo, and a fresh "normie" machine with no
+# developer tools won't have it. System git wins when present; otherwise the
+# pinned dugite-native build goes into the machine-wide tool store — same
+# path install.ps1 takes with PortableGit, same entry the provisioner
+# publishes. No sudo, no package manager, no xcode-select dialog.
 check_git() {
     log_info "Checking Git..."
 
-    # On fresh macOS /usr/bin/git is a stub that exits non-zero until CLT is installed.
+    # A working system git is enough for the clone — decision 1
+    # (system-git-first): the provisioner later records it as a fact and
+    # the pinned dugite git only exists for boxes with none. On fresh
+    # macOS /usr/bin/git is the xcode-select shim: a stub that exits
+    # non-zero AND pops a system dialog if invoked carelessly, so the
+    # `git --version` probe below must be the only thing we run.
     if command -v git &> /dev/null && git --version &> /dev/null; then
         GIT_VERSION=$(git --version | awk '{print $3}')
         log_success "Git $GIT_VERSION found"
         return 0
     fi
 
-    log_error "Git not found"
+    log_info "Git not found -- staging the pinned build into the Hermes tool store..."
 
     if [ "$DISTRO" = "termux" ]; then
+        # Termux is its own lane (decision 5): dugite-native ships no
+        # Android build, so pkg is the only source of git here.
         log_info "Installing Git via pkg..."
         pkg install -y git >/dev/null
         if command -v git >/dev/null 2>&1; then
@@ -814,45 +787,134 @@ check_git() {
             log_success "Git $GIT_VERSION installed"
             return 0
         fi
+        log_error "Could not install git. Run: pkg install git"
+        exit 1
     fi
 
-    # Try to install it automatically before giving up (parity with install.ps1).
-    log_info "Attempting to install Git automatically..."
-    if attempt_install_git; then
-        GIT_VERSION=$(git --version | awk '{print $3}')
-        log_success "Git $GIT_VERSION installed"
+    if stage_pinned_git; then
+        GIT_VERSION=$("$GIT_CMD" --version | awk '{print $3}')
+        log_success "Git $GIT_VERSION staged (pinned, user-scoped)"
         return 0
     fi
 
-    log_warn "Could not install Git automatically. Please install it manually:"
-
+    log_error "Could not stage the pinned Git. Install git manually and re-run:"
     case "$OS" in
         linux)
-            case "$DISTRO" in
-                ubuntu|debian)
-                    log_info "  sudo apt update && sudo apt install git"
-                    ;;
-                fedora)
-                    log_info "  sudo dnf install git"
-                    ;;
-                arch)
-                    log_info "  sudo pacman -S git"
-                    ;;
-                *)
-                    log_info "  Use your package manager to install git"
-                    ;;
-            esac
-            ;;
-        android)
-            log_info "  pkg install git"
+            log_info "  Debian/Ubuntu: sudo apt-get install git"
+            log_info "  Fedora:        sudo dnf install git"
+            log_info "  Arch:          sudo pacman -S git"
             ;;
         macos)
-            log_info "  xcode-select --install"
-            log_info "  Or: brew install git"
+            log_info "  brew install git    (or xcode-select --install)"
             ;;
     esac
-
     exit 1
+}
+
+# Publish the pinned dugite-native git into the machine-wide tool store —
+# the SAME entry the provisioner would create (installation/paths.py
+# get_tool_store, provisioner.py _publish): <store>/git-<ver>-<target>/,
+# marker file inside, staged under the store and moved in with one mv.
+# The provisioner later finds the marker and `kept`-fast-paths it, so the
+# bytes are fetched exactly once per machine, not once per install.
+#
+# Sets GIT_CMD to the staged binary and prepends its bin/ to PATH for the
+# rest of this run (the clone is the very next network step).
+stage_pinned_git() {
+    local _target
+    if ! _target="$(uv_bootstrap_target)"; then
+        return 1
+    fi
+    git_bootstrap_pin "$_target" || return 1
+
+    # Machine-wide store root: the BASE home, never a profile home —
+    # mirror installation.paths.get_tool_store.
+    local _home_root="${HERMES_HOME:-$HOME/.hermes}"
+    case "$_home_root" in
+        */profiles/*) _home_root="${_home_root%/profiles/*}" ;;
+    esac
+    local _store="$_home_root/tools"
+    local _entry="$_store/git-$GIT_PIN_VERSION-$_target"
+    local _marker="$_entry/.hermes-store-entry.json"
+
+    # kept fast path: a marker with the right tuple means this exact
+    # verified artifact is already published (previous run, or another
+    # install on this machine). Never re-download, never rewrite — a
+    # published entry may be executing right now.
+    if [ -f "$_marker" ] && grep -q "\"version\": \"$GIT_PIN_VERSION\"" "$_marker" 2>/dev/null; then
+        log_info "Pinned git already in the tool store -- reusing it"
+        GIT_CMD="$_entry/bin/git"
+        export PATH="$_entry/bin:$PATH"
+        return 0
+    fi
+
+    local _tmp
+    _tmp="$(mktemp -d 2>/dev/null || echo "/tmp/hermes-git-bootstrap.$$")"
+    mkdir -p "$_tmp"
+
+    log_info "Downloading pinned git $GIT_PIN_VERSION..."
+    if ! curl -LsSf "$GIT_PIN_URL" -o "$_tmp/git.tar.gz"; then
+        log_error "Failed to download pinned git from $GIT_PIN_URL"
+        rm -rf "$_tmp"
+        return 1
+    fi
+
+    # Digest BEFORE extraction, same as every other pinned artifact.
+    local _digest
+    if command -v sha256sum >/dev/null 2>&1; then
+        _digest="$(sha256sum "$_tmp/git.tar.gz" | cut -d' ' -f1)"
+    else
+        _digest="$(shasum -a 256 "$_tmp/git.tar.gz" | cut -d' ' -f1)"
+    fi
+    if [ "$_digest" != "$GIT_PIN_SHA256" ]; then
+        log_error "git download digest mismatch (expected $GIT_PIN_SHA256, got $_digest)"
+        rm -rf "$_tmp"
+        return 1
+    fi
+
+    # Stage INSIDE the store (a cross-filesystem mv is a copy, not a
+    # rename), then one atomic publish. $$ + a timestamp is unique enough
+    # for a shell without uuidgen.
+    mkdir -p "$_store"
+    local _staging="$_store/.staging-$$-$(date +%s)"
+    mkdir -p "$_staging"
+    if ! tar -xzf "$_tmp/git.tar.gz" -C "$_staging"; then
+        log_error "Failed to extract git archive"
+        rm -rf "$_tmp" "$_staging"
+        return 1
+    fi
+    rm -rf "$_tmp"
+
+    if [ ! -x "$_staging/bin/git" ]; then
+        log_error "git binary not found inside the downloaded archive"
+        rm -rf "$_staging"
+        return 1
+    fi
+
+    # dugite ships Windows remote-helper DLLs in every build; dead weight
+    # on POSIX (~40MB), same trim the provisioner applies.
+    find "$_staging/libexec/git-core" -name "*.dll" -delete 2>/dev/null || true
+
+    # Marker BEFORE the publish so it travels with the tree atomically;
+    # an entry without a marker is junk the provisioner will replace.
+    cat > "$_staging/.hermes-store-entry.json" <<MARKER
+{"tool": "git", "version": "$GIT_PIN_VERSION", "target": "$_target", "sha256": "$GIT_PIN_SHA256", "publishedAt": "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"}
+MARKER
+
+    if ! mv "$_staging" "$_entry" 2>/dev/null; then
+        # Lost the race to a concurrent install: the winner's bytes
+        # passed the same digest check. Use theirs.
+        rm -rf "$_staging"
+        [ -x "$_entry/bin/git" ] || return 1
+    fi
+
+    GIT_CMD="$_entry/bin/git"
+    export PATH="$_entry/bin:$PATH"
+    if ! "$GIT_CMD" --version >/dev/null 2>&1; then
+        log_error "Staged git does not run on this host"
+        return 1
+    fi
+    return 0
 }
 
 provision_managed_runtimes() {

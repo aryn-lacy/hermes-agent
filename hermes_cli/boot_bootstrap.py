@@ -36,6 +36,8 @@ import hashlib
 import json
 import logging
 import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -51,62 +53,70 @@ LOCK_STALE_SECONDS = 600
 # ---------------------------------------------------------------------------
 
 def read_git_head(root: Path) -> str | None:
-    """The commit SHA of the checkout at ``root``, from files alone.
+    """The commit SHA of the checkout at ``root``.
 
-    Worktree-aware: ``.git`` may be a FILE containing ``gitdir: <path>``
-    (linked worktrees). Symbolic HEAD is dereferenced through the loose ref,
-    then ``packed-refs``. Returns None when anything is missing or garbled.
+    Asks git, rather than reimplementing it. The managed git comes first
+    (every install kind provisions one) and a PATH git second; with
+    neither, the answer is None and boot carries on — the same fail-open
+    the file parser had.
+
+    This used to parse ``.git`` by hand: the worktree gitfile, symbolic
+    HEAD, loose refs, ``commondir`` delegation and ``packed-refs``. That
+    was a reimplementation of ``git rev-parse HEAD`` maintained against
+    git's on-disk formats, and reftable (which stores refs in neither
+    loose files nor packed-refs) would have broken every line of it.
+
+    Cost: one ~10ms subprocess where the parse was ~2ms of file reads.
+    Only checkouts pay it — a sealed tree reads its stamp and never gets
+    here — and it happens once per boot.
+    """
+    git = _git_binary()
+    if git is None:
+        return None
+    try:
+        out = subprocess.run(
+            [git, "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    sha = out.stdout.strip()
+    return sha if len(sha) >= 7 else None
+
+
+def _git_binary() -> str | None:
+    """The git to run: managed first, PATH second, None when neither.
+
+    Managed-first because it is the one we pinned and verified. The
+    import is local: ``installation`` reaches the registry facts, and
+    boot_bootstrap is imported early enough that a module-level import
+    would widen the boot import graph for a function most boots skip.
+
+    The macOS xcode-select shim is not git — it is a stub whose only
+    behaviour is to pop an "install developer tools?" dialog, which a
+    boot-time path must never trigger.
     """
     try:
-        git_path = Path(root) / ".git"
-        if git_path.is_file():
-            pointer = git_path.read_text(encoding="utf-8", errors="replace").strip()
-            if not pointer.startswith("gitdir:"):
-                return None
-            git_dir = Path(pointer[len("gitdir:"):].strip())
-            if not git_dir.is_absolute():
-                git_dir = (Path(root) / git_dir).resolve()
-        elif git_path.is_dir():
-            git_dir = git_path
-        else:
-            return None
+        from installation.env import is_macos_xcode_shim, managed_tool_binary
 
-        head = (git_dir / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
-        if not head.startswith("ref:"):
-            # Detached HEAD: the line is the SHA itself.
-            return head if len(head) >= 7 else None
+        managed = managed_tool_binary("git")
+        if managed is not None:
+            return str(managed)
+    except Exception as exc:  # noqa: BLE001 — boot must not die on a lookup
+        logger.debug("managed git lookup failed: %s", exc)
+        is_macos_xcode_shim = None  # type: ignore[assignment]
 
-        ref = head[len("ref:"):].strip()
-
-        # Worktree gitdirs delegate shared refs to the parent repo via
-        # ``commondir`` (usually "../.."). HEAD itself stays per-worktree,
-        # but branch refs and packed-refs live in the common dir.
-        common = git_dir
-        commondir_file = git_dir / "commondir"
-        if commondir_file.is_file():
-            common_pointer = commondir_file.read_text(encoding="utf-8", errors="replace").strip()
-            common = (git_dir / common_pointer).resolve()
-
-        for base in (git_dir, common):
-            loose = base / ref
-            if loose.is_file():
-                sha = loose.read_text(encoding="utf-8", errors="replace").strip()
-                return sha if len(sha) >= 7 else None
-
-        for base in (common, git_dir):
-            packed = base / "packed-refs"
-            if not packed.is_file():
-                continue
-            for line in packed.read_text(encoding="utf-8", errors="replace").splitlines():
-                line = line.strip()
-                if not line or line.startswith(("#", "^")):
-                    continue
-                parts = line.split(" ", 1)
-                if len(parts) == 2 and parts[1] == ref:
-                    return parts[0]
+    found = shutil.which("git")
+    if found is None:
         return None
-    except OSError:
+    if is_macos_xcode_shim is not None and is_macos_xcode_shim(found):
         return None
+    return found
 
 
 def current_install_identity(project_root: Path) -> str | None:

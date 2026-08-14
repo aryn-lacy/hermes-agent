@@ -240,7 +240,7 @@ def _probe_env(
 @dataclass
 class ToolResult:
     tool: str
-    action: str  # kept | downloaded | failed
+    action: str  # kept | adopted | downloaded | failed
     version: Optional[str] = None
     detail: Optional[str] = None
 
@@ -614,8 +614,16 @@ def _provision_one(
     except KeyError as exc:
         return ToolResult(tool, "failed", detail=str(exc))
 
+    # When the store already holds the published entry, this run only
+    # writes the FACT — the bytes were fetched by whoever published
+    # (another install, or the installer's bootstrap staging). Worth
+    # telling apart in the receipt: "downloaded" claims network traffic
+    # that never happened, and the 44-worktree case this store exists
+    # for should be visible as adoption, not as 44 downloads.
+    adopted = published and (store / rel).is_file()
+
     try:
-        if not (published and (store / rel).is_file()):
+        if not adopted:
             ctx = _StageContext(
                 node=(
                     store / _fact_rel("node", facts["node"].version, target)
@@ -665,7 +673,7 @@ def _provision_one(
             path_dirs=_fact_path_dirs(tool, version, target),
         )
         save_facts(facts, facts_dir, path_order=path_order)
-        return ToolResult(tool, "downloaded", version=version)
+        return ToolResult(tool, "adopted" if adopted else "downloaded", version=version)
     except Exception as exc:  # noqa: BLE001 — per-tool isolation is the contract
         logger.warning("provisioning %s failed: %s", tool, exc)
         return ToolResult(tool, "failed", detail=str(exc))
