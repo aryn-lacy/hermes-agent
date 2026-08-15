@@ -107,6 +107,13 @@ def _http_get_json(url: str, headers: dict, timeout: int) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+# Retry budget for Cloudflare 524 (origin timeout) on blocking POST.
+# Streaming path handles long tasks via SSE keepalives, but the blocking
+# fallback can still hit 524 if the peer takes >100s. Retry with exponential
+# backoff to survive transient origin timeouts.
+_POST_MAX_RETRIES = 3
+
+
 def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
     data = json.dumps(body).encode("utf-8")
     # Custom peer headers are operator-controlled but Content-Type and
@@ -121,8 +128,20 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
         "A2A-Version": protocol.PROTOCOL_VERSION,
     }
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
-        return json.loads(resp.read().decode("utf-8"))
+    
+    # Retry on 524 (Cloudflare origin timeout) with exponential backoff.
+    # Streaming path handles long tasks via SSE keepalives, but the blocking
+    # fallback can still hit 524 if the peer takes >100s.
+    for attempt in range(_POST_MAX_RETRIES):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 524 and attempt < _POST_MAX_RETRIES - 1:
+                # Exponential backoff: 1s, 2s, 4s
+                time.sleep(2 ** attempt)
+                continue
+            raise
 
 
 def _http_post_sse(url: str, body: dict, headers: dict, timeout: int):
