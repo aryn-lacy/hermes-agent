@@ -181,6 +181,9 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
 
     Raises urllib errors / ValueError for the caller to format. Handles
     outbound redaction, audit, persistence, and metrics.
+
+    **Idempotency:** Uses a deterministic task_id derived from (context_id,
+    message) so retries send the same ID, enabling the server to deduplicate.
     """
     base_url = peer.get("url", "")
     headers = {**_auth_header(peer.get("auth", {}) or {}), **(peer.get("headers", {}) or {})}
@@ -195,12 +198,15 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
 
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
+    # Deterministic task_id for idempotent retries
+    task_id = protocol.deterministic_task_id(ctx, safe_message)
     # v1.0: contextId lives inside the Message, not at the params top level.
     rpc_body = {
         "jsonrpc": "2.0",
-        "id": protocol.new_task_id(),
+        "id": task_id,
         "method": "SendMessage",
         "params": {
+            "taskId": task_id,
             "message": protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx),
         },
     }

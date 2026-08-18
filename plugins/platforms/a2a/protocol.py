@@ -227,6 +227,21 @@ def new_task_id() -> str:
     return "task-" + uuid.uuid4().hex[:16]
 
 
+def deterministic_task_id(context_id: str, message_text: str) -> str:
+    """Generate a stable task ID from context_id and message content.
+
+    Used by clients to make retry-safe POSTs: the same (context, message) pair
+    always produces the same task ID, so a 524 retry hits the server with an
+    ID it has already seen and can deduplicate against.
+
+    The hash is SHA-256 truncated to 16 hex chars (collision-resistant enough
+    for per-context dedup; not security-critical).
+    """
+    import hashlib
+    payload = f"{context_id or 'default'}:{message_text or ''}".encode("utf-8")
+    return "task-" + hashlib.sha256(payload).hexdigest()[:16]
+
+
 def new_context_id() -> str:
     return "ctx-" + uuid.uuid4().hex[:16]
 
@@ -840,3 +855,89 @@ def list_conversations() -> list[str]:
     if not d.exists():
         return []
     return sorted(p.stem for p in d.glob("*.jsonl"))
+
+
+# --------------------------------------------------------------------------
+# Reply persistence — keyed by context_id + turn, survives retries/restarts
+# --------------------------------------------------------------------------
+
+class ReplyStore:
+    """Persist the last agent reply per (context_id, turn) to disk.
+
+    When a client retries a 524'd POST, the server can return the persisted
+    reply for the same task_id instead of re-executing the action. The store
+    is a simple JSON file per context, with turn-indexed entries.
+
+    The store also serves as the dedup cache: task IDs that have already
+    been processed are recorded here, so a retry with the same task ID
+    returns the cached result without re-running the action.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _path(context_id: str) -> Path:
+        return _conv_dir() / f"{_safe_name(context_id)}_replies.json"
+
+    def save(self, context_id: str, task_id: str, turn: int,
+             state: str, reply: str) -> None:
+        """Persist a reply for (context_id, turn). Overwrites existing."""
+        path = self._path(context_id)
+        with self._lock:
+            data = self._load_locked(path)
+            data[str(turn)] = {
+                "task_id": task_id,
+                "state": state,
+                "reply": reply,
+                "ts": time.time(),
+            }
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("w", encoding="utf-8") as fh:
+                    json.dump(data, fh, ensure_ascii=False)
+            except Exception:
+                pass
+
+    def get_by_task_id(self, context_id: str, task_id: str) -> Optional[dict]:
+        """Find a persisted reply by task_id (any turn). Returns the record or None."""
+        path = self._path(context_id)
+        with self._lock:
+            data = self._load_locked(path)
+        for turn, rec in data.items():
+            if rec.get("task_id") == task_id:
+                return dict(rec)
+        return None
+
+    def get_by_turn(self, context_id: str, turn: int) -> Optional[dict]:
+        """Get the persisted reply for a specific turn."""
+        path = self._path(context_id)
+        with self._lock:
+            data = self._load_locked(path)
+        rec = data.get(str(turn))
+        return dict(rec) if rec else None
+
+    def get_last(self, context_id: str) -> Optional[dict]:
+        """Get the most recent persisted reply for a context."""
+        path = self._path(context_id)
+        with self._lock:
+            data = self._load_locked(path)
+        if not data:
+            return None
+        latest_turn = max(data.keys(), key=lambda t: int(t))
+        rec = data[latest_turn]
+        return dict(rec) if rec else None
+
+    @staticmethod
+    def _load_locked(path: Path) -> dict:
+        """Load reply data from disk. Caller must hold the lock."""
+        if not path.exists():
+            return {}
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+
+reply_store = ReplyStore()

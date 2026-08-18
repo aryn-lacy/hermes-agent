@@ -699,11 +699,62 @@ class A2AAdapter(BasePlatformAdapter):
         Returns (terminal_task, None) when the task ends immediately
         (rejected / not ready), else (None, pending) where pending carries
         the future the caller must wait on. Runs on an HTTP worker thread.
+
+        **Idempotency:** If the request carries a task_id that already exists
+        in the TaskStore (from a prior POST that the client is retrying), we
+        return the cached result instead of re-executing the action. This
+        prevents duplicate work on 524 retries.
         """
         agent = agent or self._agents[""]
         text = protocol.extract_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
-        task_id = protocol.new_task_id()
+        
+        # Check for client-provided task_id (for idempotent retries)
+        client_task_id = str(params.get("taskId") or params.get("id") or "").strip()
+        
+        # Deduplication: if task_id already exists, return cached result
+        if client_task_id:
+            existing = self.tasks.get(client_task_id, *self._scope_for_agent(agent))
+            if existing:
+                if existing["state"] in protocol.TERMINAL_STATES:
+                    # Task already completed — return cached reply
+                    logger.info("A2A: dedup — returning cached result for task %s", client_task_id)
+                    return protocol.build_task(
+                        client_task_id, context_id, existing["state"],
+                        existing.get("reply", ""),
+                        created_at=existing.get("created_iso", ""),
+                    ), None
+                else:
+                    # Task still in progress — wait on existing future
+                    logger.info("A2A: dedup — task %s still in progress, joining", client_task_id)
+                    fut = self.tasks.watch(client_task_id, *self._scope_for_agent(agent))
+                    if fut is None:
+                        # Shouldn't happen, but fall through to normal flow
+                        pass
+                    else:
+                        return None, {
+                            "task_id": client_task_id,
+                            "context_id": context_id,
+                            "peer": peer,
+                            "future": fut,
+                            "created_iso": existing.get("created_iso", ""),
+                            "started": existing.get("created_at", time.time()),
+                            "dedup": True,  # flag so _finalize_task knows not to re-save
+                            "turn": None,  # dedup path doesn't track turns
+                        }
+            else:
+                # TaskStore doesn't have it — check disk-backed ReplyStore (survives restarts)
+                cached = protocol.reply_store.get_by_task_id(context_id, client_task_id)
+                if cached:
+                    logger.info("A2A: dedup — returning persisted reply for task %s (cross-restart)", client_task_id)
+                    return protocol.build_task(
+                        client_task_id, context_id, cached["state"],
+                        cached.get("reply", ""),
+                        created_at="",
+                    ), None
+        
+        # Use client-provided task_id if present, otherwise generate new one
+        task_id = client_task_id or protocol.new_task_id()
 
         # Anti-loop ping-pong protection
         turn = self._turns.track(context_id)
@@ -794,6 +845,7 @@ class A2AAdapter(BasePlatformAdapter):
             "future": fut,
             "created_iso": rec["created_iso"],
             "started": time.time(),
+            "turn": turn,
         }
 
     def _profile_state_db(self, profile: str) -> Optional[str]:
@@ -913,6 +965,11 @@ class A2AAdapter(BasePlatformAdapter):
 
         protocol.persist_message(context_id, "agent", reply, task_id)
         security.audit("outbound", peer, task_id, reply)
+
+        # Persist reply to reply_store for cross-restart deduplication
+        turn = pending.get("turn")
+        if turn is not None:
+            protocol.reply_store.save(context_id, task_id, turn, state, reply)
 
         if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
             protocol.metrics.outbound_total += 1
