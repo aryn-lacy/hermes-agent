@@ -758,18 +758,20 @@ class A2AAdapter(BasePlatformAdapter):
 
         # Anti-loop ping-pong protection
         turn = self._turns.track(context_id)
-        if turn > protocol.max_pingpong_turns():
+        max_turns = protocol.max_pingpong_turns(peer)
+        if turn > max_turns:
             protocol.metrics.anti_loop_triggers += 1
             logger.warning("A2A: anti-loop triggered for context %s (turn %d > %d)",
-                           context_id, turn, protocol.max_pingpong_turns())
+                           context_id, turn, max_turns)
             rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
             self.tasks.complete(task_id, protocol.STATE_REJECTED, "")
             return protocol.build_task(
                 task_id, context_id, protocol.STATE_REJECTED,
                 f"Anti-loop protection: context {context_id} exceeded "
-                f"{protocol.max_pingpong_turns()} turns. Start a new context or "
+                f"{max_turns} turns. Start a new context or "
                 f"increase A2A_MAX_PINGPONG_TURNS.",
                 created_at=rec["created_iso"],
+                turn=turn, max_turns=max_turns,
             ), None
 
         if not text:
@@ -798,16 +800,28 @@ class A2AAdapter(BasePlatformAdapter):
                 protocol.metrics.tasks_completed += 1
             else:
                 protocol.metrics.tasks_failed += 1
+                # Transport failure: refund turn (profile forward failed, not agent work)
+                if state == protocol.STATE_FAILED:
+                    self._turns.refund(context_id)
+                    turn = self._turns.get_count(context_id)
             self._send_push_notification(task_id, context_id, reply, state)
-            return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
+            return protocol.build_task(
+                task_id, context_id, state, reply,
+                created_at=rec["created_iso"],
+                turn=turn, max_turns=max_turns,
+            ), None
 
         if self._loop is None or self._message_handler is None:
             self.tasks.complete(task_id, protocol.STATE_FAILED, "")
             protocol.metrics.tasks_failed += 1
+            # Transport failure: gateway not ready — refund turn
+            self._turns.refund(context_id)
+            turn = self._turns.get_count(context_id)
             return protocol.build_task(
                 task_id, context_id, protocol.STATE_FAILED,
                 "Agent gateway not ready to accept A2A tasks.",
                 created_at=rec["created_iso"],
+                turn=turn, max_turns=max_turns,
             ), None
 
         fut = self._add_pending(task_id, context_id)
@@ -832,9 +846,13 @@ class A2AAdapter(BasePlatformAdapter):
             msg = security.redact_outbound(f"Dispatch failed: {e}")
             self.tasks.complete(task_id, protocol.STATE_FAILED, msg)
             protocol.metrics.tasks_failed += 1
+            # Transport failure: dispatch error — refund turn
+            self._turns.refund(context_id)
+            turn = self._turns.get_count(context_id)
             return protocol.build_task(
                 task_id, context_id, protocol.STATE_FAILED, msg,
                 created_at=rec["created_iso"],
+                turn=turn, max_turns=max_turns,
             ), None
 
         self.tasks.set_state(task_id, protocol.STATE_WORKING)
@@ -846,6 +864,7 @@ class A2AAdapter(BasePlatformAdapter):
             "created_iso": rec["created_iso"],
             "started": time.time(),
             "turn": turn,
+            "max_turns": max_turns,
         }
 
     def _profile_state_db(self, profile: str) -> Optional[str]:
@@ -977,6 +996,13 @@ class A2AAdapter(BasePlatformAdapter):
             protocol.metrics.record_latency(time.time() - pending["started"])
         else:
             protocol.metrics.tasks_failed += 1
+            # Transport failure refund: if the task failed due to a transport
+            # issue (timeout, empty reply, dispatch error) rather than genuine
+            # agent work, refund the turn so recovery loops don't trip the
+            # anti-loop hard rejection.
+            if state == protocol.STATE_FAILED and self._is_transport_failure(reply):
+                self._turns.refund(context_id)
+                logger.debug("A2A: refunded turn for context %s (transport failure)", context_id)
 
         self.tasks.complete(task_id, state, reply)
         self._send_push_notification(task_id, context_id, reply, state)
@@ -1005,6 +1031,25 @@ class A2AAdapter(BasePlatformAdapter):
             except Exception:
                 return (protocol.STATE_FAILED, "[agent did not reply in time]")
 
+    @staticmethod
+    def _is_transport_failure(reply: str) -> bool:
+        """Detect if a failure message indicates a transport issue rather than
+        genuine agent work. Returns True for timeouts, empty replies, dispatch
+        errors, and client disconnections.
+        """
+        if not reply:
+            return True
+        # Match known transport failure patterns
+        transport_markers = (
+            "[agent did not reply in time]",
+            "[client disconnected]",
+            "Dispatch failed:",
+            "Agent gateway not ready",
+            "Profile dispatch failed:",
+            "[profile did not reply in time]",
+        )
+        return any(marker in reply for marker in transport_markers)
+
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
         terminal, pending = self._prepare_task(params, peer, agent=agent)
         if terminal is not None:
@@ -1015,6 +1060,8 @@ class A2AAdapter(BasePlatformAdapter):
         task = protocol.build_task(
             pending["task_id"], pending["context_id"], state, reply,
             created_at=pending["created_iso"],
+            turn=pending.get("turn"),
+            max_turns=pending.get("max_turns"),
         )
         result = protocol.send_message_response(task) if v1_response else task
         return protocol.jsonrpc_result(req_id, result)
@@ -1071,7 +1118,8 @@ class A2AAdapter(BasePlatformAdapter):
 
             task_id, context_id = pending["task_id"], pending["context_id"]
             self._sse_write(handler, protocol.sse_data(protocol.stream_task(
-                protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"])),
+                protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"],
+                                   turn=pending.get("turn"), max_turns=pending.get("max_turns"))),
                 req_id))
             self._sse_write(handler, protocol.sse_data(
                 protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))

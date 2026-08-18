@@ -75,7 +75,26 @@ _DEFAULT_MAX_PINGPONG = 5
 _HARD_MAX_PINGPONG = 20
 
 
-def max_pingpong_turns() -> int:
+def max_pingpong_turns(peer: Optional[str] = None) -> int:
+    """Return the anti-loop turn cap.
+
+    ``peer`` is an optional peer name used to look up a per-peer override in
+    the A2A config (``a2a_agents.<peer>.max_turns``). When no override exists
+    or the peer is unknown, fall back to the global ``A2A_MAX_PINGPONG_TURNS``
+    env variable (default 5, hard max 20).
+    """
+    # Per-peer override from config
+    if peer:
+        try:
+            from . import tools as _tools  # local import to avoid cycle
+            cfg = _tools._load_config()
+            entry = (cfg.get("a2a_agents") or {}).get(peer, {})
+            if isinstance(entry, dict) and "max_turns" in entry:
+                v = int(entry["max_turns"])
+                return max(1, min(v, _HARD_MAX_PINGPONG))
+        except Exception:
+            pass  # config missing or unreadable — fall through to env
+
     try:
         v = int(os.getenv("A2A_MAX_PINGPONG_TURNS", str(_DEFAULT_MAX_PINGPONG)))
         return max(1, min(v, _HARD_MAX_PINGPONG))
@@ -386,6 +405,8 @@ def build_task(
     agent_text: str = "",
     *,
     created_at: str = "",
+    turn: int | None = None,
+    max_turns: int | None = None,
 ) -> dict:
     """Build an A2A v1.0 Task object for a message/send result.
 
@@ -394,6 +415,10 @@ def build_task(
     ``lastModified`` field.  Strict ProtoJSON parsers (e.g. a2a-sdk 1.1.0)
     reject unknown fields, so we must not include them.  The spec's §5.6.1
     timestamp-format example mentions them but they are not in the proto.
+
+    ``turn`` and ``max_turns`` surface the anti-loop budget so peers know how
+    many turns remain before rejection. They live under ``metadata.turnBudget``
+    (non-spec but tolerated by lenient parsers; strict clients ignore it).
     """
     now = now_iso()
     task: dict[str, Any] = {
@@ -401,6 +426,14 @@ def build_task(
         "contextId": context_id,
         "status": {"state": state, "timestamp": now},
     }
+    if turn is not None and max_turns is not None:
+        task["metadata"] = {
+            "turnBudget": {
+                "current": turn,
+                "max": max_turns,
+                "remaining": max(0, max_turns - turn),
+            }
+        }
     if agent_text:
         task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id)
         if state == STATE_COMPLETED:
@@ -497,6 +530,28 @@ class TurnTracker:
         with self._lock:
             self._counts.pop(context_id, None)
             self._timestamps.pop(context_id, None)
+
+    def refund(self, context_id: str) -> int:
+        """Decrement the turn count for a context (transport failure refund).
+
+        When a turn is consumed by a transport failure (524 timeout, empty
+        reply, dispatch error) — not genuine agent work — the turn should not
+        count toward the anti-loop cap. This refunds it so recovery loops
+        don't trip the hard rejection.
+
+        Returns the new count (floor 0).
+        """
+        with self._lock:
+            current = self._counts.get(context_id, 0)
+            if current > 0:
+                self._counts[context_id] = current - 1
+                return current - 1
+            return 0
+
+    def get_count(self, context_id: str) -> int:
+        """Return current turn count without incrementing."""
+        with self._lock:
+            return self._counts.get(context_id, 0)
 
 
 # --------------------------------------------------------------------------
