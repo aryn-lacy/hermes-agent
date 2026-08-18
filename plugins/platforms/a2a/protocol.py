@@ -448,11 +448,24 @@ def build_task(
 # Streaming (v1.0 StreamResponse events)
 # --------------------------------------------------------------------------
 
-def status_update(task_id: str, context_id: str, state: str, text: str = "") -> dict:
-    """v1.0 StreamResponse with a statusUpdate member."""
+def status_update(task_id: str, context_id: str, state: str, text: str = "",
+                  turn: int | None = None, max_turns: int | None = None) -> dict:
+    """v1.0 StreamResponse with a statusUpdate member.
+
+    ``turn`` and ``max_turns`` surface the anti-loop budget in the status
+    metadata so streaming clients can track remaining turns.
+    """
     status: dict[str, Any] = {"state": state, "timestamp": now_iso()}
     if text:
         status["message"] = text_message(ROLE_AGENT, text, context_id)
+    if turn is not None and max_turns is not None:
+        status["metadata"] = {
+            "turnBudget": {
+                "current": turn,
+                "max": max_turns,
+                "remaining": max(0, max_turns - turn),
+            }
+        }
     return {"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}}
 
 
@@ -668,7 +681,8 @@ class TaskStore:
         return True
 
     def create(self, task_id: str, context_id: str, peer: str,
-               agent_slug: str = "", tenant: str = "") -> dict:
+               agent_slug: str = "", tenant: str = "",
+               turn: Optional[int] = None, max_turns: Optional[int] = None) -> dict:
         rec = {
             "task_id": task_id,
             "context_id": context_id,
@@ -681,6 +695,8 @@ class TaskStore:
             "created_iso": now_iso(),
             "push_url": "",
             "push_config_id": "",
+            "turn": turn,
+            "max_turns": max_turns,
         }
         with self._lock:
             self._tasks[task_id] = rec
@@ -847,6 +863,8 @@ class TaskStore:
             rec["state"],
             rec.get("reply", ""),
             created_at=rec.get("created_iso", ""),
+            turn=rec.get("turn"),
+            max_turns=rec.get("max_turns"),
         )
         if not include_artifacts:
             task.pop("artifacts", None)

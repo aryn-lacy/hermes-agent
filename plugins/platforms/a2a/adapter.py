@@ -756,7 +756,17 @@ class A2AAdapter(BasePlatformAdapter):
         # Use client-provided task_id if present, otherwise generate new one
         task_id = client_task_id or protocol.new_task_id()
 
-        # Anti-loop ping-pong protection
+        # Validate input before consuming a turn (prevents turn-exhaustion DoS)
+        if not text:
+            rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
+            self.tasks.complete(task_id, protocol.STATE_REJECTED, "")
+            return protocol.build_task(
+                task_id, context_id, protocol.STATE_REJECTED,
+                "Empty task — nothing to do.", created_at=rec["created_iso"],
+                turn=None, max_turns=protocol.max_pingpong_turns(peer),
+            ), None
+
+        # Anti-loop ping-pong protection (track after validation)
         turn = self._turns.track(context_id)
         max_turns = protocol.max_pingpong_turns(peer)
         if turn > max_turns:
@@ -772,14 +782,6 @@ class A2AAdapter(BasePlatformAdapter):
                 f"increase A2A_MAX_PINGPONG_TURNS.",
                 created_at=rec["created_iso"],
                 turn=turn, max_turns=max_turns,
-            ), None
-
-        if not text:
-            rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
-            self.tasks.complete(task_id, protocol.STATE_REJECTED, "")
-            return protocol.build_task(
-                task_id, context_id, protocol.STATE_REJECTED,
-                "Empty task — nothing to do.", created_at=rec["created_iso"],
             ), None
 
         framed = security.wrap_inbound(peer, text)
@@ -1084,19 +1086,22 @@ class A2AAdapter(BasePlatformAdapter):
         handler.wfile.flush()
 
     def _emit_terminal(self, handler, task_id: str, context_id: str, state: str, reply: str,
-                       req_id: Any = None) -> None:
+                       req_id: Any = None, turn: Optional[int] = None, max_turns: Optional[int] = None) -> None:
         """Emit the final artifact/status events and close the stream (v1.0:
         closure signals terminal state, no ``final`` field).
 
-        ``req_id`` is threaded into JSON-RPC-wrapped SSE frames per §9.4."""
+        ``req_id`` is threaded into JSON-RPC-wrapped SSE frames per §9.4.
+        ``turn`` and ``max_turns`` surface the anti-loop budget in the final
+        status update so streaming clients know how many turns remain.
+        """
         if reply and state == protocol.STATE_COMPLETED:
             self._sse_write(handler, protocol.sse_data(
                 protocol.artifact_update(task_id, context_id, reply), req_id))
             self._sse_write(handler, protocol.sse_data(
-                protocol.status_update(task_id, context_id, state), req_id))
+                protocol.status_update(task_id, context_id, state, turn=turn, max_turns=max_turns), req_id))
         else:
             self._sse_write(handler, protocol.sse_data(
-                protocol.status_update(task_id, context_id, state, reply), req_id))
+                protocol.status_update(task_id, context_id, state, reply, turn=turn, max_turns=max_turns), req_id))
         self._sse_write(handler, protocol.sse_done())
 
     def _rpc_message_stream(self, handler, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None) -> None:
@@ -1108,11 +1113,14 @@ class A2AAdapter(BasePlatformAdapter):
         try:
             terminal, pending = self._prepare_task(params, peer, agent=agent)
             if terminal is not None:
+                # Extract turn budget from the terminal task metadata
+                tb = (terminal.get("metadata") or {}).get("turnBudget", {})
                 self._emit_terminal(
                     handler, terminal["id"], terminal["contextId"],
                     terminal["status"]["state"],
                     protocol.extract_text(terminal.get("status", {}).get("message", {}) or {}),
                     req_id=req_id,
+                    turn=tb.get("current"), max_turns=tb.get("max"),
                 )
                 return
 
@@ -1127,7 +1135,11 @@ class A2AAdapter(BasePlatformAdapter):
             state, reply = self._await_reply(
                 pending, keepalive=lambda: self._sse_write(handler, ": keepalive\n\n"))
             state, reply = self._finalize_task(pending, state, reply)
-            self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
+            # After _finalize_task, turn may have been refunded — get current count
+            final_turn = self._turns.get_count(context_id)
+            final_max = pending.get("max_turns")
+            self._emit_terminal(handler, task_id, context_id, state, reply,
+                                req_id=req_id, turn=final_turn, max_turns=final_max)
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("A2A: stream client disconnected")
 
@@ -1156,7 +1168,9 @@ class A2AAdapter(BasePlatformAdapter):
                         state, reply = rec["state"], rec.get("reply", "")
                         break
                     self._sse_write(handler, ": keepalive\n\n")
-            self._emit_terminal(handler, task_id, rec["context_id"], state, reply, req_id=req_id)
+            self._emit_terminal(handler, task_id, rec["context_id"], state, reply, req_id=req_id,
+                                turn=self._turns.get_count(rec["context_id"]),
+                                max_turns=protocol.max_pingpong_turns(rec.get("peer")))
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("A2A: subscribe client disconnected")
 
