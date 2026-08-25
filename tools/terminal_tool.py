@@ -272,6 +272,19 @@ def _get_sudo_password_callback():
     return getattr(_callback_tls, "sudo_password", None)
 
 
+def _current_session_key() -> str:
+    """Return the active gateway/WebUI session key, or "" outside sessions.
+
+    Single lookup point for the ``HERMES_SESSION_KEY`` ContextVar with the
+    os.environ fallback that ``get_session_env()`` applies for CLI, cron, and
+    test processes. Callers scope per-session caches by prefixing the value
+    with ``"session:"`` so two sessions never share a cache slot.
+    """
+    from gateway.session_context import get_session_env
+
+    return get_session_env("HERMES_SESSION_KEY", "")
+
+
 def _get_approval_callback():
     return getattr(_callback_tls, "approval", None)
 
@@ -297,12 +310,7 @@ def set_approval_callback(cb):
 
 def _get_sudo_password_cache_scope() -> str:
     """Return the cache scope for interactive sudo passwords."""
-    try:
-        from gateway.session_context import get_session_env
-
-        session_key = get_session_env("HERMES_SESSION_KEY", "")
-    except Exception:
-        session_key = os.getenv("HERMES_SESSION_KEY", "")
+    session_key = _current_session_key()
     if session_key:
         return f"session:{session_key}"
 
@@ -421,15 +429,39 @@ def _validate_workdir(workdir: str) -> str | None:
     return None
 
 
+def _in_delegated_child_context() -> bool:
+    """Return True while running inside a delegate_task child.
+
+    Subagents execute on worker threads of the parent process, so they
+    inherit process-wide interactivity signals (``HERMES_INTERACTIVE=1`` set
+    by the CLI at startup) that do NOT mean *this* execution context can
+    reach the user. A child that passes the interactive gate with no sudo
+    callback falls through to the raw ``/dev/tty`` prompt — printed mid-TUI
+    from a background thread, racing siblings for the tty, and blocking the
+    child for the full timeout. Children must always behave as headless for
+    sudo prompting. The ContextVar is set by ``delegated_child_context()``
+    around every child run and propagates through ``contextvars.copy_context``
+    onto the executor thread.
+    """
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        return is_delegated_child_context()
+    except Exception:
+        return False
+
+
 def _handle_sudo_failure(output: str, env_type: str) -> str:
     """
-    Check for sudo failure and add helpful message for messaging contexts.
-    
-    Returns enhanced output if sudo failed in messaging context, else original.
+    Check for sudo failure and add helpful message for headless contexts
+    (messaging gateway sessions and delegate_task subagents).
+
+    Returns enhanced output if sudo failed in such a context, else original.
     """
     is_gateway = env_var_enabled("HERMES_GATEWAY_SESSION")
-    
-    if not is_gateway:
+    is_delegated_child = _in_delegated_child_context()
+
+    if not is_gateway and not is_delegated_child:
         return output
     
     # Check for sudo failure indicators
@@ -442,6 +474,12 @@ def _handle_sudo_failure(output: str, env_type: str) -> str:
     for failure in sudo_failures:
         if failure in output:
             from hermes_constants import display_hermes_home as _dhh
+            if is_delegated_child:
+                return output + (
+                    "\n\n💡 Tip: Subagents cannot prompt for a sudo password. "
+                    f"Add SUDO_PASSWORD to {_dhh()}/.env on the agent machine, "
+                    "or run the command without sudo."
+                )
             return output + f"\n\n💡 Tip: To enable sudo over messaging, add SUDO_PASSWORD to {_dhh()}/.env on the agent machine."
     
     return output
@@ -1045,9 +1083,16 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
         return command, None
 
     has_sudo_prompt_callback = _get_sudo_password_callback() is not None
+    # delegate_task children inherit the parent's process-wide
+    # HERMES_INTERACTIVE=1 (and, on a recycled worker thread, potentially a
+    # stale thread-local callback), but there is no user on the other side of
+    # this execution context: prompting from a subagent thread fights the
+    # parent's TUI for /dev/tty and blocks the child for the full timeout.
+    # Children always behave as headless — configured SUDO_PASSWORD, the
+    # session cache, and the NOPASSWD probe above all still work.
     should_prompt_for_sudo = (
         env_var_enabled("HERMES_INTERACTIVE") or has_sudo_prompt_callback
-    )
+    ) and not _in_delegated_child_context()
     if not has_configured_password and not sudo_password and should_prompt_for_sudo:
         sudo_password = _prompt_for_sudo_password(timeout_seconds=45)
         if sudo_password:
@@ -1078,6 +1123,7 @@ import sys
 TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Filesystem, current working directory, and exported environment variables persist between calls.
 
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
+NEVER pipe a build/test command through tail/head/cat to shorten output (e.g. `cargo build | tail -20`): output is auto-truncated with the full text saved to a file, and the pipe makes exit_code report the LAST pipeline command's status (tail's 0), masking real failures. Run the command bare; the same applies to `cmd || echo failed`, which also masks the exit code.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
@@ -1385,6 +1431,21 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         return task_id
     if task_id and _docker_session_isolation_enabled():
         return _resolve_container_alias(task_id)
+    # Per-session isolation: when a session key is present (the WebUI streaming
+    # layer sets it per-session, the gateway per-message via contextvars), scope
+    # the container to it so switching profiles can't reuse a previous profile's
+    # SSHEnvironment and silently run commands on the wrong remote host. Subagents
+    # inherit the same session key, so they still collapse onto the parent's
+    # container (the #16177 shared-container intent). CLI mode has no session key
+    # and falls through to "default", behaviour unchanged. See commit e00f940a9.
+    #
+    # This runs *after* the isolation-override and docker/container_persistent
+    # branches above: those paths already key containers per task_id, so they
+    # stay authoritative where they apply and this only covers the cases that
+    # would otherwise collapse to the shared "default" key (notably SSH).
+    session_key = _current_session_key()
+    if session_key:
+        return f"session:{session_key}"
     return "default"
 
 
@@ -2290,6 +2351,61 @@ atexit.register(_atexit_cleanup)
 # wastes a turn investigating something that just means "no matches".
 # This lookup adds a human-readable note so the agent can move on.
 
+# Signal-death notes for the lethal signals seen in practice. Keyed by
+# signum; used for both the ``-signum`` (subprocess) and ``128+signum``
+# (shell) encodings. Curated rather than exhaustive so we never mislabel a
+# legitimate application exit code (e.g. 130/SIGINT is handled by the
+# executor's interrupt-marker path and excluded here).
+_SIGNAL_EXIT_NOTES: dict[int, str] = {
+    3:  "SIGQUIT (quit from keyboard)",
+    4:  "SIGILL (illegal instruction — corrupt binary or wrong architecture)",
+    6:  "SIGABRT (abort — assertion failure, fatal runtime error, or glibc abort)",
+    7:  "SIGBUS (bus error — misaligned or unmapped memory access)",
+    8:  "SIGFPE (fatal arithmetic error, e.g. integer division by zero)",
+    9:  "SIGKILL — often the kernel OOM killer on memory exhaustion, "
+        "or an explicit kill -9",
+    11: "SIGSEGV (segmentation fault — the program crashed)",
+    13: "SIGPIPE (wrote to a closed pipe — e.g. output piped to a reader that exited)",
+    15: "SIGTERM (terminated — kill/timeout or shutdown requested it to stop)",
+    24: "SIGXCPU (CPU time limit exceeded)",
+    25: "SIGXFSZ (file size limit exceeded)",
+}
+
+
+def _interpret_signal_exit(exit_code: int) -> str | None:
+    """Map signal-termination exit codes to a human-readable note.
+
+    Returns None when ``exit_code`` does not look like a signal death.
+    Negative codes are Python ``subprocess`` semantics (definite); codes in
+    the 128+signum band are the shell convention (very likely but not
+    guaranteed, so those notes hedge with "usually").
+    """
+    if exit_code < 0:
+        signum = -exit_code
+        if signum == 2:  # SIGINT — executor's interrupt-marker path owns it
+            return None
+        note = _SIGNAL_EXIT_NOTES.get(signum)
+        if note:
+            return f"Command terminated by signal {signum}: {note}"
+        try:
+            import signal as _signal
+            name = _signal.Signals(signum).name
+        except (ValueError, ImportError):
+            name = f"signal {signum}"
+        return f"Command terminated by {name} (signal {signum})"
+
+    if exit_code > 128:
+        signum = exit_code - 128
+        note = _SIGNAL_EXIT_NOTES.get(signum)
+        if note:
+            return (
+                f"Exit code {exit_code} usually means the command was "
+                f"terminated by signal {signum}: {note}"
+            )
+
+    return None
+
+
 def _interpret_exit_code(command: str, exit_code: int) -> str | None:
     """Return a human-readable note when a non-zero exit code is non-erroneous.
 
@@ -2299,6 +2415,21 @@ def _interpret_exit_code(command: str, exit_code: int) -> str | None:
     """
     if exit_code == 0:
         return None
+
+    # Signal terminations (ported from Kilo-Org/kilocode#12698, adapted to
+    # Python semantics). Two shapes reach the model:
+    #   * negative codes — subprocess.Popen reports a signal-killed process
+    #     as ``-signum`` (definite signal death), and
+    #   * 128+signum — the conventional shell encoding when bash reports a
+    #     signal-killed child (heuristic: a program *can* ``exit 139``, so
+    #     these notes say "usually").
+    # Without a note the model sees a bare ``exit_code=-9`` or ``137`` and
+    # burns turns re-running or mis-diagnosing (137 = OOM kill is the big
+    # one). 130/SIGINT is deliberately absent: the executor has bespoke
+    # interrupt-marker handling for rc=130.
+    signal_note = _interpret_signal_exit(exit_code)
+    if signal_note is not None:
+        return signal_note
 
     # Extract the last command in a pipeline/chain — that determines the
     # exit code.  Handles  `cmd1 && cmd2`, `cmd1 | cmd2`, `cmd1; cmd2`.
@@ -2555,7 +2686,7 @@ def terminal_tool(
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
-        watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
+        watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row — or after a small lifetime cap of delivered matches, however cleanly spaced — watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -2776,13 +2907,23 @@ def terminal_tool(
         session_key = get_current_session_key(default="") or (task_id or "")
 
         # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
-        # restart|stop targeting hermes-gateway) must never run inside the
+        # restart|stop|uninstall targeting hermes-gateway) must never run inside the
         # gateway process itself. The restart would SIGTERM the gateway, which
         # kills this very subprocess before it can complete — the service may
         # never restart. This mirrors the `hermes gateway restart` guard in
         # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
         # but applies unconditionally (force=True cannot help here).
-        if os.environ.get("_HERMES_GATEWAY") == "1":
+        # Gate on the SUPERVISED-gateway probe, not the raw _HERMES_GATEWAY
+        # marker: gateway.run sets it at import time, so it leaks into every
+        # process that merely imports gateway.run (hermes serve --isolated,
+        # CLI, web server) which are NOT the gateway and must be able to
+        # restart it. A plain foreground `hermes gateway run` (env set, PID
+        # owned, no supervisor) now also PASSES this guard: intentional and
+        # harmless, since without a supervisor there is no KeepAlive to turn a
+        # self-restart into a respawn loop.
+        from tools.process_registry import _is_supervised_gateway_process
+
+        if _is_supervised_gateway_process():
             from cron.lifecycle_guard import (
                 _MAX_REFERENCED_SCRIPT_BYTES,
                 contains_gateway_lifecycle_command_or_referenced_script,
@@ -2874,8 +3015,8 @@ def terminal_tool(
                     "output": "",
                     "exit_code": 1,
                     "error": (
-                        "Blocked: command or referenced script cannot restart or stop "
-                        "the gateway from inside the gateway process. The gateway would "
+                        "Blocked: command or referenced script cannot restart, stop, or "
+                        "uninstall the gateway from inside the gateway process. The gateway would "
                         "kill this command before it could complete (SIGTERM propagates "
                         "to child processes). Run `hermes gateway restart` from a "
                         "separate shell outside the running gateway."
@@ -2896,18 +3037,25 @@ def terminal_tool(
                     "status": "blocked"
                 }, ensure_ascii=False)
 
-        # Non-bypassable: rewriting the local checkout backing this interpreter
-        # can mix module versions. Remote backends cannot reach that checkout.
+        # Windows-only: NTFS locks loaded module files, so rewriting the local
+        # checkout backing this interpreter can corrupt the running process.
+        # POSIX keeps old inodes alive for open handles, so the guard is off
+        # there. Remote backends cannot reach that checkout.
         if env_type == "local":
-            from tools.self_repo_guard import detect_self_repo_git_mutation
+            from tools.self_repo_guard import (
+                detect_self_repo_git_mutation,
+                guard_active,
+            )
 
             guard_cwd = _resolve_command_cwd(
                 workdir=workdir,
                 default_cwd=cwd,
                 session_key=session_key,
             )
-            _self_repo_hit, _self_repo_msg = detect_self_repo_git_mutation(
-                command, guard_cwd
+            _self_repo_hit, _self_repo_msg = (
+                detect_self_repo_git_mutation(command, guard_cwd)
+                if guard_active()
+                else (False, None)
             )
             if _self_repo_hit:
                 logger.warning(
@@ -3179,6 +3327,15 @@ def terminal_tool(
                             proc_session.watcher_user_name = _gw_user_name
                             proc_session.watcher_thread_id = _gw_thread_id
                             proc_session.watcher_message_id = _gw_message_id
+                            # Stamp the spawning conversation's session-db id
+                            # so the gateway's completion pre-flight
+                            # (_classify_completion_target) can drop the
+                            # notification when the user closes this session
+                            # (/new) before the process finishes, instead of
+                            # injecting it into the chat's NEW session.
+                            proc_session.parent_session_id = _gse(
+                                "HERMES_SESSION_ID", ""
+                            )
 
                 # Mutual exclusion: if both notify_on_complete and watch_patterns
                 # are set, drop watch_patterns. The combination produces duplicate
@@ -3217,6 +3374,7 @@ def terminal_tool(
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
                             "notify_on_complete": True,
+                            "parent_session_id": proc_session.parent_session_id,
                         })
 
                 # Set watch patterns for output monitoring
@@ -3311,7 +3469,14 @@ def terminal_tool(
             # (docstring: "Working directory for this command"). Recording it
             # would hijack the session's durable cwd for every later command
             # that doesn't pass ``workdir``. Skip the dual-write in that case.
-            if not workdir:
+            #
+            # AND only when the command actually reported its cwd. The marker
+            # is printed after the command returns, so an interrupted / killed
+            # / timed-out command emits none and env.cwd still holds whatever
+            # the last command to FINISH left there — on a shared env, that is
+            # another session's directory. Recording it silently re-homes this
+            # session into a directory the user never opened.
+            if not workdir and (result or {}).get("cwd_observed"):
                 record_session_cwd(session_key, getattr(env, "cwd", None))
 
             # Extract output
@@ -3331,7 +3496,10 @@ def terminal_tool(
             )
             if sudo_cache_cleared:
                 has_sudo_prompt_callback = _get_sudo_password_callback() is not None
-                if has_sudo_prompt_callback or env_var_enabled("HERMES_INTERACTIVE"):
+                can_reprompt = (
+                    has_sudo_prompt_callback or env_var_enabled("HERMES_INTERACTIVE")
+                ) and not _in_delegated_child_context()
+                if can_reprompt:
                     output += (
                         "\n\n⚠️ Sudo authentication failed — cached password "
                         "cleared. You will be prompted again on the next sudo "
@@ -3406,6 +3574,19 @@ def terminal_tool(
                     failure_hint = annotate_failure(command, returncode, output)
                 except Exception:
                     failure_hint = None
+            elif returncode == 0:
+                # Masked-success backstop: `cargo build | tail -20` returns
+                # tail's exit 0 even when the build failed (bash reports the
+                # last pipeline command's status; same for `cmd || echo ...`).
+                # When the command shape can mask an upstream failure AND the
+                # output carries strong failure indicators, warn the model so
+                # exit_code 0 isn't read as a success signal. Advisory only —
+                # the exit code itself is never modified.
+                try:
+                    from tools.terminal_hints import annotate_masked_success
+                    failure_hint = annotate_masked_success(command, output)
+                except Exception:
+                    failure_hint = None
 
             result_dict = {
                 "output": output,
@@ -3418,8 +3599,13 @@ def terminal_tool(
             # defensive 'cd X && ' prefix because the model can't see cwd
             # state; echoing it on change removes the guesswork (pattern
             # borrowed from crush's <cwd> injection).
+            #
+            # Gated on the same observation flag as the record above: without
+            # it, an interrupted command echoes the shared env's leftover cwd
+            # and tells the model it moved to a directory another session
+            # opened.
             try:
-                post_cwd = getattr(env, "cwd", None)
+                post_cwd = getattr(env, "cwd", None) if (result or {}).get("cwd_observed") else None
                 if post_cwd and command_cwd and os.path.realpath(str(post_cwd)) != os.path.realpath(str(command_cwd)):
                     result_dict["cwd"] = str(post_cwd)
             except Exception:
@@ -3434,9 +3620,17 @@ def terminal_tool(
                 try:
                     _sp = Path(spill_file_path)
                     raw_spill = _sp.read_text(encoding="utf-8", errors="replace")
-                    _sp.write_text(
+                    from tools.spill_safety import write_text_exclusive
+
+                    # Rewrite in place via lstat-checked unlink + exclusive
+                    # create so the redacted copy can't be diverted through a
+                    # symlink planted between the collector's write and now.
+                    write_text_exclusive(
+                        _sp,
                         redact_terminal_output(strip_ansi(raw_spill), command),
-                        encoding="utf-8", errors="replace",
+                        private=True,
+                        overwrite=True,
+                        errors="replace",
                     )
                     result_dict["output_total_chars"] = spill_total_chars
                     result_dict["full_output_path"] = spill_file_path
@@ -3777,7 +3971,7 @@ TERMINAL_SCHEMA = {
             "watch_patterns": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Strings to watch for in background output. ONLY for rare one-shot mid-process signals on processes that never exit (e.g. ['Application startup complete'] on a server). NOT for end-of-run markers (use notify_on_complete) and NOT for per-iteration patterns like 'ERROR' in loops — rate-limited to 1 notification/15s; repeated over-firing auto-disables it and falls back to notify-on-exit. When in doubt, use notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete."
+                "description": "Strings to watch for in background output. ONLY for rare one-shot mid-process signals on processes that never exit (e.g. ['Application startup complete'] on a server). NOT for end-of-run markers (use notify_on_complete) and NOT for per-iteration patterns like 'ERROR' in loops — rate-limited to 1 notification/15s, capped at a small number of matches over the process's lifetime; over-firing auto-disables it and falls back to notify-on-exit. When in doubt, use notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete."
             }
         },
         "required": ["command"]

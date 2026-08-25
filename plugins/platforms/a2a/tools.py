@@ -623,17 +623,14 @@ _HANDLERS = {
 def register_tools(ctx) -> None:
     """Register the client tools in the ``a2a`` toolset."""
     for name, schema in _SCHEMAS.items():
-        # The registry stores schemas as-is and ``get_definitions()`` wraps
-        # them in {"type": "function", "function": ...}. ``_SCHEMAS`` entries
-        # are pre-wrapped for OpenAI compatibility, so unwrap here — passing
-        # them wrapped would double-nest them and the model-facing tool defs
-        # (and ``tool_describe``) would come back empty.
-        flat = schema.get("function", schema)
+        # "_SCHEMAS" entries are OpenAI-style {"type": "function", ...}
+        # wrappers; the registry re-wraps on get_definitions(), so register
+        # the bare function schema to avoid double-nesting (empty defs).
+        function_schema = schema["function"]
         ctx.register_tool(
             name=name,
             toolset="a2a",
-            schema=flat,
+            schema=function_schema,
             handler=_HANDLERS[name],
-            description=flat.get("description", ""),
-            emoji="\U0001f9e9",  # puzzle piece
+            description=function_schema["description"],            emoji="\U0001f9e9",  # puzzle piece
         )

@@ -957,7 +957,9 @@ class TestInterimAssistantMessageConfig:
     def test_default_config_enables_interim_assistant_messages(self):
         assert DEFAULT_CONFIG["display"]["interim_assistant_messages"] is True
 
-    def test_migrate_to_v15_adds_interim_assistant_message_gate(self, tmp_path):
+    def test_migrate_to_v15_supplies_interim_message_gate_at_read_time(
+        self, tmp_path, capsys
+    ):
         config_path = tmp_path / "config.yaml"
         config_path.write_text(
             yaml.safe_dump({"_config_version": 14, "display": {"tool_progress": "off"}}),
@@ -965,7 +967,7 @@ class TestInterimAssistantMessageConfig:
         )
 
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            migrate_config(interactive=False, quiet=True)
+            results = migrate_config(interactive=False, quiet=False)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
             loaded = load_config()
 
@@ -978,6 +980,11 @@ class TestInterimAssistantMessageConfig:
         # was the config-bloat bug). It is still effective via load_config().
         assert "interim_assistant_messages" not in raw.get("display", {})
         assert loaded["display"]["interim_assistant_messages"] is True
+        assert not any(
+            "interim_assistant_messages" in item
+            for item in results["config_added"]
+        )
+        assert "Added display.interim_assistant_messages" not in capsys.readouterr().out
 
 
 class TestCliRefreshIntervalConfig:
@@ -1311,6 +1318,54 @@ class TestDelegationCapUnificationMigration:
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
         # Migration must not materialize a delegation section it never had.
         assert "delegation" not in raw
+
+
+class TestBackgroundNotificationsConciseMigration:
+    """v34 → v35: move users on the old implicit default 'all' to 'concise'."""
+
+    def _write(self, tmp_path, body):
+        (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
+
+    def test_all_becomes_concise(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            self._write(
+                tmp_path,
+                "_config_version: 34\n"
+                "display:\n"
+                "  background_process_notifications: all\n",
+            )
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        assert raw["display"]["background_process_notifications"] == "concise"
+
+    def test_explicit_choices_preserved(self, tmp_path):
+        # NOTE: bare `off` in YAML parses as boolean False — the gateway mode
+        # loader maps False → "off", and the migration must leave it alone.
+        for written, expected in (
+            ("off", False), ("result", "result"),
+            ("error", "error"), ("concise", "concise"),
+        ):
+            with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+                self._write(
+                    tmp_path,
+                    "_config_version: 34\n"
+                    "display:\n"
+                    f"  background_process_notifications: {written}\n",
+                )
+                migrate_config(interactive=False, quiet=True)
+                raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            assert raw["display"]["background_process_notifications"] == expected
+
+    def test_unset_key_is_not_materialized(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            self._write(tmp_path, "_config_version: 34\nmodel:\n  provider: openrouter\n")
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        # Unset users inherit the new default at read time; no write needed.
+        assert "display" not in raw or "background_process_notifications" not in raw.get("display", {})
+
+    def test_default_config_is_concise(self):
+        assert DEFAULT_CONFIG["display"]["background_process_notifications"] == "concise"
 
 
 class TestConfigNormalizationDoesNotOverwriteUserValues:
