@@ -291,14 +291,16 @@ class TestRpcOriginBinding:
         tools._send_task("peer-x", peer, "hi", "")
         assert posted["url"] == "https://trusted.example/rpc"
 
-    def test_card_fetch_carries_no_credentials(self, monkeypatch):
-        """The card fetch itself must be bare: no bearer header, no custom
-        proxy headers — the card endpoint is discovery data, not a secret
-        destination."""
+    def test_card_fetch_carries_credentials_to_configured_origin(self, monkeypatch):
+        """The card fetch goes to the CONFIGURED origin, so it carries the
+        credential map (a Cloudflare-Access-fronted peer otherwise 403s the
+        card, losing streaming/capability discovery). The egress bound is on
+        the RPC destination, proven by the cross-origin tests above."""
         fetched = {}
 
         def fake_fetch(url, headers, timeout):
-            fetched["headers"] = headers
+            fetched["url"] = url
+            fetched["headers"] = dict(headers)
             return None
 
         monkeypatch.setattr(tools, "_fetch_card", fake_fetch)
@@ -313,4 +315,6 @@ class TestRpcOriginBinding:
         peer = self._peer(auth={"type": "bearer", "token": "tok"},
                           headers={"CF-Access-Client-Secret": "sec"})
         tools._send_task("peer-x", peer, "hi", "")
-        assert fetched["headers"] == {}
+        assert fetched["url"].startswith("https://configured.example")
+        assert fetched["headers"].get("Authorization") == "Bearer tok"
+        assert fetched["headers"].get("CF-Access-Client-Secret") == "sec"

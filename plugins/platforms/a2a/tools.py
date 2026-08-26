@@ -231,12 +231,14 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     idempotency = bool(peer.get("idempotency", False))
 
     # Best-effort card fetch (to learn the rpc URL); non-fatal on failure.
-    # The card is fetched WITHOUT credential-bearing headers: it is served at
-    # the configured base URL (same origin), but keeping the fetch bare keeps
-    # the credential surface exactly where the operator pinned it.
+    # The card is fetched AT the configured origin with the full credential
+    # map — same destination the operator pinned the credentials for (a
+    # Cloudflare-Access-fronted peer otherwise 403s the card and streaming
+    # discovery is lost). The egress bound is enforced on the RPC destination
+    # after the fetch: a card-advertised cross-origin URL never receives them.
     card = None
     try:
-        card = _fetch_card(base_url, {}, min(timeout, 30))
+        card = _fetch_card(base_url, headers, min(timeout, 30))
     except Exception:
         pass
 
