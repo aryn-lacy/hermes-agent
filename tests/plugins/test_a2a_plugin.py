@@ -576,7 +576,7 @@ class TestClientTools:
             description="finds things",
             skills=[{"id": "s", "name": "search", "description": "web search"}],
         )
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: card)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, ao=(): card)
         out = tools.a2a_discover({"url": "http://localhost:9999"})
         assert "researcher" in out
         assert "search" in out
@@ -586,7 +586,7 @@ class TestClientTools:
         """Outbound params: contextId inside the message, v1.0 role, no kind."""
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"r": {"url": "http://localhost:9999"}}})
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, ao=(): None)
 
         captured = {}
 
@@ -616,7 +616,7 @@ class TestClientTools:
     def test_call_reports_input_required(self, monkeypatch):
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"r": {"url": "http://localhost:9999"}}})
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, ao=(): None)
 
         def fake_post(url, body, headers, timeout, retry_524=False):
             return protocol.jsonrpc_result(
@@ -708,7 +708,7 @@ class TestRegistryDispatchConvention:
         alias for 'agent' so the call doesn't fail the required-arg guard."""
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"peer": {"url": "http://localhost:9999"}}})
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, ao=(): None)
         captured = {}
 
         def fake_post(url, body, headers, timeout, retry_524=False):
@@ -1515,7 +1515,7 @@ class TestClientTenantAndDiscovery:
     def test_rpc_body_echoes_tenant_from_agent_card(self, monkeypatch):
         posted = {}
 
-        def fake_get(url, headers, timeout):
+        def fake_get(url, headers, timeout, allowed_origins=()):
             assert url.endswith("/.well-known/agent-card.json")
             return protocol.build_agent_card(
                 name="dev",
@@ -1543,7 +1543,7 @@ class TestClientTenantAndDiscovery:
     def test_discovery_falls_back_to_legacy_agent_json(self, monkeypatch):
         calls = []
 
-        def fake_get(url, headers, timeout):
+        def fake_get(url, headers, timeout, allowed_origins=()):
             calls.append(url)
             if url.endswith("agent-card.json"):
                 raise urllib.error.HTTPError(url, 404, "not found", {}, None)
@@ -1593,7 +1593,7 @@ class TestV1SpecRegressionFixes:
     def test_client_sends_v1_method_and_unwraps_response(self, monkeypatch):
         posted = {}
 
-        def fake_get(url, headers, timeout):
+        def fake_get(url, headers, timeout, allowed_origins=()):
             return protocol.build_agent_card(
                 name="dev", url="http://peer.example/dev/", description="dev", tenant="dev-team")
 

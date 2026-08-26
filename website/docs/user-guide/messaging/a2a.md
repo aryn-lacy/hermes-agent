@@ -79,24 +79,24 @@ a2a_agents:
 
 Then just ask: *"Ask the researcher agent to summarize today's arXiv postings."* Direct URLs work too — `a2a_call` accepts any A2A endpoint.
 
-**Header precedence.** Custom `headers` override the derived `Authorization` (a proxy may require its own auth scheme — colliding configs log a warning), but protocol-owned `Content-Type`, `A2A-Version`, and `Accept` can never be clobbered. `User-Agent` stays overridable since some proxies filter it.
+**Header precedence.** Custom `headers` override the derived `Authorization` (a proxy may require its own auth scheme — the collision is logged as a warning), but protocol-owned `Content-Type` and `A2A-Version` can never be clobbered by config. `User-Agent` stays overridable since some proxies filter it.
 
-**Credential destination.** Auth and custom headers are only sent to the **configured origin**. If the peer's Agent Card advertises an RPC interface on a different origin, the send refuses to follow it (a card-controlled host must not receive your service tokens) and uses the configured origin instead. To trust a card-advertised cross-origin endpoint, pin it explicitly:
+**Credential destination.** Auth and custom headers are only sent to the **configured origin**. If the peer's Agent Card advertises an RPC interface on a different origin, the send refuses to follow it (a card-controlled host must not receive your service tokens) and uses the configured origin instead. Redirects are covered by the same policy: a 3xx pointing at a different origin is refused rather than followed. To trust a card-advertised cross-origin endpoint, pin its origin explicitly:
 
 ```yaml
 a2a_agents:
   hermes-server:
     url: "https://hermes-server-a2a.example.com"
-    allowed_rpc_origins: ["https://rpc.internal.example.com"]
+    allowed_rpc_origins: ["https://rpc.internal.example.com"]   # origin: scheme+host+port, any path
 ```
 
-**524 retries are opt-in.** A Cloudflare 524 means the proxy gave up on the response — the origin may have already executed the task. Retrying a send is therefore only safe when the peer deduplicates on message identity, which Hermes peers do. Assert that per peer:
+**524 retries are opt-in.** A Cloudflare 524 means the proxy gave up on the response — the origin may have already executed the task. Retrying a send is therefore only safe when the peer deduplicates requests, which Hermes peers do (the retry re-sends the task with identical task and message identity). Assert that per peer:
 
 ```yaml
 a2a_agents:
   hermes-server:
     url: "https://hermes-server-a2a.example.com"
-    idempotency: true   # peer dedupes on messageId -> 524s retried with backoff
+    idempotency: true   # peer dedupes -> 524s retried with backoff
 ```
 
 Without `idempotency`, a 524 surfaces to the caller as an indeterminate outcome — never auto-retried.

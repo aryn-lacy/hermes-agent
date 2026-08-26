@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 import urllib.error as urlerr
+import urllib.request
 
 from plugins.platforms.a2a import protocol, tools
 
@@ -47,7 +48,7 @@ class TestPerPeerHeaders:
         monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: None)
         captured = {}
 
-        def fake_post(url, body, headers, timeout, retry_524=False):
+        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
             captured.update(headers)
             return protocol.jsonrpc_result(
                 body["id"],
@@ -72,7 +73,7 @@ class TestPerPeerHeaders:
         monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: None)
         captured = {}
 
-        def fake_post(url, body, headers, timeout, retry_524=False):
+        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
             captured.update(headers)
             return protocol.jsonrpc_result(
                 body["id"],
@@ -92,7 +93,7 @@ class TestPerPeerHeaders:
         monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: None)
         seen = []
 
-        def fake_post(url, body, headers, timeout, retry_524=False):
+        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
             seen.append((url, headers.get("X-Tenant")))
             return protocol.jsonrpc_result(
                 body["id"],
@@ -119,11 +120,12 @@ class TestClientHttpEdgeCases:
             def __exit__(self, *a):
                 return False
 
-        def fake_urlopen(req, timeout=None):
+        def fake_open(req, timeout=None):
             seen["headers"] = dict(req.headers)
             return _Resp()
 
-        monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(tools, "_open_url_no_redirect_leak",
+                            lambda req, timeout, allowed=(): fake_open(req, timeout))
         out = tools._http_get_json("http://peer/.well-known/agent-card.json",
                                    {"CF-Access-Client-Id": "cf-id"}, 30)
         assert out == {"name": "peer"}
@@ -143,11 +145,12 @@ class Test524RetryPolicy:
         and the error surfaces to the caller."""
         attempts = {"n": 0}
 
-        def fake_urlopen(req, timeout=None):
+        def fake_open(req, timeout=None):
             attempts["n"] += 1
             raise urlerr.HTTPError(req.full_url, 524, "Origin Time-out", {}, None)
 
-        monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(tools, "_open_url_no_redirect_leak",
+                            lambda req, timeout, allowed=(): fake_open(req, timeout))
         with pytest.raises(urlerr.HTTPError) as ei:
             tools._http_post_json("http://peer/", {"x": 1}, {}, 30)
         assert ei.value.code == 524
@@ -159,11 +162,12 @@ class Test524RetryPolicy:
         monkeypatch.setattr(tools.time, "sleep", lambda s: None)
         attempts = {"n": 0}
 
-        def fake_urlopen(req, timeout=None):
+        def fake_open(req, timeout=None):
             attempts["n"] += 1
             raise urlerr.HTTPError(req.full_url, 524, "Origin Time-out", {}, None)
 
-        monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(tools, "_open_url_no_redirect_leak",
+                            lambda req, timeout, allowed=(): fake_open(req, timeout))
         with pytest.raises(urlerr.HTTPError):
             tools._http_post_json("http://peer/", {"x": 1}, {}, 30, retry_524=True)
         assert attempts["n"] == tools._POST_MAX_RETRIES
@@ -184,13 +188,14 @@ class Test524RetryPolicy:
             def __exit__(self, *a):
                 return False
 
-        def fake_urlopen(req, timeout=None):
+        def fake_open(req, timeout=None):
             attempts["n"] += 1
             if attempts["n"] < tools._POST_MAX_RETRIES:
                 raise urlerr.HTTPError(req.full_url, 524, "Origin Time-out", {}, None)
             return _Ctx()
 
-        monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(tools, "_open_url_no_redirect_leak",
+                            lambda req, timeout, allowed=(): fake_open(req, timeout))
         out = tools._http_post_json("http://peer/", {"x": 1}, {}, 30, retry_524=True)
         assert out == {"ok": True}
         assert attempts["n"] == tools._POST_MAX_RETRIES
@@ -199,11 +204,12 @@ class Test524RetryPolicy:
     def test_other_errors_never_retried(self, monkeypatch):
         attempts = {"n": 0}
 
-        def fake_urlopen(req, timeout=None):
+        def fake_open(req, timeout=None):
             attempts["n"] += 1
             raise urlerr.HTTPError(req.full_url, 502, "Bad Gateway", {}, None)
 
-        monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(tools, "_open_url_no_redirect_leak",
+                            lambda req, timeout, allowed=(): fake_open(req, timeout))
         with pytest.raises(urlerr.HTTPError):
             tools._http_post_json("http://peer/", {"x": 1}, {}, 30, retry_524=True)
         assert attempts["n"] == 1
@@ -218,7 +224,7 @@ class Test524RetryPolicy:
         monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: None)
         captured = {}
 
-        def fake_post(url, body, headers, timeout, retry_524=False):
+        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
             captured["retry_524"] = retry_524
             return protocol.jsonrpc_result(
                 body["id"],
@@ -228,6 +234,192 @@ class Test524RetryPolicy:
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
         tools.a2a_call({"agent": "mac", "message": "ping"})
         assert captured["retry_524"] is True
+
+
+# ---------------------------------------------------------------------------
+# User-Agent on the real POST path
+# ---------------------------------------------------------------------------
+
+class TestPostUserAgent:
+    def test_post_sends_hermes_user_agent(self, monkeypatch):
+        """The Hermes-A2A/1.0 UA must be on real POSTs (proxy filtering);
+        asserted at the opener seam where the Request is actually built."""
+        captured = {}
+
+        def fake_open(req, timeout, allowed=()):
+            captured["ua"] = req.get_header("User-agent")
+            return _Ctxlike()
+
+        class _Ctxlike:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        monkeypatch.setattr(tools, "_open_url_no_redirect_leak", fake_open)
+        out = tools._http_post_json("http://peer/", {"x": 1}, {}, 30)
+        assert out == {"ok": True}
+        assert captured["ua"] == "Hermes-A2A/1.0"
+
+
+# ---------------------------------------------------------------------------
+# Redirect policy: credentials never follow a cross-origin 3xx
+# ---------------------------------------------------------------------------
+
+class TestRedirectPolicy:
+    def _redirect_handler(self, allowed=()):
+        from plugins.platforms.a2a.tools import _NoCredentialRedirectHandler
+        return _NoCredentialRedirectHandler(tuple(allowed))
+
+    def test_same_origin_redirect_followed(self):
+        h = self._redirect_handler()
+        req = urllib.request.Request("https://configured.example/rpc")
+        new = h.redirect_request(req, None, 302, "Found", {},
+                                 "https://configured.example/rpc/v2")
+        assert new is not None  # followed: same origin, credentials stay on-service
+
+    def test_cross_origin_redirect_refused(self):
+        """THE exfiltration vector: a 3xx from the (trusted, same-origin)
+        endpoint pointing at a foreign host must be refused, not followed.
+        Under the old default opener the foreign host received the full
+        credential map (empirically reproduced in review run t_2ee74a0d)."""
+        h = self._redirect_handler()
+        req = urllib.request.Request("https://configured.example/rpc")
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            h.redirect_request(req, None, 302, "Found", {},
+                               "https://evil.example/collect")
+        assert "refused" in str(ei.value.reason)
+
+    def test_cross_origin_redirect_allowed_via_pinned_origin(self):
+        h = self._redirect_handler(allowed=["https://trusted.example/rpc"])
+        req = urllib.request.Request("https://configured.example/rpc")
+        new = h.redirect_request(req, None, 302, "Found", {},
+                                 "https://trusted.example/other/path")
+        assert new is not None
+
+    def test_scheme_change_is_cross_origin(self):
+        h = self._redirect_handler()
+        req = urllib.request.Request("https://configured.example/rpc")
+        with pytest.raises(urllib.error.HTTPError):
+            h.redirect_request(req, None, 302, "Found", {},
+                               "http://configured.example/rpc")  # https->http downgrade refused
+
+    def test_port_change_is_cross_origin(self):
+        h = self._redirect_handler()
+        req = urllib.request.Request("https://configured.example/rpc")
+        with pytest.raises(urllib.error.HTTPError):
+            h.redirect_request(req, None, 302, "Found", {},
+                               "https://configured.example:8443/rpc")
+
+    def test_end_to_end_post_refuses_cross_origin_redirect(self, monkeypatch):
+        """Full POST path through the guarded opener: the redirecting server
+        never gets a second request, the foreign target is never contacted,
+        and the caller sees the refusal."""
+        import http.server
+        import threading
+        hits = {"redirector": 0, "foreign": 0}
+
+        class Foreign(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                hits["foreign"] += 1
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                hits["redirector"] += 1
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{foreign_port}/x")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        fs = http.server.HTTPServer(("127.0.0.1", 0), Foreign)
+        foreign_port = fs.server_address[1]
+        rs = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+        threading.Thread(target=fs.serve_forever, daemon=True).start()
+        threading.Thread(target=rs.serve_forever, daemon=True).start()
+        try:
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                tools._http_post_json(f"http://127.0.0.1:{rs.server_address[1]}/",
+                                      {"x": 1}, {"Authorization": "Bearer tok"}, 10)
+            assert hits == {"redirector": 1, "foreign": 0}
+            assert "refused" in str(ei.value.reason)
+        finally:
+            fs.shutdown()
+            rs.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Origin-level allowlist matching
+# ---------------------------------------------------------------------------
+
+class TestOriginLevelAllowlist:
+    def test_allowlist_entry_matches_any_path(self):
+        peer = {"url": "https://configured.example",
+                "allowed_rpc_origins": ["https://trusted.example"]}
+        assert tools._origin_allowed("https://trusted.example/rpc", peer)
+        assert tools._origin_allowed("https://trusted.example/", peer)
+        assert tools._origin_allowed("https://trusted.example", peer)
+
+    def test_allowlist_is_origin_scoped_not_string_scoped(self):
+        peer = {"url": "https://configured.example",
+                "allowed_rpc_origins": ["https://trusted.example"]}
+        assert not tools._origin_allowed("https://trusted.evil.example/rpc", peer)
+        assert not tools._origin_allowed("https://trusted.example:8443/rpc", peer)
+        assert not tools._origin_allowed("http://trusted.example/rpc", peer)
+
+    def test_port0_is_not_silently_defaulted(self):
+        assert tools._url_origin("https://configured.example:0/rpc") == ("https", "configured.example:0")
+        assert not tools._url_same_origin("https://configured.example:0/rpc",
+                                          "https://configured.example/rpc")
+
+
+class TestAuthCollisionWarning:
+    def test_authorization_override_logs_warning(self, monkeypatch, caplog):
+        import logging as _logging
+        peer = {"url": "http://localhost:9999",
+                "auth": {"type": "bearer", "token": "t"},
+                "headers": {"Authorization": "ProxyAuth xyz"}}
+        monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: None)
+
+        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
+            return protocol.jsonrpc_result(
+                body["id"],
+                protocol.build_task("t", "c1", protocol.STATE_COMPLETED, "ok"),
+            )
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        with caplog.at_level(_logging.WARNING, logger="plugins.platforms.a2a.tools"):
+            tools._send_task("p", peer, "hi", "")
+        assert any("override the derived Authorization" in r.message for r in caplog.records)
+
+    def test_distinct_headers_do_not_warn(self, monkeypatch, caplog):
+        import logging as _logging
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {"p": {
+            "url": "http://localhost:9999",
+            "auth": {"type": "bearer", "token": "t"},
+            "headers": {"CF-Access-Client-Id": "x"},
+        }}})
+
+        def fake_send(*a, **k):
+            return ("reply", "ctx", protocol.STATE_COMPLETED)
+
+        monkeypatch.setattr(tools, "_send_task", fake_send)
+        with caplog.at_level(_logging.WARNING, logger="plugins.platforms.a2a.tools"):
+            tools.a2a_call({"agent": "p", "message": "hi"})
+        assert not any("override the derived Authorization" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +451,7 @@ class TestRpcOriginBinding:
         monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: card)
         posted = {}
 
-        def fake_post(url, body, headers, timeout, retry_524=False):
+        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
             posted["url"] = url
             return protocol.jsonrpc_result(
                 body["id"],
@@ -279,7 +471,7 @@ class TestRpcOriginBinding:
         monkeypatch.setattr(tools, "_fetch_card", lambda *a, **k: card)
         posted = {}
 
-        def fake_post(url, body, headers, timeout, retry_524=False):
+        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
             posted["url"] = url
             return protocol.jsonrpc_result(
                 body["id"],
@@ -298,14 +490,14 @@ class TestRpcOriginBinding:
         the RPC destination, proven by the cross-origin tests above."""
         fetched = {}
 
-        def fake_fetch(url, headers, timeout):
+        def fake_fetch(url, headers, timeout, allowed_origins=()):
             fetched["url"] = url
             fetched["headers"] = dict(headers)
             return None
 
         monkeypatch.setattr(tools, "_fetch_card", fake_fetch)
 
-        def fake_post(url, body, headers, timeout, retry_524=False):
+        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
             return protocol.jsonrpc_result(
                 body["id"],
                 protocol.build_task("t", "c1", protocol.STATE_COMPLETED, "ok"),
