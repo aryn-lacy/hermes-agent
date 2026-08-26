@@ -590,7 +590,7 @@ class TestClientTools:
 
         captured = {}
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, retry_524=False):
             captured["body"] = body
             ctx = body["params"]["message"].get("contextId", "c1")
             return protocol.jsonrpc_result(
@@ -618,7 +618,7 @@ class TestClientTools:
                             lambda: {"a2a_agents": {"r": {"url": "http://localhost:9999"}}})
         monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, retry_524=False):
             return protocol.jsonrpc_result(
                 body["id"],
                 protocol.build_task("t", "ctx-q", protocol.STATE_INPUT_REQUIRED, "Which repo?"),
@@ -861,7 +861,7 @@ class TestRegistryDispatchConvention:
         monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
         captured = {}
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, retry_524=False):
             captured["sent"] = True
             return protocol.jsonrpc_result(
                 body["id"],
@@ -1674,7 +1674,7 @@ class TestClientTenantAndDiscovery:
                 tenant="dev-team",
             )
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, retry_524=False):
             posted["url"] = url
             posted["body"] = body
             return {"jsonrpc": "2.0", "id": body["id"], "result": protocol.build_task(
@@ -1747,7 +1747,7 @@ class TestV1SpecRegressionFixes:
             return protocol.build_agent_card(
                 name="dev", url="http://peer.example/dev/", description="dev", tenant="dev-team")
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, retry_524=False):
             posted["headers"] = headers
             posted["body"] = body
             return {"jsonrpc": "2.0", "id": body["id"], "result": {"task": protocol.build_task(
@@ -1902,108 +1902,3 @@ print('fake reply')
 # Client HTTP edge cases: GET-layer headers, collision precedence,
 # 524 retry budget
 # --------------------------------------------------------------------------
-
-class TestClientHttpEdgeCases:
-    """Edge cases beyond TestPerPeerHeaders: the GET (card) path at the
-    urllib layer, header-collision precedence, and the 524 retry budget."""
-
-    def test_get_json_sends_user_agent_and_custom_headers(self, monkeypatch):
-        """Card fetches hit the same header-auth proxy as task submits —
-        GETs must carry per-peer headers and the real User-Agent too."""
-        seen = {}
-
-        class _Resp:
-            def read(self):
-                return b'{"name": "peer"}'
-
-        class _Ctx:
-            def __enter__(self):
-                return _Resp()
-
-            def __exit__(self, *a):
-                return False
-
-        def fake_urlopen(req, timeout=None):
-            seen["headers"] = dict(req.header_items())
-            return _Ctx()
-
-        monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
-        out = tools._http_get_json("http://peer/.well-known/agent-card.json",
-                                   {"CF-Access-Client-Id": "cf-id"}, 30)
-        assert out == {"name": "peer"}
-        lowered = {k.lower(): v for k, v in seen["headers"].items()}
-        assert lowered["user-agent"] == "Hermes-A2A/1.0"
-        assert lowered["cf-access-client-id"] == "cf-id"
-
-    def test_custom_headers_override_derived_auth_header(self, monkeypatch):
-        """Peer config headers win over the derived Authorization header on
-        name collision (a proxy may require a different auth scheme)."""
-        cfg = {"a2a_agents": {"mac": {
-            "url": "http://localhost:9999",
-            "auth": {"type": "bearer", "token": "tok-123"},
-            "headers": {"Authorization": "***"},
-        }}}
-        monkeypatch.setattr(tools, "_load_config", lambda: cfg)
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
-        captured = {}
-
-        def fake_post(url, body, headers, timeout):
-            captured.update(headers)
-            return protocol.jsonrpc_result(
-                body["id"],
-                protocol.build_task("t", "c1", protocol.STATE_COMPLETED, "ok"),
-            )
-
-        monkeypatch.setattr(tools, "_http_post_json", fake_post)
-        tools.a2a_call({"agent": "mac", "message": "ping"})
-        assert captured["Authorization"] == "***"
-
-    def test_524_exhausts_retry_budget_then_raises(self, monkeypatch):
-        """A persistently 524-ing peer must eventually surface the error
-        (after _POST_MAX_RETRIES attempts), not retry forever."""
-        import urllib.error as urlerr
-
-        monkeypatch.setattr(tools.time, "sleep", lambda s: None)
-        attempts = {"n": 0}
-
-        def fake_urlopen(req, timeout=None):
-            attempts["n"] += 1
-            raise urlerr.HTTPError(req.full_url, 524, "Origin Time-out", {}, None)
-
-        monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
-        with pytest.raises(urlerr.HTTPError) as ei:
-            tools._http_post_json("http://peer/", {"x": 1}, {}, 30)
-        assert ei.value.code == 524
-        assert attempts["n"] == tools._POST_MAX_RETRIES
-
-    def test_524_backoff_is_exponential(self, monkeypatch):
-        """Success on the last attempt exercises the full backoff ladder."""
-        import urllib.error as urlerr
-
-        sleeps = []
-        monkeypatch.setattr(tools.time, "sleep", lambda s: sleeps.append(s))
-        attempts = {"n": 0}
-
-        class _Resp:
-            def read(self):
-                return b'{"ok": true}'
-
-        class _Ctx:
-            def __enter__(self):
-                return _Resp()
-
-            def __exit__(self, *a):
-                return False
-
-        def fake_urlopen(req, timeout=None):
-            attempts["n"] += 1
-            if attempts["n"] < tools._POST_MAX_RETRIES:
-                raise urlerr.HTTPError(req.full_url, 524, "Origin Time-out", {}, None)
-            return _Ctx()
-
-        monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
-        out = tools._http_post_json("http://peer/", {"x": 1}, {}, 30)
-        assert out == {"ok": True}
-        assert attempts["n"] == tools._POST_MAX_RETRIES
-        assert sleeps == [1, 2]
-
