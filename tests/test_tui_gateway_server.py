@@ -3887,7 +3887,7 @@ def test_session_cwd_set_profile_session_updates_profile_db(monkeypatch, tmp_pat
     assert "launch_update" not in captured
 
 
-def test_stored_session_runtime_overrides_skips_bare_billing_provider():
+def test_stored_session_runtime_overrides_skips_bare_billing_provider(monkeypatch):
     """A bare billing bucket ("custom"/"auto") must not be restored as the provider
     identity on resume. A custom endpoint that never used `/model` persists only
     `billing_provider="custom"`; restoring that broke `session.resume` with "No LLM provider
@@ -3909,7 +3909,23 @@ def test_stored_session_runtime_overrides_skips_bare_billing_provider():
     assert ov["provider_override"] == "anthropic"
     assert ov["model_override"]["provider"] == "anthropic"
 
-    # An explicit routable provider in model_config wins over the bare billing bucket.
+    # An explicit ROUTABLE provider in model_config wins over the bare billing
+    # bucket. It must actually resolve in the registry — a stale/renamed
+    # provider is dropped (see TestStaleProviderNameFallsBack).
+    cfg = {
+        "custom_providers": [
+            {
+                "name": "myendpoint",
+                "base_url": "https://myendpoint.invalid/v1",
+                "api_key": "sk-test",
+                "model": "m",
+            }
+        ]
+    }
+    import hermes_cli.runtime_provider as rp
+
+    monkeypatch.setattr(rp, "load_config", lambda: cfg)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
     ov = server._stored_session_runtime_overrides(
         {"model": "m", "billing_provider": "custom", "model_config": {"provider": "custom:myendpoint"}}
     )
@@ -10716,6 +10732,49 @@ def test_commands_catalog_filters_gateway_only_commands_and_keeps_status_visible
     assert "/approve" not in canon
     assert "/deny" not in canon
     assert "/set-home" not in canon
+
+
+def test_commands_catalog_includes_desktop_meta_without_skills():
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+
+    commands = resp["result"]["commands"]
+    assert commands["/review"] == {"argument_mode": "text", "desktop": None}
+    assert commands["/clear"]["desktop"] == "terminal"
+    assert commands["/model"]["desktop"] == "hidden"
+    assert commands["/compact"]["argument_mode"] == commands["/compress"]["argument_mode"]
+
+    for skill in resp["result"]["skills"]:
+        assert skill not in commands
+
+
+def test_commands_catalog_includes_plugin_commands(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_commands",
+        lambda: {
+            "lcm": {
+                "description": "Latent consistency",
+                "args_hint": "<prompt>",
+                "argument_mode": "text",
+            }
+        },
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+
+    assert resp["result"]["commands"]["/lcm"] == {
+        "argument_mode": "text",
+        "desktop": None,
+    }
+    pairs = dict(resp["result"]["pairs"])
+    assert "/lcm" in pairs
+    plugin_cat = next(
+        c for c in resp["result"]["categories"] if c["name"] == "Plugin commands"
+    )
+    assert "/lcm" in dict(plugin_cat["pairs"])
 
 
 def test_session_status_reads_live_gateway_agent(monkeypatch):

@@ -139,11 +139,21 @@ class TestImageRejectionPhraseIsolation:
         "model does not support image",
         "image_url'. expected",
         "no endpoints found that support image input",
+        "failed to decode image",
+        "image data you provided does not represent a valid image",
     )
 
     def _matches(self, body: str) -> bool:
         low = body.lower()
         return any(p in low for p in self._REJECTION_PHRASES)
+
+    def test_kimi_truncated_image_trips_recovery(self):
+        # Kimi/Moonshot reject truncated image bytes with this 400; the
+        # bad bytes are in immutable history so stripping must fire.
+        body = ("HTTP 400: Invalid request: prepare image failed error, "
+                "status code: 400, message: failed to decode image: invalid "
+                "or unsupported image format")
+        assert self._matches(body) is True
 
     def test_anthropic_image_too_large_does_not_trip(self):
         # From agent/error_classifier.py _IMAGE_TOO_LARGE_PATTERNS —
@@ -160,5 +170,22 @@ class TestImageRejectionPhraseIsolation:
 
 
 
+    def test_real_image_rejection_bodies_trip(self):
+        """Positive cases — real-world error wordings that should trigger."""
+        bodies = [
+            "Only 'text' content type is supported.",
+            "Bad request: multimodal is not supported by this model",
+            "This model does not support images",
+            "vision is not supported on this endpoint",
+            "model does not support image input",
+            # ChatGPT-account Codex backend (issue #23570) — rejects
+            # data:image/...base64 URLs in input_image fields. Without this
+            # match the agent cascaded into compression / context-too-large
+            # recovery instead of just stripping the images.
+            "Invalid 'input[56].content[1].image_url'. Expected a valid URL, but got a value with an invalid format.",
+            "The image data you provided does not represent a valid image. Please check your input and try again.",
+        ]
+        for body in bodies:
+            assert self._matches(body) is True, f"false negative on: {body}"
 
 
