@@ -60,13 +60,8 @@ except ImportError:
         "PRIVATE": "private_chat", "PUBLIC": "public_chat", "TRUSTED_PRIVATE": "trusted_private_chat"})
     TrustState = type("_TrustStateStub", (), {"UNVERIFIED": 0, "VERIFIED": 1})  # type: ignore[misc,assignment]
 
-try:
-    from mautrix.errors import MatrixRequestError
-except ImportError:  # pragma: no cover - module must import without mautrix
-    class MatrixRequestError(Exception):  # type: ignore[no-redef]
-        """Stub so the module is importable without mautrix installed."""
-
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base_exec_approval import EA_HEADER_TEXT
 from gateway.platforms.base import (
     gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt,
     SendResult, resolve_proxy_url, proxy_kwargs_for_aiohttp, _ssrf_redirect_guard,
@@ -201,6 +196,26 @@ def _strip_reply_fallback(body: str) -> str:
                 continue
         stripped.append(line)
     return "\n".join(stripped) if stripped else body
+
+
+def _split_reply_fallback(body: str) -> tuple[str, str]:
+    """Split ``> quote\\n\\nreply`` into ``(quote_block, reply_text)``; ``("", body)`` when absent.
+
+    The two halves always concatenate back to *body* verbatim (``quote + reply == body``), so
+    callers can transform one half and rebuild the body without disturbing the other. The blank
+    separator line belongs to the quote block. Used to keep the ``> <@user:srv>`` reply pill —
+    the only mention text in a reply-to-the-bot — out of whole-body rewrites.
+    """
+    if not body or not body.startswith("> "):
+        return "", body
+    lines = body.split("\n")
+    idx = 0
+    while idx < len(lines) and (lines[idx].startswith("> ") or lines[idx] == ">"):
+        idx += 1
+    if idx < len(lines) and lines[idx] == "":
+        idx += 1  # the blank line separating the quote from the reply belongs to the quote
+    head = "\n".join(lines[:idx])
+    return (head, "") if idx >= len(lines) else (head + "\n", "\n".join(lines[idx:]))
 
 
 class _MatrixHtmlSanitizer(HTMLParser):
@@ -1368,6 +1383,23 @@ class MatrixAdapter(BasePlatformAdapter):
             self._client.send_message_event(RoomID(chat_id), EventType.ROOM_MESSAGE, msg_content), timeout=45)
         return str(event_id)
 
+    async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
+        """Post a seed message and return its ``event_id`` as the handoff ``thread_id``. Matrix has
+        no create-thread API: a thread is the events whose ``m.relates_to``/``rel_type: m.thread``
+        point at a root event (Slack-style), and ``_apply_relation_metadata`` already threads later
+        sends off a supplied ``thread_id``. ``None`` when disconnected or the seed send failed.
+
+        In-thread replies keep the ROOM's chat_type (``dm``/``group``) in the session key — the
+        handoff watcher and the cron seeder mirror that shape rather than the shared ``thread`` slot."""
+        if self._client is None:
+            return None
+        result = await self.send(parent_chat_id, (name or "").strip() or "Hermes session")
+        root = result.message_id if result.success else None
+        if not root:
+            return None
+        self._threads.mark(str(root))  # replies in this thread bypass require_mention, like inbound roots
+        return str(root)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         identity = await self._resolve_room_identity(chat_id)
         return {"name": identity.display_name, "type": "dm" if identity.chat_type == "dm" else "group"}
@@ -1558,7 +1590,7 @@ class MatrixAdapter(BasePlatformAdapter):
 
     # Template attrs for the shared _format_exec_approval core (header + fence + reason only;
     # the smart-deny/scope wording lives in the reaction legend below).
-    _EA_HEADER = "⚠️ **Dangerous command requires approval**\n"
+    _EA_HEADER = f"⚠️ **{EA_HEADER_TEXT}**\n"
     _EA_CMD_BUDGET = 2000
 
     async def _send_reaction_prompt(
@@ -1765,45 +1797,42 @@ class MatrixAdapter(BasePlatformAdapter):
     def _is_permanent_auth_error(self, exc: Exception) -> bool:
         """Classify a sync-loop exception as a permanent auth failure.
 
-        Must use the exception's STRUCTURED fields (type, http_status,
-        errcode), never substring matching over str(exc): proxy/CDN error
-        pages are delivered as MatrixUnknownRequestError and their HTML can
-        contain arbitrary text (the 2026-08-31 Cloudflare 502 page contained
-        "401"). M_* auth errcodes come only from the homeserver itself, so
-        they are the authoritative permanent-auth verdict.
-        """
-        # Not a homeserver response at all (connection reset, timeout, ...)
-        if not isinstance(exc, MatrixRequestError):
-            return False
+        Structured fields only (errcode, http_status) — never substring
+        matching over str(exc): proxy/CDN error pages carry arbitrary text
+        (the 2026-08-31 Cloudflare 502 page contained "401"; upstream hit
+        the same class of false positive via an SVG path coordinate
+        embedding "403"). M_* auth errcodes come only from the homeserver,
+        so they are the authoritative permanent-auth verdict, trusted on
+        ANY exception shape. The bare-status fallback (401/403 with no
+        errcode) requires an int http_status, deliberately not
+        .status/.status_code/.errno: those belong to unrelated exception
+        shapes and can misclassify on a coincidental integer.
 
-        # Homeserver-verdict auth errors are unambiguous. M_UNKNOWN_TOKEN
-        # (raised as the MatrixInvalidToken subclass) carries the errcode.
+        Union policy adopted at the 2026-09-17 upstream merge: upstream's
+        contract tests feed duck-typed (non-mautrix) exceptions carrying
+        the same structured attrs, so the earlier MatrixRequestError
+        isinstance gate is dropped — the structured auth signals alone
+        decide, on any exception type.
+        """
         errcode = getattr(exc, "errcode", None)
         if errcode in ("M_UNKNOWN_TOKEN", "M_MISSING_TOKEN", "M_FORBIDDEN"):
             return True
 
-        # Legacy/edge servers may report auth failures as a bare HTTP
-        # status with no M_* errcode. Status 401/403 from the HOMESERVER
-        # (errcode absent but the exception typed as a Matrix response)
-        # is authoritative; nothing else is.
-        http_status = getattr(exc, "http_status", 0) or 0
-        if errcode is None and http_status in (401, 403):
-            return True
-
-        return False
+        http_status = getattr(exc, "http_status", None)
+        return (
+            isinstance(http_status, int)
+            and errcode is None
+            and http_status in (401, 403)
+        )
 
     async def _sync_loop(self) -> None:
         client = self._client
         next_batch = await client.sync_store.get_next_batch()  # resume from the initial sync
         while not self._closing:
             try:
-                # 45s outer cap guards TCP-level hangs the 30s long-poll timeout can't catch.
+                # 45s outer cap guards TCP-level hangs the 30s long-poll timeout cannot catch.
+                # mautrix raises on every non-2xx, so a non-dict here is never an error object.
                 sync_data = await asyncio.wait_for(client.sync(since=next_batch, timeout=30000), timeout=45.0)
-                # Auth failures (M_UNKNOWN_TOKEN) arrive as SyncError objects, not exceptions.
-                _sync_msg = getattr(sync_data, "message", None)
-                if isinstance(_sync_msg, str) and "unknown_token" in _sync_msg.lower():
-                    logger.error("Matrix: permanent auth error from sync: %s — stopping", _sync_msg)
-                    return
                 if isinstance(sync_data, dict):
                     next_batch = await self._absorb_sync(client, sync_data) or next_batch
                     await asyncio.sleep(0)  # let fresh invite joins start before the next sync
@@ -1813,10 +1842,11 @@ class MatrixAdapter(BasePlatformAdapter):
                 if self._closing:
                     return
                 # Permanent auth/permission failures: classify via the
-                # exception's structured fields (type / M_* errcode /
-                # HTTP status). Never substring-match str(exc): CDN/proxy
+                # exception's structured fields (errcode / int HTTP
+                # status). Never substring-match str(exc): CDN/proxy
                 # error pages (e.g. Cloudflare 502 HTML containing "401")
-                # ride in as MatrixUnknownRequestError and are retryable.
+                # ride in and are retryable. Union policy with upstream:
+                # structured signals trusted on any exception shape.
                 if self._is_permanent_auth_error(exc):
                     logger.error(
                         "Matrix: permanent auth error: %s — stopping sync", exc
@@ -2017,7 +2047,16 @@ class MatrixAdapter(BasePlatformAdapter):
                     event_id, thread_id)
                 return None
         if is_mentioned and self._require_mention:
-            body = self._strip_mention(body)
+            # Strip the mention from the reply text only: the quote block carries the
+            # ``> <@bot:srv> ...`` reply pill, which _extract_reply_context parses later
+            # for reply_to_author_id. A whole-body replace rewrote the pill to ``> <>``
+            # and silently dropped the replied-to author (#111233). Only a real reply carries a
+            # pill; a hand-typed blockquote in a plain message is stripped whole as before.
+            if relates_to.get("m.in_reply_to"):
+                quote_block, reply_text = _split_reply_fallback(body)
+                body = quote_block + self._strip_mention(reply_text)
+            else:
+                body = self._strip_mention(body)
         # Real thread roots are preserved above; synthetic roots (this event) follow policy: DM
         # @mention threads / DM auto-thread, or room auto-thread unless session_scope pins the room.
         if not thread_id:
