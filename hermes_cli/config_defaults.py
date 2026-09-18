@@ -855,6 +855,9 @@ DEFAULT_CONFIG = {
         # Gateway: natural mid-turn assistant status messages. Desktop: keep mid-turn narration
         # between tool calls instead of collapsing to the final message.
         "interim_assistant_messages": True,
+        # Engine warning/failure notifications stay visible unless an operator opts in.
+        # Does not suppress task results, manual commands, or existing logs.
+        "suppress_warning_notifications": False,
         # Codex Responses commentary channel: true delivers completed commentary as mid-turn interim
         # updates; false routes it to reasoning (visible only with show_reasoning).
         "show_commentary": True,
@@ -1451,9 +1454,9 @@ DEFAULT_CONFIG = {
         "allowed_channels": "",  # if set, ONLY respond in these channel IDs (whitelist)
         "auto_thread": True,  # auto-create threads on @mention in channels (like Slack)
         "thread_require_mention": False,  # require @mention in threads too (multi-bot threads)
-        # Multi-bot rooms: another bot must type @thisbot (a reply/quote alone won't) to trigger a
-        # reply — stops two bots replying to each other forever. Humans unaffected.
-        "bots_require_inline_mention": False,
+        # Bot authors must type @thisbot to trigger a reply; Discord reply pings alone do not count.
+        # Set False only for trusted legacy relays. Humans are unaffected.
+        "bots_require_inline_mention": True,
         # Prepend recent channel scrollback when triggered (recovers messages gated out by
         # require_mention); limit = max messages scanned.
         "history_backfill": True,
