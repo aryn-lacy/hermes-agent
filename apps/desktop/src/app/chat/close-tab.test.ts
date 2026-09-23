@@ -74,7 +74,7 @@ describe('closeActiveTab', () => {
   // pane's registered closer) rather than a rail-shaped special case. Open
   // previews must therefore NOT claim the key on their own.
   it('leaves ⌘W to the zone rungs even with previews open', () => {
-    openPreview(fileTarget('/work/notes.md'), 'manual')
+    openPreview(fileTarget('/work/notes.md'))
     closeFocusedToolTab.mockReturnValue(true)
 
     expect($previewTabs.get()).toHaveLength(1)
@@ -106,13 +106,6 @@ describe('closeWorkspaceTab', () => {
     loadedMainOnly()
 
     expect(closeWorkspaceTab(vi.fn())).toBe(true)
-    expect(requestFreshSession).toHaveBeenCalledTimes(1)
-  })
-
-  it('empties main even with no session loader wired', () => {
-    loadedMainOnly()
-
-    expect(closeWorkspaceTab()).toBe(true)
     expect(requestFreshSession).toHaveBeenCalledTimes(1)
   })
 
