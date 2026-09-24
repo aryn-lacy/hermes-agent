@@ -64,7 +64,12 @@ import {
 import { dashboardFallbackArgs } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { BackendDialClaims } from './backend-dial-claim'
-import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
+import {
+  buildDesktopBackendEnv,
+  hermesManagedNodePathEntries,
+  normalizeHermesHomeRoot,
+  profileBackendParentEnv
+} from './backend-env'
 import { createBackendExitRecoveryLatch } from './backend-exit-recovery'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
@@ -490,6 +495,7 @@ import {
 import { isHermesOwnedVenvDaemon } from './venv-holder-select'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
+import { windowAcceleratorAction } from './window-accelerator'
 import { enumerateWindowsFrontToBack, enumerationFailed, readWindowBelow } from './window-below'
 import { bindWindowChromeEvents } from './window-chrome-events'
 import {
@@ -7466,14 +7472,14 @@ function installDevToolsShortcut(window) {
 
 function installPreviewShortcut(window) {
   window.webContents.on('before-input-event', (event, input) => {
-    const key = String(input.key || '').toLowerCase()
-    const accel = (IS_MAC ? input.meta : input.control) && !input.alt
-    const isCloseTabShortcut = key === 'w' && accel && !input.shift
+    const action = windowAcceleratorAction(input, IS_MAC)
 
     // Always claim ⌘W here (the File>Close item deliberately has no
     // accelerator, so nothing else does). The renderer decides tab-vs-window
     // — no `previewShortcutActive` gate, so it works for every closeable tab.
-    if (isCloseTabShortcut) {
+    // keyUp is not a claim: a chord that started in another app can deliver
+    // its leftover keyup when this window inherits focus (#105498).
+    if (action === 'close-tab') {
       event.preventDefault()
 
       // ⌘W in the HUD is "leave HUD mode", not "close a tab in the app
@@ -7496,7 +7502,7 @@ function installPreviewShortcut(window) {
     // see #77845), so a menu accelerator would leave Windows and Linux with no
     // way to reload a page at all. ⇧⌘R is left alone — that is `forceReload`,
     // the unconditional whole-window escape hatch.
-    if (key === 'r' && accel && !input.shift) {
+    if (action === 'reload') {
       event.preventDefault()
       sendPreviewNavCommand('reload')
     }
@@ -7598,33 +7604,19 @@ function installZoomShortcuts(window) {
   // Chromium's default handler would use the full 0.2 step, so we intercept
   // here for consistency. Ctrl/Cmd+0 resets to DEFAULT_ZOOM_LEVEL, not Chromium 0.
   window.webContents.on('before-input-event', (event, input) => {
-    const mod = IS_MAC ? input.meta : input.control
+    const action = windowAcceleratorAction(input, IS_MAC)
 
-    if (!mod || input.alt) {
-      return
-    }
-
-    const key = input.key
-
-    if (key === '0') {
-      if (input.shift) {
-        return // Ctrl/Cmd+Shift+0 is not a zoom chord — leave it alone
-      }
-
+    if (action === 'zoom-reset') {
       event.preventDefault()
       setAndPersistZoomLevel(window, DEFAULT_ZOOM_LEVEL)
-    } else if (key === '=' || key === '+') {
+    } else if (action === 'zoom-in') {
       // Zoom-in must accept the shift modifier: on US layouts Plus is
       // physically Shift+=, so Cmd+Plus arrives as Cmd+Shift+'+' (or '='
       // depending on platform). The old blanket shift guard silently
       // dropped keyboard zoom-in on macOS (#43517).
       event.preventDefault()
       setAndPersistZoomLevel(window, window.webContents.getZoomLevel() + ZOOM_STEP)
-    } else if (key === '-') {
-      if (input.shift) {
-        return // Shift+'-' is '_' territory on most layouts, not zoom-out
-      }
-
+    } else if (action === 'zoom-out') {
       event.preventDefault()
       setAndPersistZoomLevel(window, window.webContents.getZoomLevel() - ZOOM_STEP)
     }
@@ -12726,7 +12718,8 @@ async function runPoolBackendStart(
       cwd: hermesCwd,
       env: desktopBackendSpawnEnv(
         {
-          ...process.env,
+          // Never another profile's dotenv credentials from the Desktop env (#68367).
+          ...profileBackendParentEnv({ hermesHome: HERMES_HOME, profile }),
           HERMES_HOME,
           ...backend.env,
           // Pin the gateway's tool/terminal cwd to the same directory we chose for
@@ -13510,7 +13503,8 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
         cwd: hermesCwd,
         env: desktopBackendSpawnEnv(
           {
-            ...process.env,
+            // Never another profile's dotenv credentials from the Desktop env (#68367).
+            ...profileBackendParentEnv({ hermesHome: HERMES_HOME, profile: activeProfile }),
             // Explicitly pin HERMES_HOME for the child so Python's get_hermes_home()
             // resolves to the SAME location our resolveHermesHome() picked. Without
             // this pin, Python falls back to ~/.hermes on every platform — fine on
