@@ -533,6 +533,34 @@ export function activeGateway(): HermesGateway | null {
   return g.secondaries.get(g.activeKey)?.gateway ?? null
 }
 
+/** Passive ordering barrier for a runtime's transcript reads. Inspect only
+ * existing sockets: waiting must never dial, activate, or retain a backend.
+ * Each client names its own replaying runtime IDs; no ambient route is used
+ * to decide which session's events are safe to paint over. A pruned or
+ * pool-retired secondary keeps its closed socket's watermarks but will never
+ * reopen to replay them, so it must not veto reads forever. */
+export function pendingSessionReplay(runtimeId: string): Promise<boolean> | undefined {
+  const reconnectable = [...g.secondaries.values()].filter(entry => entry.wantOpen && !entry.retiredByPool)
+  const clients = new Set([g.primaryGateway, ...reconnectable.map(entry => entry.gateway)])
+
+  // A closed socket's false means only that IT cannot replay yet. When another
+  // open socket already serves this runtime, that socket orders the read.
+  const servedOpen = [...clients].some(client => isOpen(client) && client?.getSeqWatermarks?.()[runtimeId] != null)
+
+  const pending = [...clients].flatMap(client => {
+    if (servedOpen && !isOpen(client)) {
+      return []
+    }
+
+    // A dev-HMR survivor can predate the barrier method.
+    const barrier = client?.sessionReplayBarrier?.(runtimeId)
+
+    return barrier ? [barrier] : []
+  })
+
+  return pending.length ? Promise.all(pending).then(results => results.every(Boolean)) : undefined
+}
+
 /**
  * The registry connection serving the gateway the user is currently looking
  * at. A registry-backed primary takes its identity from the published primary
@@ -696,12 +724,21 @@ async function openSecondary(entry: Secondary, spawnPriority: SpawnPriority = 'b
 
     if (reopening) {
       try {
-        const { reconcileBusyStatesOnReconnect, resetTileRuntimeBindings } = await import('@/store/session-states')
+        const { reconcileBusyStatesOnReconnect, resetRouteOwnedTileRuntimeBindings, resetTileRuntimeBindings } =
+          await import('@/store/session-states')
 
-        resetTileRuntimeBindings({
-          connectionId: entry.connectionId || 'local',
-          profile: entry.profile
-        })
+        const scope = { connectionId: entry.connectionId || 'local', profile: entry.profile }
+
+        // Only the window's ambient gateway carries un-owned tiles and the main
+        // thread. A background route (e.g. a relay request lease that disposed
+        // its socket after the last tick) can only have minted runtimes for
+        // tiles that name it as their owner route.
+        if (g.activeKey === entry.scope) {
+          resetTileRuntimeBindings(scope)
+        } else {
+          resetRouteOwnedTileRuntimeBindings(scope)
+        }
+
         reconcileBusyAfterOpen = () => reconcileBusyStatesOnReconnect(entry.scope)
       } catch {
         // Best effort for partial test/HMR graphs. Production always loads the

@@ -7,9 +7,11 @@ import {
   clampForDisplay,
   countDiffLineStats,
   inlineDiffFromResult,
+  isPreviewableTarget,
   MAX_TOOL_RENDER_CHARS,
   prettyJson,
-  type ToolPart
+  type ToolPart,
+  toolPreviewOutcome
 } from './fallback-model'
 
 const part = (overrides: Partial<ToolPart>): ToolPart => ({
@@ -464,6 +466,27 @@ describe('buildToolView title actions', () => {
   })
 })
 
+// #85132: Windows agents write `C:\\...` / UNC paths; those must get the same
+// artifact preview tag a POSIX `/Users/...` path gets.
+describe('Windows absolute preview targets', () => {
+  it.each(['C:\\Users\\me\\report.html', 'D:/work/report.htm', '\\\\server\\share\\report.html'])(
+    'tags a written %s as a previewable artifact',
+    path => {
+      const outcome = toolPreviewOutcome(
+        part({ args: { content: '<h1>hi</h1>', path }, result: { bytes_written: 11 }, toolName: 'write_file' })
+      )
+
+      expect(outcome.previewTarget).toBe(path)
+      expect(isPreviewableTarget(outcome.previewTarget)).toBe(true)
+    }
+  )
+
+  it('keeps non-HTML Windows files out of the preview tag, like POSIX ones', () => {
+    expect(isPreviewableTarget('C:\\Users\\me\\notes.txt')).toBe(isPreviewableTarget('/Users/me/notes.txt'))
+    expect(isPreviewableTarget('C:\\Users\\me\\notes.txt')).toBe(false)
+  })
+})
+
 describe('clampForDisplay', () => {
   it('passes short payloads through untouched', () => {
     expect(clampForDisplay('hello')).toBe('hello')
@@ -476,7 +499,7 @@ describe('clampForDisplay', () => {
 
     expect(clamped.length).toBeLessThan(oversized.length)
     expect(clamped.startsWith('x'.repeat(MAX_TOOL_RENDER_CHARS))).toBe(true)
-    expect(clamped).toContain('5,000 more characters truncated')
+    expect(clamped).toContain(`${new Intl.NumberFormat().format(5_000)} more characters truncated`)
   })
 })
 
