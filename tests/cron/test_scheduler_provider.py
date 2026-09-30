@@ -85,7 +85,7 @@ def test_desktop_ticker_calls_tick_then_stops():
         return 0
 
     with patch("cron.scheduler.tick", side_effect=fake_tick), patch(
-        "hermes_cli.web_server._gateway_process_running", return_value=False
+        "hermes_cli.web_server._gateway_owns_cron", return_value=False
     ):
         t = threading.Thread(
             target=_start_desktop_cron_ticker,
@@ -121,7 +121,7 @@ def test_desktop_ticker_defers_dispatch_while_gateway_runs():
 
     gate = MagicMock(return_value=True)
     with patch("cron.scheduler.tick", side_effect=fake_tick), patch(
-        "hermes_cli.web_server._gateway_process_running", gate
+        "hermes_cli.web_server._gateway_owns_cron", gate
     ):
         t = threading.Thread(
             target=_start_desktop_cron_ticker,
@@ -149,7 +149,8 @@ def test_desktop_ticker_gate_opens_when_gateway_dies():
     """The gate is a failover, not a defer-only: once the gateway process
     goes away, can_dispatch flips True and the desktop backend fires due
     jobs itself (a job scheduled in the app must not starve because the
-    gateway crashed)."""
+    gateway crashed). Gate seam since the 2026-09-30 upstream merge:
+    ``_gateway_owns_cron(name, home)`` (#126822)."""
     from hermes_cli.web_server import _start_desktop_cron_ticker
 
     calls = []
@@ -161,8 +162,8 @@ def test_desktop_ticker_gate_opens_when_gateway_dies():
         return 0
 
     with patch("cron.scheduler.tick", side_effect=fake_tick), patch(
-        "hermes_cli.web_server._gateway_process_running",
-        side_effect=lambda: gateway_up["value"],
+        "hermes_cli.web_server._gateway_owns_cron",
+        side_effect=lambda name, home: gateway_up["value"],
     ):
         t = threading.Thread(
             target=_start_desktop_cron_ticker,
