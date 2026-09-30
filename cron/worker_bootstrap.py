@@ -18,32 +18,28 @@ dependency -- and does nothing unless ``_launch_external_cron_worker`` marked th
 gateway already booted through ``hermes_bootstrap``, and every other importer of
 ``cron.scheduler`` is an interpreter that owns its own dependencies.
 
-Failure degrades to a log line: the worker still has the pinned dependency path, and a
-dependency problem must not be reported as a lost job.
+A genuine activation failure propagates: continuing on the inherited, unleased path lets the
+collector delete the generation under a live worker. The worker then exits before its ownership
+acknowledgement, which ``_launch_external_cron_worker`` already reports as a failed dispatch with
+the worker's stderr. PM's legitimate no-ops (no committed generation under a venv, wheel, Nix)
+return normally.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
-
 # Set by ``_launch_external_cron_worker`` in the child's env and consumed here, so it never
 # reaches the worker's own children -- they inherit the activated PYTHONPATH instead.
-WORKER_MARKER = "HERMES_CRON_EXTERNAL_WORKER"
-
-_root = Path(__file__).resolve().parent.parent
+# Distinct from ``_HERMES_CRON_EXTERNAL_WORKER`` (the owning execution id) in scheduler.py.
+WORKER_MARKER = "_HERMES_CRON_WORKER_BOOT"
 
 
 def worker_bootstrap() -> None:
-    """Run PM's dependency boot in the marked external worker; idempotent, never raises."""
+    """Run PM's dependency boot in the marked external worker, once."""
     if not os.environ.pop(WORKER_MARKER, None):
         return
-    try:
-        from pm.environments import activate_dependencies
+    from pm.environments import activate_dependencies
 
-        activate_dependencies(_root)
-    except Exception as exc:
-        logger.warning("cron external worker dependency activation failed: %s", exc)
+    activate_dependencies(Path(__file__).resolve().parent.parent)
