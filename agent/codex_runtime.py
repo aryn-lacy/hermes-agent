@@ -557,6 +557,41 @@ def _codex_wire_model(agent, model_provider: str | None) -> str | None:
     return model
 
 
+def _codex_turn_effort(agent, model: str | None) -> str | None:
+    """``turn/start.effort``: only an explicit Hermes reasoning setting overrides codex's own default, clamped
+    to the route's vocabulary like the Responses path (a level the model lacks fails the turn with 400
+    "Unsupported value"). ``ultra`` stays ``ultra`` where the model reaches ``max``: codex runs it as its
+    harness mode. Disabled reasoning goes out as ``none`` where the route accepts it."""
+    reasoning_config = getattr(agent, "reasoning_config", None)
+    # Guard first: _resolve_reasoning fills an unset config with "medium", which would override codex's default.
+    if not isinstance(reasoning_config, dict) or not (
+            reasoning_config.get("enabled") is False or reasoning_config.get("effort")):
+        return None
+    from agent.codex_responses_adapter import classify_responses_route
+    from agent.reasoning_effort import route_supported_efforts
+    from agent.transports.codex import _resolve_reasoning
+    route = classify_responses_route(agent)
+    effort, _enabled = _resolve_reasoning(model or "", {
+        "reasoning_config": reasoning_config, "provider": getattr(agent, "provider", None),
+        "base_url": getattr(agent, "base_url", None), "is_codex_backend": route.is_codex_backend,
+        "is_xai_responses": route.is_xai_responses,
+    })
+    # ``ultra`` is codex's harness mode, not an inference level: keep it where the route accepts it
+    # instead of the ``max`` the Responses clamp maps it to.
+    if effort == "max" and reasoning_config.get("effort") == "ultra" and "ultra" in route_supported_efforts(
+            getattr(agent, "provider", None), model, "codex_app_server"):
+        return "ultra"
+    return effort
+
+
+def _codex_turn_service_tier(agent) -> str | None:
+    """``turn/start.serviceTier``: the tier Hermes' own Responses path would request this turn (a static
+    ``/fast`` tier pinned in request_overrides, or an open ``auto``/``cold`` window), in codex's words: the
+    OpenAI ``priority`` tier is codex's ``fast``. A tier codex has no word for (``ultrafast``) is not sent."""
+    from agent.fast_mode import CODEX_TIER_WORDS, effective_request_overrides
+    return CODEX_TIER_WORDS.get(effective_request_overrides(agent).get("service_tier"))
+
+
 def _ensure_codex_session(agent, messages: List[Dict[str, Any]] | None = None) -> None:
     """Lazily spawn one CodexAppServerSession per AIAgent (reused across turns, closed by the _cleanup hook).
     A live session whose thread was started with a different prompt composition (TUI/Desktop ``/personality``
@@ -693,9 +728,11 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     _ensure_codex_session(agent, messages)
     try:
         _start_codex_thread(agent)
+        wire_model = _codex_wire_model(agent, getattr(agent, "_codex_session_model_provider", None))
         turn = agent._codex_session.run_turn(
             user_input=user_message,
-            model=_codex_wire_model(agent, getattr(agent, "_codex_session_model_provider", None)))
+            model=wire_model, reasoning_effort=_codex_turn_effort(agent, wire_model),
+            service_tier=_codex_turn_service_tier(agent))
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         _close_codex_session(agent)
