@@ -49,13 +49,11 @@ import {
   AUTOMATION_SESSION_SOURCES,
   NO_MATCHING_SESSION_SOURCE,
   SOURCE_CONFIG,
+  type SessionFilterCategory,
+  type SourceSelectionsByCategory,
   isAutomationSource,
   sourceBelongsToCategory,
   sourceLabel,
-} from "./SessionsPage_sources";
-import type {
-  SessionFilterCategory,
-  SourceSelectionsByCategory,
 } from "./SessionsPage_sources";
 import { StructuredReasoning } from "@/components/StructuredReasoning";
 import { PlatformsCard } from "@/components/PlatformsCard";
