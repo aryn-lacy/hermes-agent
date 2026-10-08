@@ -750,38 +750,12 @@ class TestMatrixRequirements:
         with patch.object(builtins, "__import__", _blocking_import):
             assert _check_e2ee_deps() is False
 
-    def test_check_requirements_runs_lazy_install_when_partial(self, monkeypatch):
-        """When mautrix is installed but asyncpg/aiosqlite are missing,
-        check_matrix_requirements must still run the lazy installer.
-
-        Regression for #31116: the previous ``try: import mautrix`` gate
-        short-circuited the install of the OTHER 4 platform.matrix packages,
-        so a partial install (mautrix only) was treated as fully installed.
-        """
-        monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_test")
-        monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
-        monkeypatch.delenv("MATRIX_ENCRYPTION", raising=False)
-
-        import plugins.platforms.matrix.adapter as matrix_mod
-
-        # Simulate "mautrix installed, asyncpg missing" → extras.missing
-        # returns a non-empty tuple → ensure_and_bind MUST be called.
-        called = {"ensure_and_bind": False}
-
-        def _fake_ensure_and_bind(extra, importer, target_globals):
-            called["ensure_and_bind"] = True
-            assert extra == "matrix"
-            return True  # Pretend install succeeded.
-
-        with patch("pm.extras.missing", return_value=("asyncpg",)), \
-             patch("pm.extras.ensure_and_bind", side_effect=_fake_ensure_and_bind):
-            matrix_mod.check_matrix_requirements()
-
-        assert called["ensure_and_bind"], (
-            "check_matrix_requirements must call ensure_and_bind whenever ANY "
-            "platform.matrix dep is missing, not just when mautrix itself is "
-            "missing (#31116)"
-        )
+    # test_check_requirements_runs_lazy_install_when_partial moved to
+    # tests/gateway/test_matrix_darwin_selfheal.py (fork): the #31116
+    # contract (ensure_and_bind fires when ANY dep is missing) now lives in
+    # test_linux_dispatch_goes_through_ensure_and_bind, which pins the
+    # platform read to linux because on darwin the fork's self-heal owns
+    # the dispatch.
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
+# health: allow FILE_LINES -- fork darwin self-heal hook; upstream facade kept merge-clean
 """Matrix gateway adapter (any homeserver, via mautrix; optional E2EE with ``mautrix[encryption]``).
 
-Env vars (config.yaml ``matrix:`` keys alias several — env wins):
+ Env vars (config.yaml ``matrix:`` keys alias several — env wins):
   MATRIX_HOMESERVER, MATRIX_ACCESS_TOKEN (preferred) | MATRIX_USER_ID + MATRIX_PASSWORD;
   MATRIX_E2EE_MODE off|optional|required (legacy MATRIX_ENCRYPTION=true => required);
   MATRIX_DEVICE_ID (stable E2EE device), MATRIX_RECOVERY_KEY (cross-signing after key rotation),
@@ -740,14 +741,27 @@ def ensure_matrix_deps() -> bool:
             "UserID": UserID,
         }
 
-    # A complete install (module-level imports already bound the types) needs no sync; only a
-    # partial one goes through ensure_and_bind, which rebinds after the install.
-    if extras.missing("matrix") and not extras.ensure_and_bind("matrix", _import, globals()):
-        logger.warning(
-            "Matrix: required packages not installed or need a restart. "
-            "Run `hermes pm install`, then restart Hermes."
-        )
-        return False
+    missing_now = extras.missing("matrix")
+    if missing_now:
+        # Fork: upstream gates [matrix] to Linux ("python-olm: linux-only
+        # wheels"), so on macOS ensure_and_bind refuses before installing and
+        # every `hermes update` env migration lands with Matrix dark. The
+        # darwin self-heal (sibling) builds python-olm against Homebrew libolm
+        # and installs the missing anchors; None = non-darwin → upstream path.
+        from plugins.platforms.matrix import adapter_darwin_e2ee
+
+        outcome = adapter_darwin_e2ee.handle_missing_matrix_deps(missing_now, _import, globals())  # health: allow FILE_LINES -- fork hook in an upstream-owned facade; moving upstream functions into fork siblings would poison future merges
+        if outcome is None:
+            # A complete install (module-level imports already bound the types) needs no sync; only a
+            # partial one goes through ensure_and_bind, which rebinds after the install.
+            if not extras.ensure_and_bind("matrix", _import, globals()):
+                logger.warning(
+                    "Matrix: required packages not installed or need a restart. "
+                    "Run `hermes pm install`, then restart Hermes."
+                )
+                return False
+        elif not outcome:
+            return False
     e2ee_mode = _resolve_e2ee_mode()
     if e2ee_mode == "required" and not _check_e2ee_deps():
         logger.error(
