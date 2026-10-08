@@ -750,38 +750,33 @@ class TestMatrixRequirements:
         with patch.object(builtins, "__import__", _blocking_import):
             assert _check_e2ee_deps() is False
 
-    def test_check_requirements_runs_lazy_install_when_partial(self, monkeypatch):
-        """When mautrix is installed but asyncpg/aiosqlite are missing,
-        check_matrix_requirements must still run the lazy installer.
-
-        Regression for #31116: the previous ``try: import mautrix`` gate
-        short-circuited the install of the OTHER 4 platform.matrix packages,
-        so a partial install (mautrix only) was treated as fully installed.
+    def test_linux_dispatch_goes_through_ensure_and_bind(self, monkeypatch):
+        """The LINUX dispatch keeps upstream's path: ensure_and_bind runs and
+        the fork's darwin self-heal never engages. Host-native (unmarked) so
+        the Linux CI lane owns the #31116 contract; the sys_platform patch
+        makes the same dispatch assertion hold on any host. The
+        ``pm.extras.missing`` call count is the single gate probe.
         """
+        import plugins.platforms.matrix.adapter as matrix_mod
+        from plugins.platforms.matrix import adapter_darwin_e2ee
+
         monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_test")
         monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
         monkeypatch.delenv("MATRIX_ENCRYPTION", raising=False)
+        monkeypatch.delenv("MATRIX_E2EE_MODE", raising=False)
+        with patch.object(adapter_darwin_e2ee, "sys_platform", return_value="linux"), \
+             patch("pm.extras.missing", return_value=("mautrix",)) as missing, \
+             patch("pm.extras.ensure_and_bind", return_value=True) as ensure_bind, \
+             patch.object(adapter_darwin_e2ee, "darwin_e2ee_selfheal") as selfheal:
+            assert matrix_mod.ensure_matrix_deps() is True
 
-        import plugins.platforms.matrix.adapter as matrix_mod
+        ensure_bind.assert_called_once()
+        selfheal.assert_not_called()
+        assert missing.call_count == 1  # gate probe only
 
-        # Simulate "mautrix installed, asyncpg missing" → extras.missing
-        # returns a non-empty tuple → ensure_and_bind MUST be called.
-        called = {"ensure_and_bind": False}
-
-        def _fake_ensure_and_bind(extra, importer, target_globals):
-            called["ensure_and_bind"] = True
-            assert extra == "matrix"
-            return True  # Pretend install succeeded.
-
-        with patch("pm.extras.missing", return_value=("asyncpg",)), \
-             patch("pm.extras.ensure_and_bind", side_effect=_fake_ensure_and_bind):
-            matrix_mod.check_matrix_requirements()
-
-        assert called["ensure_and_bind"], (
-            "check_matrix_requirements must call ensure_and_bind whenever ANY "
-            "platform.matrix dep is missing, not just when mautrix itself is "
-            "missing (#31116)"
-        )
+    # The darwin-side self-heal suite (dispatch, rebind, sdist patching,
+    # degrade paths) lives in tests/gateway/test_matrix_darwin_selfheal.py
+    # under that file's platforms("macos") module mark.
 
 
 # ---------------------------------------------------------------------------
