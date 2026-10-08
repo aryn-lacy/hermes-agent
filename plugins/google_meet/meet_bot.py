@@ -361,7 +361,7 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 30.0) -> Non
         name_box = _visible(page.locator('input[aria-label*="name" i]'))
         if name_box is not None:
             _quiet(name_box.fill, cfg.guest_name, timeout=2_000)
-        for label in ("Join now", "Ask to join"):
+        for label in ("Join now", "Ask to join", "Join anyway"):
             btn = _visible(page.get_by_role("button", name=label, exact=False))
             if btn is not None and _quiet(lambda: (btn.click(timeout=3_000), True)):
                 if label == "Ask to join":
