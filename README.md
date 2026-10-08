@@ -16,6 +16,9 @@
   <a href="README.es.md"><img src="https://img.shields.io/badge/Lang-Español-orange?style=for-the-badge" alt="Español"></a>
 </p>
 
+> [!NOTE]
+> **This is the Aryn Lacy flavor of Hermes Agent** — a working fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent), not a redesign. It tracks upstream continuously (merges are automated daily) and exists to carry fixes that are still broken upstream. See **[FORK.md](FORK.md)** for why this fork exists, the patch inventory, and what has already been landed upstream from here. If you want the canonical agent, use upstream.
+
 **The self-improving AI agent built by [Nous Research](https://nousresearch.com).** It's the only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, searches its own past conversations, and builds a deepening model of who you are across sessions. Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearly nothing when idle. It's not tied to your laptop — talk to it from Telegram while it works on a cloud VM.
 
 Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenRouter, OpenAI, your own endpoint, and [many others](https://hermes-agent.nousresearch.com/docs/integrations/providers). Switch with `hermes model` — no code changes, no lock-in.
