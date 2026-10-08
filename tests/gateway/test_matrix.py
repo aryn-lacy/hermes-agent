@@ -750,12 +750,33 @@ class TestMatrixRequirements:
         with patch.object(builtins, "__import__", _blocking_import):
             assert _check_e2ee_deps() is False
 
-    # test_check_requirements_runs_lazy_install_when_partial moved to
-    # tests/gateway/test_matrix_darwin_selfheal.py (fork): the #31116
-    # contract (ensure_and_bind fires when ANY dep is missing) now lives in
-    # test_linux_dispatch_goes_through_ensure_and_bind, which pins the
-    # platform read to linux because on darwin the fork's self-heal owns
-    # the dispatch.
+    def test_linux_dispatch_goes_through_ensure_and_bind(self, monkeypatch):
+        """The LINUX dispatch keeps upstream's path: ensure_and_bind runs and
+        the fork's darwin self-heal never engages. Host-native (unmarked) so
+        the Linux CI lane owns the #31116 contract; the sys_platform patch
+        makes the same dispatch assertion hold on any host. The
+        ``pm.extras.missing`` call count is the single gate probe.
+        """
+        import plugins.platforms.matrix.adapter as matrix_mod
+        from plugins.platforms.matrix import adapter_darwin_e2ee
+
+        monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_test")
+        monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
+        monkeypatch.delenv("MATRIX_ENCRYPTION", raising=False)
+        monkeypatch.delenv("MATRIX_E2EE_MODE", raising=False)
+        with patch.object(adapter_darwin_e2ee, "sys_platform", return_value="linux"), \
+             patch("pm.extras.missing", return_value=("mautrix",)) as missing, \
+             patch("pm.extras.ensure_and_bind", return_value=True) as ensure_bind, \
+             patch.object(adapter_darwin_e2ee, "darwin_e2ee_selfheal") as selfheal:
+            assert matrix_mod.ensure_matrix_deps() is True
+
+        ensure_bind.assert_called_once()
+        selfheal.assert_not_called()
+        assert missing.call_count == 1  # gate probe only
+
+    # The darwin-side self-heal suite (dispatch, rebind, sdist patching,
+    # degrade paths) lives in tests/gateway/test_matrix_darwin_selfheal.py
+    # under that file's platforms("macos") module mark.
 
 
 # ---------------------------------------------------------------------------

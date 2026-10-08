@@ -1,5 +1,6 @@
 """Darwin E2EE self-heal for the Matrix adapter (fork-only).
-pyproject.toml): ``mautrix[encryption]`` pulls python-olm, which ships no
+
+Why (pyproject.toml): ``mautrix[encryption]`` pulls python-olm, which ships no
 macOS wheels and bundles a libolm snapshot that fails to compile under
 AppleClang 17+. On a Mac with Homebrew libolm installed, building the
 extension against the brew dylib works — this module performs that build
@@ -16,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -29,15 +31,20 @@ logger = logging.getLogger(__name__)
 
 # Keep in sync with pyproject.toml [project.optional-dependencies].matrix.
 _PINNED_PACKAGES = {
-    "mautrix": "mautrix==0.21.1",
+    "mautrix": "mautrix[encryption]==0.21.1",
     "aiosqlite": "aiosqlite==0.22.1",
     "asyncpg": "asyncpg==0.31.0",
     "aiohttp_socks": "aiohttp-socks==0.11.0",
 }
-# mautrix's own deps satisfy aiohttp; the lock pins the patched floor, so
-# only install it when the anchor is genuinely absent.
+# Floor/aux pins: not import anchors, so they ride along on EVERY self-heal
+# install (gating them on ``missing`` would never fire — they are never
+# anchors). aiohttp restates pyproject's CVE floor: this lane resolves fresh
+# outside PM's lock+quarantine, so the floor must be explicit. markdown
+# carries the lock's pin. python-olm resolves from the sdist installed in
+# the same self-heal, not from PyPI (no darwin wheels).
 _FLOOR_PACKAGES = {
-    "markdown": "markdown",
+    "markdown": "markdown==3.10.2",
+    "aiohttp": "aiohttp==3.14.3",
 }
 
 _SDIST_URL = "https://files.pythonhosted.org/packages/b8/eb/23ca73cbdc8c7466a774e515dfd917d9fbe747c1257059246fdc63093f04/python-olm-3.2.16.tar.gz"
@@ -104,26 +111,54 @@ def _patched_sdist(workdir: Path, brew: Path) -> Path:
 
     source_dir = workdir / "python-olm-3.2.16"
     with tarfile.open(archive) as tar:
-        tar.extractall(workdir, filter="data")
+        # filter="data" needs 3.11.4+; older 3.11 patch releases raise
+        # TypeError on the kwarg itself — extract without it there (same
+        # archive every time: the pinned, hash-verified sdist).
+        try:
+            tar.extractall(workdir, filter="data")
+        except TypeError:
+            tar.extractall(workdir)
 
     build_script = source_dir / "olm_build.py"
     script = build_script.read_text(encoding="utf-8-sig")
-    compile_marker = 'compile_args = ["-Ilibolm/include"]'
-    dirs_marker = 'library_dirs=[os.path.join("libolm", "build")],'
     build_marker = "# Try to build with cmake first"
     set_source_marker = "ffibuilder.set_source("
-    if not (compile_marker in script and dirs_marker in script
-            and build_marker in script and set_source_marker in script):
+    # Order sanity on the pristine text: compile_args, then the bundled
+    # cmake/make block, then set_source — whose argument list carries
+    # library_dirs after it.
+    positions = {
+        "compile_args": script.find("compile_args = ["),
+        "cmake_block": script.find(build_marker),
+        "set_source": script.find(set_source_marker),
+        "library_dirs": script.find('library_dirs=[os.path.join("libolm", "build")],'),
+    }
+    if not (0 <= positions["compile_args"] < positions["cmake_block"]
+            < positions["set_source"] < positions["library_dirs"]):
         raise RuntimeError("python-olm olm_build.py layout changed; self-heal patch does not apply")
     # The bundled-libolm cmake/make block sits between compile_args and
     # set_source; library_dirs lives INSIDE the set_source(...) call, after
-    # it — patch each site in place rather than splicing one region.
+    # it — patch each site in place rather than splicing one region. Each
+    # value site must match EXACTLY ONCE and is rewritten via bounded
+    # replaces (no regex substitution, so brew paths can never be read as
+    # backreferences), and splice offsets are computed AFTER the rewrites:
+    # they lengthen their lines, so offsets taken earlier slice stale
+    # positions (2026-10-08 review: mid-string-literal cut -> SyntaxError;
+    # the self-heal could never succeed on any host).
+    compile_hits = re.findall(r'compile_args = \["-I[^"]*"\]', script)
+    dirs_hits = re.findall(r'library_dirs=\[os\.path\.join\("libolm", "build"\)\],', script)
+    if len(compile_hits) != 1 or len(dirs_hits) != 1:
+        raise RuntimeError("python-olm olm_build.py layout changed; self-heal patch does not apply")
+    script = script.replace(compile_hits[0], 'compile_args = ["-I' + str(brew / "include") + '"]', 1)
+    script = script.replace(dirs_hits[0], 'library_dirs=["' + str(brew / "lib") + '"],', 1)
     start = script.index(build_marker)
     end = script.index(set_source_marker)
-    script = (script
-              .replace(compile_marker, f'compile_args = ["-I{brew}/include"]')
-              .replace(dirs_marker, f'library_dirs=["{brew}/lib"],'))
     script = script[:start] + "# Bundled libolm build removed; linking against Homebrew libolm.\n\n" + script[end:]
+    # Belt and suspenders: a corrupted splice must fail HERE, loudly, not at
+    # build time three steps later.
+    try:
+        compile(script, "olm_build.py", "exec")
+    except SyntaxError as exc:
+        raise RuntimeError(f"self-heal patch produced an invalid olm_build.py: {exc}") from exc
     build_script.write_text(script, encoding="utf-8")
     return source_dir
 
@@ -186,18 +221,25 @@ def _selfheal_locked(missing: tuple[str, ...]) -> bool:
         return False
 
     specs = [_PINNED_PACKAGES[anchor] for anchor in missing if anchor in _PINNED_PACKAGES]
-    specs += [_FLOOR_PACKAGES[anchor] for anchor in missing if anchor in _FLOOR_PACKAGES]
+    specs += list(_FLOOR_PACKAGES.values())
     if not specs:
         return False
     try:
         with tempfile.TemporaryDirectory(prefix="hermes-olm-build-") as tmp:
             source_dir = _patched_sdist(Path(tmp), brew)
+            # ONE resolve for the whole closure. This lane runs outside PM's
+            # lock + exclude-newer quarantine, so every root must be pinned:
+            # the transitive closure floats within mautrix's own declared
+            # constraints, but aiohttp (the CVE-floor package) is rooted at
+            # pyproject's pin so the resolver cannot move it. python-olm
+            # enters the resolve as the patched sdist — its local metadata
+            # satisfies mautrix[encryption]'s python-olm requirement, so uv
+            # never reaches for PyPI, where darwin has no wheels and the
+            # bundled libolm would hit the same AppleClang failure this
+            # self-heal exists to route around.
             subprocess.run(
-                [uv, "pip", "install", "--python", str(python), "--no-deps", str(source_dir)],
-                capture_output=True, text=True, timeout=600, check=True)
-            specs.insert(0, str(source_dir))
-            subprocess.run(
-                [uv, "pip", "install", "--python", str(python), *specs],
+                [uv, "pip", "install", "--python", str(python),
+                 str(source_dir), *specs],
                 capture_output=True, text=True, timeout=600, check=True)
     except (OSError, subprocess.SubprocessError, RuntimeError, tarfile.TarError) as exc:
         logger.warning("Matrix: darwin E2EE self-heal failed: %s", exc)

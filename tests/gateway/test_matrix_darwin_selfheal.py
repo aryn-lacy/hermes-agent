@@ -120,21 +120,6 @@ def test_selfheal_success_rebinds_types(monkeypatch):
     assert stubbed is not real_type  # precondition: a stub was actually replaced
 
 
-def test_linux_dispatch_goes_through_ensure_and_bind(monkeypatch):
-    """The linux dispatch keeps upstream's path: ensure_and_bind runs, the
-    self-heal never engages. sys_platform() is platform-as-data."""
-    _configured_env(monkeypatch)
-    with patch.object(adapter_darwin_e2ee, "sys_platform", return_value="linux"), \
-         patch("pm.extras.missing", return_value=("mautrix",)) as missing, \
-         patch("pm.extras.ensure_and_bind", return_value=True) as ensure_bind, \
-         patch.object(adapter_darwin_e2ee, "darwin_e2ee_selfheal") as selfheal:
-        assert matrix_mod.ensure_matrix_deps() is True
-
-    ensure_bind.assert_called_once()
-    selfheal.assert_not_called()
-    assert missing.call_count == 1  # gate probe only
-
-
 def test_selfheal_failure_returns_false(monkeypatch):
     """Self-heal False → ensure_matrix_deps False (upstream failure path)."""
     _configured_env(monkeypatch)
@@ -261,11 +246,110 @@ def test_olm_build_patch_applies_to_real_layout(tmp_path):
     assert "ffibuilder.set_source(" in script
 
 
+def test_olm_build_patch_splice_survives_long_brew_paths(tmp_path):
+    """Regression for the 2026-10-08 review CRITICAL: splice offsets taken
+    BEFORE the value rewrites slice stale positions once the brew path is
+    longer than the marker text — the patched script was left with an
+    unterminated string literal. A long brew prefix must still produce a
+    syntactically valid build script."""
+    real_member = "python-olm-3.2.16/olm_build.py"
+    fixture_src = (
+        'compile_args = ["-Ilibolm/include"]\n'
+        "link_args = []\n"
+        'if DEVELOP and DEVELOP.lower() in ["yes", "true", "1"]:\n'
+        "    link_args.append('-Wl,-rpath=../build')\n"
+        "# Try to build with cmake first, fall back to GNU make\n"
+        "try:\n"
+        '    subprocess.run(["cmake", ".", "-Bbuild", "-DBUILD_SHARED_LIBS=NO"], cwd="libolm", check=True)\n'
+        "except FileNotFoundError:\n"
+        '    subprocess.run(["make", "static"], cwd="libolm", check=True)\n'
+        "ffibuilder.set_source(\n"
+        '    "_libolm",\n'
+        '    libraries=["olm"],\n'
+        '    library_dirs=[os.path.join("libolm", "build")],\n'
+        ")\n"
+    )
+    archive_path = tmp_path / "python-olm-3.2.16.tar.gz"
+    import io
+    import hashlib
+    import unittest.mock as um
+
+    with tarfile.open(archive_path, "w:gz") as tar:
+        data = fixture_src.encode()
+        info = tarfile.TarInfo(real_member)
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    # Deep, long prefix: the rewrites lengthen their lines far more than
+    # the markers, which is exactly what desynced the stale offsets.
+    brew = tmp_path / "very" / "long" / "homebrew" / "prefix" / "opt" / "libolm-darwin-arm64"
+    brew.mkdir(parents=True)
+
+    digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    with um.patch.object(adapter_darwin_e2ee, "_SDIST_URL", archive_path.as_uri()), \
+         um.patch.object(adapter_darwin_e2ee, "_SDIST_SHA256", digest), \
+         um.patch.object(adapter_darwin_e2ee, "_urlrequest") as urlrequest:
+        class _FileResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return archive_path.read_bytes()
+
+        urlrequest.urlopen.return_value = _FileResponse()
+        work = tmp_path / "work"
+        work.mkdir()
+        source = adapter_darwin_e2ee._patched_sdist(work, brew)
+
+    script = (source / "olm_build.py").read_text(encoding="utf-8")
+    # The exact failure mode of the pre-fix code: a slice that lands
+    # mid-string produces a SyntaxError at compile time.
+    compile(script, "olm_build.py", "exec")
+    assert f'compile_args = ["-I{brew}/include"]' in script
+    assert f'library_dirs=["{brew}/lib"],' in script
+    assert "cmake" not in script and '"make", "static"' not in script
+    assert "ffibuilder.set_source(" in script
+
+
 def test_anchor_import_check_uses_fresh_interpreter():
     """_anchor_imports probes a clean interpreter: a present-but-broken
     sys.modules entry must not mask a broken install."""
     assert adapter_darwin_e2ee._anchor_imports("json") is True
     assert adapter_darwin_e2ee._anchor_imports("definitely_not_a_real_module_xyz") is False
+
+
+def test_selfheal_install_resolves_once_with_pinned_floors(tmp_path):
+    """The self-heal resolves the whole closure in ONE uv invocation whose
+    roots carry every pin: mautrix[encryption] (the E2EE extras pyproject
+    installs on linux), the aiohttp CVE floor, and the markdown pin. A
+    second, unpinned transitive resolve must never hit the live env
+    (2026-10-08 review, IMPORTANT #1)."""
+    import subprocess as _subprocess
+
+    calls = []
+
+    def _fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    with patch.object(adapter_darwin_e2ee, "brew_libolm_prefix", return_value=tmp_path / "brew"), \
+         patch.object(adapter_darwin_e2ee, "_uv_binary", return_value=str(tmp_path / "uv")), \
+         patch.object(adapter_darwin_e2ee, "_target_python", return_value=tmp_path / "python"), \
+         patch.object(adapter_darwin_e2ee, "_patched_sdist", return_value=tmp_path / "src") as sdist, \
+         patch.object(adapter_darwin_e2ee.subprocess, "run", side_effect=_fake_run), \
+         patch.object(adapter_darwin_e2ee, "_anchor_imports", return_value=True):
+        assert adapter_darwin_e2ee.darwin_e2ee_selfheal(("mautrix",)) is True
+
+    assert sdist.call_count == 1
+    assert len(calls) == 1, "install must be a single uv resolve, not sdist-then-deps"
+    argv = calls[0]
+    assert str(tmp_path / "src") in argv  # python-olm from the patched sdist
+    assert "mautrix[encryption]==0.21.1" in argv
+    assert "aiohttp==3.14.3" in argv      # CVE floor rooted, not left to drift
+    assert "markdown==3.10.2" in argv
 
 
 def test_selfheal_serializes_concurrent_calls():

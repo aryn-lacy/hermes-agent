@@ -1,7 +1,7 @@
 # health: allow FILE_LINES -- fork darwin self-heal hook; upstream facade kept merge-clean
 """Matrix gateway adapter (any homeserver, via mautrix; optional E2EE with ``mautrix[encryption]``).
 
- Env vars (config.yaml ``matrix:`` keys alias several — env wins):
+Env vars (config.yaml ``matrix:`` keys alias several - env wins):
   MATRIX_HOMESERVER, MATRIX_ACCESS_TOKEN (preferred) | MATRIX_USER_ID + MATRIX_PASSWORD;
   MATRIX_E2EE_MODE off|optional|required (legacy MATRIX_ENCRYPTION=true => required);
   MATRIX_DEVICE_ID (stable E2EE device), MATRIX_RECOVERY_KEY (cross-signing after key rotation),
@@ -750,7 +750,7 @@ def ensure_matrix_deps() -> bool:
         # and installs the missing anchors; None = non-darwin → upstream path.
         from plugins.platforms.matrix import adapter_darwin_e2ee
 
-        outcome = adapter_darwin_e2ee.handle_missing_matrix_deps(missing_now, _import, globals())  # health: allow FILE_LINES -- fork hook in an upstream-owned facade; moving upstream functions into fork siblings would poison future merges
+        outcome = adapter_darwin_e2ee.handle_missing_matrix_deps(missing_now, _import, globals())
         if outcome is None:
             # A complete install (module-level imports already bound the types) needs no sync; only a
             # partial one goes through ensure_and_bind, which rebinds after the install.
