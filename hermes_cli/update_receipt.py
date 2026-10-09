@@ -40,7 +40,7 @@ import sys
 import time
 import uuid
 from contextlib import contextmanager, suppress
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Optional
 
@@ -56,7 +56,7 @@ COMMAND_BOUNDARY_STOP_REASON = "completed at command boundary"
 # the outer one, and the boundary finalize must see exactly its own
 # process's receipt. Same pattern as pm.receipt's ContextVars — no
 # manager object.
-_current: contextvars.ContextVar[Optional["UpdateReceipt"]] = contextvars.ContextVar(
+_current: contextvars.ContextVar[Optional[UpdateReceipt]] = contextvars.ContextVar(
     "update_receipt_current", default=None
 )
 #: The terminal outcome of the run the enclosing command scope finalized or adopted (from a
@@ -108,7 +108,7 @@ def current_correlation_id() -> Optional[str]:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _code_identity(refresh: bool = False) -> dict[str, Any]:
@@ -782,7 +782,7 @@ def _consent_reader_importable() -> bool:
     that runs the new tree (never the pre-pull one, which must import nothing); the recorder's
     pre-gate imports the same module next, so a working interpreter loads nothing extra."""
     try:
-        import hermes_cli.config  # noqa: F401
+        import hermes_cli.config
     except ImportError:  # ruamel and every other third-party package are missing here
         return False
     return True

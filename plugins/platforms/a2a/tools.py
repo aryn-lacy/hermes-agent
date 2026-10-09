@@ -798,7 +798,7 @@ def _a2a_tools_available() -> bool:
             return True
         a2a_cfg = (cfg.get("platforms") or {}).get("a2a") or {}
         return bool(isinstance(a2a_cfg, dict) and a2a_cfg.get("enabled"))
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
 
 
