@@ -2767,18 +2767,18 @@ def save_env_value_secure(key: str, value: str) -> dict[str, Any]:
 
 
 def reload_env() -> int:
-    """Re-read ~/.hermes/.env into os.environ; returns count of vars changed.
-    Removes deleted vars only when known to Hermes (OPTIONAL_ENV_VARS and _EXTRA_ENV_KEYS) so
-    unrelated environment is never clobbered."""
+    """Re-read ~/.hermes/.env into os.environ; returns count of vars changed. Removes deleted vars only when
+    known to Hermes (OPTIONAL_ENV_VARS and _EXTRA_ENV_KEYS), and none while the .env exists but is unreadable."""
+    from hermes_cli.env_loader import dotenv_unreadable
     env_vars = load_env()
     count = 0
     for key, value in env_vars.items():
         if os.environ.get(key) != value:
             os.environ[key] = value
             count += 1
-    for key in (set(OPTIONAL_ENV_VARS) | _EXTRA_ENV_KEYS) - set(env_vars):
-        if key in os.environ:
-            del os.environ[key]
+    known = set() if dotenv_unreadable(get_env_path()) else set(OPTIONAL_ENV_VARS) | _EXTRA_ENV_KEYS
+    for key in known - set(env_vars):
+        if os.environ.pop(key, None) is not None:
             count += 1
     return count
 
@@ -2963,13 +2963,13 @@ def _suggest_closest_key(key: str, candidates: set[str], cutoff: float = 0.6) ->
 
 
 def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
-    """Dotted config-key path -> ``(is_known, suggestion)``: the schema walk, then (only for a refused key)
-    the runtime-read keys DEFAULT_CONFIG leaves unseeded (config_runtime_keys)."""
+    """CLI-syntax key (``\\.`` escapes a dot) -> ``(is_known, suggestion)``: the schema walk, then (only for a
+    refused key) the runtime-read keys DEFAULT_CONFIG leaves unseeded (config_runtime_keys)."""
     known, suggestion = _validate_schema_key(key)
     if known or not key:
         return known, suggestion
     from hermes_cli.config_runtime_keys import is_runtime_read_key
-    return (True, None) if is_runtime_read_key(".".join(_split_key_path(key))) else (False, suggestion)
+    return (True, None) if is_runtime_read_key(_split_key_path(key)) else (False, suggestion)
 
 
 def _validate_schema_key(key: str) -> tuple[bool, Optional[str]]:
