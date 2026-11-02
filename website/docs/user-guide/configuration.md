@@ -91,6 +91,24 @@ sandboxes
 where the limit cannot be changed, startup continues without changing the
 limit.
 
+On Linux with glibc, the gateway, `hermes serve` and `hermes dashboard` also cap the number of
+malloc arenas the process may create:
+
+```yaml
+runtime:
+  malloc_arena_max: 4
+```
+
+glibc otherwise hands every new thread its own arena, up to eight per CPU core,
+and keeps each arena's freed pages; a long-running gateway with many short-lived
+worker threads ends up holding hundreds of MB of free-but-unreturned memory.
+The cap is set at startup, before the server starts any thread, and applies
+only to the Hermes server process itself — commands it runs (terminal tools,
+MCP servers, builds) keep glibc's default. An explicit `MALLOC_ARENA_MAX` (or
+`GLIBC_TUNABLES=glibc.malloc.arena_max=…`) takes precedence, whether exported
+before launch or set in the profile's `.env`. Set the value to `0`, `false`, or `null` to keep
+glibc's default. Other platforms ignore it.
+
 ## Database Settings
 
 The `database:` section controls how Hermes opens its SQLite state database
@@ -216,7 +234,7 @@ updates:
 
 Point-in-time copies of `config.yaml` itself (taken before `hermes setup` rewrites it, before `hermes migrate` edits it, every time the file parses successfully, and when it fails to parse) go to `backups/config/config.yaml.<reason>.<timestamp>`. Identical repeats are skipped and only the newest five per reason are kept, so they never pile up beside `config.yaml`. If `config.yaml` is broken, Hermes serves the newest `good` copy instead of built-in defaults and warns on every start until the YAML is fixed; the broken file is never modified.
 
-For git installs, Hermes auto-stashes dirty tracked files and untracked files before checking out the update branch or pulling. Interactive terminal updates prompt before restoring that stash. Non-interactive updates (desktop/chat app, gateway, or `--yes`) use `updates.non_interactive_local_changes`: `stash` restores local source edits after a successful pull, while `discard` drops the update-created stash after a successful pull. Use `discard` only on managed installs where local source edits are never meant to persist.
+For git installs, Hermes auto-stashes dirty tracked files, plus any untracked file at a path the update adds, before checking out the update branch or pulling. Untracked files the update never writes stay in place. Interactive terminal updates ask whether to keep the changes before stashing anything; answering no deletes them instead of leaving a stash entry behind. Non-interactive updates (desktop/chat app, gateway, or `--yes`) use `updates.non_interactive_local_changes`: `stash` restores local source edits after a successful pull, while `discard` drops the update-created stash after a successful pull. Use `discard` only on managed installs where local source edits are never meant to persist.
 
 Before that stash step, Hermes also restores tracked `package-lock.json` diffs left by npm install/build churn. Commit or manually stash intentional lockfile edits before updating.
 
